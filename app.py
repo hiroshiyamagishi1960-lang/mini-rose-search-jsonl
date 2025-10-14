@@ -1,8 +1,8 @@
 # app.py — Mini Rose Search API
 # 方針反映版：日本語短語ファジー抑止 / 代表日=開催日/発行日 / order=latest でページング前ソート / UI変更なし
-# 版: ui-2025-10-06-best-practice
+# 版: ui-2025-10-06-best-practice + jsonl-fallback-2025-10-14
 
-import os, re, json, unicodedata, datetime as dt
+import os, re, json, unicodedata, datetime as dt, hashlib, io, time
 from typing import List, Dict, Any, Tuple, Optional
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
@@ -11,9 +11,13 @@ from fastapi.staticfiles import StaticFiles
 import requests
 from urllib.parse import urlparse, urlunparse
 
-# ==== 環境変数（必須のみ） ====
+# ==== 環境変数（Notion：あれば優先。無ければJSONLフォールバック） ====
 NOTION_TOKEN       = os.getenv("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
+
+# JSONL（kb版）
+KB_URL  = os.getenv("KB_URL", "").strip()
+KB_PATH = os.getenv("KB_PATH", "kb.jsonl").strip() or "kb.jsonl"   # ローカル保存名
 
 # （任意）他フィールド
 FIELD_TITLE  = os.getenv("FIELD_TITLE",  "")
@@ -28,7 +32,7 @@ NOTION_PUBLIC_HOST = os.getenv("NOTION_PUBLIC_HOST", "receptive-paste-be4.notion
 JSON_HEADERS = {"content-type": "application/json; charset=utf-8"}
 
 app = FastAPI(title="Mini Rose Search API",
-              version="ui-2025-10-06-best-practice")
+              version="ui-2025-10-06-best-practice+jsonl")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
@@ -356,7 +360,7 @@ def _text_hit_any(text: str, terms: List[str]) -> bool:
     return False
 
 # =============================
-# Notion 全取得
+# Notion 全取得（Notionが設定されていれば使用）
 # =============================
 NOTION_VER = "2022-06-28"
 def notion_query_all() -> List[Dict[str, Any]]:
@@ -380,7 +384,7 @@ def notion_query_all() -> List[Dict[str, Any]]:
         else: break
     return pages
 
-# ---- プロパティ抽出 ----
+# ---- プロパティ抽出（Notion）----
 def _extract_properties(page: Dict[str, Any]) -> Dict[str, str]:
     props = page.get("properties", {})
     return {
@@ -400,7 +404,88 @@ def _extract_properties(page: Dict[str, Any]) -> Dict[str, str]:
     }
 
 # =============================
-# 検索ロジック + 年/範囲フィルタ
+# JSONL（kb.jsonl）ローダ
+# =============================
+_kb_cache: Dict[str, Any] = {
+    "sha256": "",
+    "lines": 0,
+    "loaded_at": 0.0,
+    "records": [],   # List[Dict[str, str]]
+}
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _download_kb_if_needed() -> None:
+    """KB_URLがあればダウンロード。なければローカルKB_PATHだけ参照。"""
+    if KB_URL:
+        try:
+            r = requests.get(KB_URL, timeout=20)
+            if r.status_code == 200 and r.text:
+                with open(KB_PATH, "w", encoding="utf-8") as f:
+                    f.write(r.text)
+        except Exception:
+            pass  # ネットワーク一時失敗は無視（手元のKB_PATHをそのまま使う）
+
+def load_kb(force: bool=False) -> Tuple[List[Dict[str,str]], str, int]:
+    """
+    kb.jsonl を読み込み（必要なら KB_URL から取得）、records を返す。
+    返り値：（records, sha256, lines）
+    """
+    # 1) 取得（必要なら）
+    _download_kb_if_needed()
+
+    # 2) 変更検知（sha256）
+    sha = ""
+    lines = 0
+    try:
+        sha = _sha256_file(KB_PATH) if os.path.exists(KB_PATH) else ""
+    except Exception:
+        sha = ""
+
+    if (not force) and sha and sha == _kb_cache.get("sha256",""):
+        return _kb_cache["records"], _kb_cache["sha256"], _kb_cache["lines"]
+
+    # 3) 読み込み
+    records: List[Dict[str,str]] = []
+    if os.path.exists(KB_PATH):
+        with io.open(KB_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    rec = json.loads(line)
+                    # refresh_kb.py の出力キーに合わせる（最低限）
+                    m = {
+                        "title": rec.get("title","") or "",
+                        "text":  rec.get("text","") or "",
+                        "url":   rec.get("url","") or "",
+                        "author": rec.get("author","") or "",
+                        "issue": rec.get("issue","") or "",
+                        "date_primary": rec.get("date_primary","") or "",
+                        "category": rec.get("category","") or "",
+                    }
+                    if (m["title"] or m["text"]):
+                        records.append(m)
+                except Exception:
+                    continue
+    lines = len(records)
+
+    # 4) キャッシュ更新
+    _kb_cache.update({
+        "sha256": sha,
+        "lines": lines,
+        "loaded_at": time.time(),
+        "records": records
+    })
+    return records, sha, lines
+
+# =============================
+# 検索ロジック + 年/範囲フィルタ（共通）
 # =============================
 W_TITLE, W_TEXT, W_AUTHOR, W_ISSUE, W_DATES, W_CATEGORY = 2.0, 1.6, 0.8, 0.6, 0.4, 0.5
 BONUS_PHRASE = 2.0
@@ -482,14 +567,6 @@ def _record_years(rec: Dict[str,str]) -> List[int]:
 
 # ---- 代表日（best date）ユーティリティ ----
 def _best_date(rec: Dict[str, Any]) -> Tuple[dt.date, Dict[str, Any]]:
-    """
-    優先順位：
-      1) date_primary（開催日/発行日）
-      2) last_edited_time（Notion ISO）
-      3) created_time（Notion ISO）
-      4) テキスト等から抽出した最大の年（1/1仮置き）
-      5) 1970-01-01
-    """
     dpri = _parse_date_any(rec.get("date_primary",""))
     if dpri:
         return dpri, {"kind":"date_primary", "value": rec.get("date_primary","")}
@@ -531,6 +608,19 @@ def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[int
         base = " ".join(parts[:-1]).strip()
         return (base, None, (y1, y2))
     return (q_n, None, None)
+
+# ---- 共通ランキング処理 ----
+def _search_ranked_all(records: List[Dict[str,str]], q: str) -> Tuple[List[Dict[str,Any]], List[str]]:
+    base_terms=jp_terms(q)
+    if not base_terms: return [], []
+    terms_all=expand_terms_with_fold_and_dict(base_terms)
+    hl_terms = make_highlight_terms(base_terms)
+    scored=[(score_record(r,terms_all,q),r) for r in records]
+    scored=[(s,r) for s,r in scored if s>0.0]
+    if not scored: return [], hl_terms
+    scored.sort(key=lambda x:x[0],reverse=True)
+    ranked=[r for _,r in scored]
+    return ranked, hl_terms
 
 def score_record(rec: Dict[str,str], q_terms_all: List[str], q_raw: str) -> float:
     def low(s): return (s or "").lower()
@@ -585,32 +675,7 @@ def score_record(rec: Dict[str,str], q_terms_all: List[str], q_raw: str) -> floa
 
     return score if matched else 0.0
 
-def _search_ranked_all(records: List[Dict[str,str]], q: str) -> Tuple[List[Dict[str,Any]], List[str]]:
-    base_terms=jp_terms(q)
-    if not base_terms: return [], []
-    terms_all=expand_terms_with_fold_and_dict(base_terms)
-    hl_terms = make_highlight_terms(base_terms)
-    scored=[(score_record(r,terms_all,q),r) for r in records]
-    scored=[(s,r) for s,r in scored if s>0.0]
-    if not scored: return [], hl_terms
-    scored.sort(key=lambda x:x[0],reverse=True)
-    ranked=[r for _,r in scored]
-    return ranked, hl_terms
-
-def _apply_head_and_excerpt(r: Dict[str,str], head_hl: str, text_raw: str, is_first_in_page: bool, hl_terms: List[str]) -> Dict[str,Any]:
-    title = r.get("title","")
-    out = dict(r)
-    if is_first_in_page:
-        out["title"] = f"{head_hl or title}"
-        out["text"]  = _highlight_terms(text_raw, hl_terms) + "<br><br>"
-    else:
-        hits_in_head = (head_hl != _make_head(r))
-        text_hit = _text_hit_any(text_raw, hl_terms)
-        tag = "" if hits_in_head else ("（本文にヒット）" if text_hit else "")
-        out["title"] = f"{head_hl}{tag}" if head_hl else f"{title}{tag}"
-        out["text"]  = ""
-    return out
-
+# ---- Notion検索（Notionが使えるとき）----
 def search_notion_advanced(q_raw: str,
                            year: Optional[int]=None,
                            year_from: Optional[int]=None,
@@ -620,7 +685,19 @@ def search_notion_advanced(q_raw: str,
     records=[_extract_properties(p) for p in pages]
     ranked, hl_terms = _search_ranked_all(records, q_raw)
     if not ranked: return [], hl_terms
-    # 年/範囲フィルタ
+    ranked = [r for r in ranked if _matches_year(r, year, year_from, year_to)]
+    return ranked, hl_terms
+
+# ---- JSONL検索（kb.jsonlを使うとき）----
+def search_kb_advanced(q_raw: str,
+                       year: Optional[int]=None,
+                       year_from: Optional[int]=None,
+                       year_to: Optional[int]=None) -> Tuple[List[Dict[str,Any]], List[str]]:
+    records, _, _ = load_kb(force=False)
+    if not records:
+        return [], []
+    ranked, hl_terms = _search_ranked_all(records, q_raw)
+    if not ranked: return [], hl_terms
     ranked = [r for r in ranked if _matches_year(r, year, year_from, year_to)]
     return ranked, hl_terms
 
@@ -651,10 +728,15 @@ def _paginate(items: List[Dict[str,Any]], page: int, page_size: int) -> Tuple[Li
 # =============================
 @app.get("/health")
 def health():
+    # kb 側の状況を取得（軽量）
+    _, kb_sha, kb_lines = load_kb(force=False) if KB_URL or os.path.exists(KB_PATH) else ([], "", 0)
     return JSONResponse({
         "ok": True,
         "has_token": bool(NOTION_TOKEN),
         "has_dbid": bool(NOTION_DATABASE_ID),
+        "has_kb": bool(kb_lines > 0),
+        "kb_lines": kb_lines,
+        "kb_sha256": kb_sha[:40] if kb_sha else None,
         "primary_date_keys": primary_date_keys(),
         "now": dt.datetime.now().isoformat(timespec="seconds"),
     }, headers=JSON_HEADERS)
@@ -703,7 +785,12 @@ def api_search(
             yf = yf if yf is not None else yr_tail[0]
             yt = yt if yt is not None else yr_tail[1]
 
-        ranked, hl_terms = search_notion_advanced(base_q, y, yf, yt)
+        # ---- データソース選択：Notion優先・無ければkb.jsonl ----
+        if NOTION_TOKEN and NOTION_DATABASE_ID:
+            ranked, hl_terms = search_notion_advanced(base_q, y, yf, yt)
+        else:
+            ranked, hl_terms = search_kb_advanced(base_q, y, yf, yt)
+
         if not ranked:
             return JSONResponse(
                 {"items": [], "total_hits": 0, "page": 1, "page_size": page_size,
