@@ -1,25 +1,21 @@
 name: Refresh KB Daily
-
 on:
   schedule:
-    - cron: "0 18 * * *"  # JST 03:00（UTC 18:00）
-  workflow_dispatch:
+    - cron: '0 18 * * *'   # JST 03:00 (UTC 18:00)
+  workflow_dispatch: {}
 
 permissions:
   contents: write
 
 jobs:
-  refresh-kb:
+  refresh_kb:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
@@ -49,10 +45,3 @@ jobs:
           else
             echo "No changes to commit."
           fi
-
-     - name: Notify Render (optional)
-  if: ${{ secrets.RENDER_DEPLOY_HOOK_URL && secrets.RENDER_DEPLOY_HOOK_URL != '' }}
-  env:
-    HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
-  run: curl -fsS -X POST "$HOOK" || true
-
