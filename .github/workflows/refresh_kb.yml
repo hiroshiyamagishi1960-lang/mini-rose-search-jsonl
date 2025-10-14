@@ -1,7 +1,7 @@
 name: Refresh KB Daily
 on:
-   schedule:
-     - cron: '0 18 * * *'   # JST 03:00 (UTC 18:00)
+  schedule:
+    - cron: '0 18 * * *'   # JST 03:00 (UTC 18:00)
   workflow_dispatch: {}
 
 permissions:
