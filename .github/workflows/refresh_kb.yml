@@ -50,7 +50,9 @@ jobs:
             echo "No changes to commit."
           fi
 
-      - name: Notify Render (optional)
-        if: ${{ secrets.RENDER_DEPLOY_HOOK_URL != '' }}
-        run: curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}" || true
+     - name: Notify Render (optional)
+  if: ${{ secrets.RENDER_DEPLOY_HOOK_URL && secrets.RENDER_DEPLOY_HOOK_URL != '' }}
+  env:
+    HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+  run: curl -fsS -X POST "$HOOK" || true
 
