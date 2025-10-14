@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mini Rose UI（完成版）</title>
+  <style>
+    :root {
+      --bg: #fafafa;
+      --fg: #111;
+      --muted: #666;
+      --card: #fff;
+      --border: #e5e5e5;
+      --accent: #2563eb;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b0b0c;
+        --fg: #f4f4f5;
+        --muted: #a1a1aa;
+        --card: #151518;
+        --border: #26262b;
+        --accent: #60a5fa;
+      }
+    }
+    html, body {
+      background: var(--bg);
+      color: var(--fg);
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", "メイリオ", sans-serif;
+      line-height: 1.6;
+    }
+    .wrap { max-width: 980px; margin: 24px auto 80px; padding: 0 16px; }
+    h1 { font-size: 22px; margin: 0 0 12px; }
+    .toolbar {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .pill {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .pill input, .pill select {
+      background: transparent; border: none; color: var(--fg); outline: none;
+      font-size: 14px; min-width: 80px;
+    }
+    .pill input[type="text"] { min-width: 260px; }
+    .btn {
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--fg);
+      padding: 8px 12px;
+      border-radius: 12px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn.primary {
+      background: var(--accent);
+      color: white;
+      border-color: transparent;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      margin-top: 12px;
+    }
+    textarea {
+      width: 100%;
+      min-height: 120px;
+      resize: vertical;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--fg);
+      padding: 12px;
+      font-size: 15px;
+    }
+    .meta { color: var(--muted); font-size: 13px; }
+    .result { border-top: 1px dashed var(--border); padding-top: 12px; margin-top: 12px; }
+    .result h3 { margin: 0 0 4px; font-size: 16px; }
+    .row-end { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+    .copy {
+      border: 1px dashed var(--border);
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    mark { padding: 0 2px; border-radius: 3px; }
+    .small { font-size: 12px; color: var(--muted); }
+    .split { display: grid; gap: 12px; }
+    @media (min-width: 900px) {
+      .split { grid-template-columns: 1.2fr 1fr; }
+    }
+    .list > .item { border: 1px dashed var(--border); border-radius: 12px; padding: 10px; margin-top: 8px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 2px 6px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Mini Rose UI（完成版）</h1>
+    <div class="toolbar">
+      <div class="row">
+        <div class="pill">
+          接続先（APIの住所）：
+          <input id="baseUrl" type="text" />
+        </div>
+        <div class="pill">
+          モード：
+          <label><input type="radio" name="mode" value="chat" checked /> Chat</label>
+          <label><input type="radio" name="mode" value="search" /> Search</label>
+        </div>
+        <div class="pill">
+          Top K（上位いくつ）： 
+          <select id="topK">
+            <option>1</option><option selected>3</option><option>5</option><option>10</option>
+          </select>
+        </div>
+        <div class="pill">
+          ページ（結果のページ）：
+          <button class="btn" id="prevBtn">前</button>
+          <span id="pageInfo" class="small">1 / 1</span>
+          <button class="btn" id="nextBtn">次</button>
+        </div>
+      </div>
+      <div class="row-end">
+        <button class="btn" id="detectBtn">接続先を自動設定</button>
+        <button class="btn" id="healthBtn">/health</button>
+        <button class="btn" id="versionBtn">/version</button>
+      </div>
+    </div>
+
+    <div class="split">
+      <div class="card">
+        <div class="meta">質問（クエリ＝知りたいこと）</div>
+        <textarea id="query" placeholder="例）夏の剪定について"></textarea>
+        <div style="display:flex; gap:8px; margin-top:10px;">
+          <button class="btn primary" id="runBtn">送信</button>
+          <button class="btn" id="clearBtn">クリア</button>
+        </div>
+        <div style="margin-top:10px;" class="small">
+          形式：1位は「会報号・発行日・開催日・著者名・タイトル・本文」。2位以下は「見出し＋出典リンク」。<br/>
+          ハイライト（強調表示）は質問語を <span class="kbd">&lt;mark&gt;</span> で囲みます（読みやすくするための印）。 
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="meta">状態（ステータス）</div>
+        <div id="status" class="small">準備OK。</div>
+        <div class="meta" style="margin-top:8px;">ヘルプ</div>
+        <ul class="small">
+          <li><b>Chat</b>：毎回考えて答える（会話AI）。</li>
+          <li><b>Search</b>：検索リストを返す（一覧）。</li>
+          <li><b>Top K</b>：上位いくつ使うか（数を増やすと精度↑・時間↑）。</li>
+          <li><b>ページ</b>：結果が多いときに次/前で移動。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card" id="outCard" style="display:none;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div class="meta">回答（整形済み）</div>
+        <button class="copy" id="copyBtn">本文をコピー（1位）</button>
+      </div>
+      <div id="topBlock" class="result"></div>
+      <div class="result">
+        <div class="meta" style="margin-bottom:6px;">2位以下（見出し＋出典）</div>
+        <div id="others" class="list"></div>
+      </div>
+    </div>
+
+    <div class="card" id="rawCard" style="display:none;">
+      <div class="meta">生データ（そのまま）</div>
+      <pre id="raw" style="white-space:pre-wrap;"></pre>
+    </div>
+
+  </div>
+
+  <script>
+    // ===== ユーティリティ（便利な道具） =====
+    const DEFAULT_RENDER = "https://mini-rose-search.onrender.com";
+
+    function autoBase() {
+      try {
+        // 同一オリジン（同じ住所）なら相対で叩く
+        if (location.origin && location.origin.startsWith("http") && location.protocol.startsWith("http")) {
+          return location.origin;
+        }
+      } catch {}
+      return DEFAULT_RENDER;
+    }
+
+    function $(id){ return document.getElementById(id); }
+    function getMode() {
+      const el = document.querySelector('input[name="mode"]:checked');
+      return el ? el.value : "chat";
+    }
+    function tokensFrom(q){
+      return (q||"")
+        .replace(/[、。・，．,.\n\r\t]/g," ")
+        .split(" ")
+        .map(s=>s.trim())
+        .filter(s=>s.length>=2)
+        .slice(0,8);
+    }
+    function highlight(text, toks){
+      if(!text || toks.length===0) return text||"";
+      let out = text;
+      toks.forEach(t=>{
+        const re = new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), "gi");
+        out = out.replace(re, m=>`<mark>${m}</mark>`);
+      });
+      return out;
+    }
+    function safe(v, alt="") { return (v===null||v===undefined) ? alt : v; }
+
+    // ===== 接続先 初期化 =====
+    const baseInput = $("baseUrl");
+    baseInput.value = autoBase();
+    $("detectBtn").onclick = ()=> { baseInput.value = autoBase(); msg(`接続先を ${baseInput.value} に設定しました。`); };
+
+    // ===== 状態表示 =====
+    function msg(s){ $("status").textContent = s; }
+
+    // ===== ページング =====
+    let page = 1;
+    let totalPages = 1;
+    $("prevBtn").onclick = ()=>{ if(page>1){ page--; $("pageInfo").textContent = `${page} / ${totalPages}`; } };
+    $("nextBtn").onclick = ()=>{ if(page<totalPages){ page++; $("pageInfo").textContent = `${page} / ${totalPages}`; } };
+
+    // ===== ヘルス/バージョン =====
+    $("healthBtn").onclick = async ()=>{
+      try{
+        const r = await fetch(`${baseInput.value}/health`, {credentials:"include"});
+        const j = await r.json();
+        msg(`/health → ${JSON.stringify(j)}`);
+      } catch(e){ msg(`/health エラー：${e}`); }
+    };
+    $("versionBtn").onclick = async ()=>{
+      try{
+        const r = await fetch(`${baseInput.value}/version`, {credentials:"include"});
+        const j = await r.json();
+        msg(`/version → ${JSON.stringify(j)}`);
+      } catch(e){ msg(`/version エラー：${e}`); }
+    };
+
+    // ===== 実行 =====
+    $("clearBtn").onclick = ()=>{
+      $("query").value = "";
+      $("outCard").style.display = "none";
+      $("rawCard").style.display = "none";
+      msg("クリアしました。");
+    };
+
+    $("runBtn").onclick = async ()=>{
+      const q = $("query").value.trim();
+      const mode = getMode();
+      const topK = parseInt($("topK").value, 10) || 3;
+      if(!q){ msg("質問（クエリ）を入れてください。"); return; }
+
+      msg("送信中…");
+      $("outCard").style.display = "none";
+      $("rawCard").style.display = "none";
+
+      const endpoint = mode === "chat" ? "/api/chat" : "/api/search";
+      const url = `${baseInput.value}${endpoint}`;
+
+      // 送信形式を2パターン試行（互換性のため）
+      const payloads = mode === "chat"
+        ? [{query: q, top_k: topK}, {ask: q, top_k: topK}]
+        : [{q: q, top_k: topK}, {query: q, top_k: topK}];
+
+      let data = null;
+      let lastErr = null;
+      for (const body of payloads) {
+        try {
+          const r = await fetch(url, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(body),
+            credentials: "include"
+          });
+          if (r.ok) { data = await r.json(); break; }
+          // POSTがダメならGETを試す
+          const qs = new URLSearchParams(Object.entries(body)).toString();
+          const r2 = await fetch(`${url}?${qs}`, {credentials:"include"});
+          if (r2.ok) { data = await r2.json(); break; }
+          lastErr = await r.text();
+        } catch(e){ lastErr = e.toString(); }
+      }
+      if(!data){
+        msg(`API呼び出しに失敗しました：${lastErr||"不明"}`);
+        return;
+      }
+
+      // 表示
+      $("raw").textContent = JSON.stringify(data, null, 2);
+      $("rawCard").style.display = "block";
+
+      const toks = tokensFrom(q);
+      const norm = normalize(mode, data);
+
+      renderTop(norm.top, toks);
+      renderOthers(norm.others, toks);
+
+      $("outCard").style.display = "block";
+      msg("完了。");
+
+      // コピー
+      $("copyBtn").onclick = ()=>{
+        const plain = stripHtml(norm.top?.text || "");
+        navigator.clipboard.writeText(plain)
+          .then(()=> msg("本文をコピーしました。"))
+          .catch(()=> msg("コピーに失敗しました。"));
+      };
+    };
+
+    function stripHtml(html) {
+      const tmp = document.createElement("div");
+      tmp.innerHTML = html || "";
+      return tmp.textContent || tmp.innerText || "";
+    }
+
+    // ===== 正規化（形を揃える） =====
+    function normalize(mode, data){
+      // 期待形：
+      // top: { issue, published, held_on, author, title, text, notion_url, source_url }
+      // others: [ { title, source_url } ... ]
+      const N = { top: null, others: [] };
+
+      // いくつかの候補キーを許容
+      const arr =
+        data?.answers || data?.results || data?.items || data?.data || data?.hits || [];
+
+      const first =
+        arr?.[0] || data?.top || data?.best || null;
+
+      if (first) {
+        N.top = {
+          issue: first.issue || first.会報号 || first.issue_no || first.number || "",
+          published: first.published || first.発行日 || first.date || first.published_at || "",
+          held_on: first.held_on || first.開催日 || first.event_date || "",
+          author: first.author || first.著者 || first.speaker || "",
+          title: first.title || first.タイトル || first.heading || "",
+          text: first.text || first.body || first.content || first.本文 || "",
+          notion_url: first.notion_url || first.notion || "",
+          source_url: first.source_url || first.url || first.link || ""
+        };
+      }
+
+      // 2位以下
+      const rest = (arr || []).slice(1);
+      N.others = rest.map(x=>({
+        title: x.title || x.タイトル || x.heading || x.issue || x.会報号 || "(タイトル不明)",
+        source_url: x.source_url || x.url || x.link || x.notion_url || ""
+      }));
+
+      return N;
+    }
+
+    function renderTop(top, toks){
+      const el = $("topBlock");
+      if(!top){
+        el.innerHTML = `<div class="small">1位が取得できませんでした。</div>`;
+        return;
+      }
+      const issue = safe(top.issue, "（会報号 不明）");
+      const pub = safe(top.published, "（発行日 不明）");
+      const held = safe(top.held_on, "（開催日 不明）");
+      const author = safe(top.author, "（著者 不明）");
+      const title = safe(top.title, "（タイトル 不明）");
+      const text = highlight(safe(top.text, ""), toks);
+
+      const notionBtn = top.notion_url
+        ? `<a class="btn" href="${top.notion_url}" target="_blank" rel="noopener">Notionを開く</a>`
+        : "";
+
+      const srcBtn = top.source_url
+        ? `<a class="btn" href="${top.source_url}" target="_blank" rel="noopener">出典リンク</a>`
+        : "";
+
+      el.innerHTML = `
+        <div class="meta">会報号：<b>${issue}</b>｜発行日：<b>${pub}</b>｜開催日：<b>${held}</b></div>
+        <h3>【${author}】${title}</h3>
+        <div>${text || "<span class='small'>（本文なし）</span>"}</div>
+        <div style="display:flex; gap:8px; margin-top:10px;">${notionBtn}${srcBtn}</div>
+      `;
+    }
+
+    function renderOthers(items, toks){
+      const box = $("others");
+      box.innerHTML = "";
+      if(!items || items.length===0){
+        box.innerHTML = `<div class="small">データなし。</div>`;
+        return;
+      }
+      for (const it of items){
+        const title = highlight(safe(it.title, "(タイトル不明)"), toks);
+        const link = it.source_url
+          ? `<a href="${it.source_url}" target="_blank" rel="noopener">出典</a>`
+          : `<span class="small">出典なし</span>`;
+        const div = document.createElement("div");
+        div.className = "item";
+        div.innerHTML = `<div style="display:flex; justify-content:space-between; gap:8px; align-items:center;">
+            <div>${title}</div>
+            <div>${link}</div>
+          </div>`;
+        box.appendChild(div);
+      }
+    }
+
+    // 初期ページ情報
+    $("pageInfo").textContent = `${page} / ${totalPages}`;
+  </script>
+</body>
+</html>
+

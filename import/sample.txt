@@ -1,0 +1,5 @@
+Title: ROSE 簡易チャットのメモ
+Date: 2025-08-25
+本文:
+FastAPI と Uvicorn を使って /api/search を呼び出す。
+UI は /ui から開く。FastAPI 側で JSONL を読む。

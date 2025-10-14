@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: newrose-fastapi
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    runtime:
+      dockerfilePath: ./Dockerfile
+    envVars:
+      - key: KB_URL
+        value: "SET_ME"

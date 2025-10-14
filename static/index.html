@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ミニバラ盆栽愛好会 デジタル資料館</title>
+  <!-- UI_STABLE: 2025-09-14 fix -->
+  <style>
+    :root{--bd:#e5e7eb;--muted:#6b7280;--pill:#fff4cc;--pillbd:#ffe08a;--card:#ffffff;--bg:#fafafa}
+    html,body{background:#fff;margin:0;padding:0}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";line-height:1.6;padding:24px}
+    h1{font-size:20px;margin:0 0 18px}
+    .card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px;margin:16px 0}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    input[type="text"]{flex:1 1 520px;padding:10px 12px;border:1px solid var(--bd);border-radius:10px}
+    button{padding:8px 14px;border:1px solid var(--bd);border-radius:10px;background:#f7f7f7;cursor:pointer}
+    button.primary{background:#e7f0ff;border-color:#9bbcff}
+    .hint{display:inline-block;background:var(--pill);border:1px solid var(--pillbd);border-radius:999px;padding:4px 10px;font-size:12px}
+    .label{font-weight:700;margin:10px 0 6px}
+    pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--bd);border-radius:10px;padding:12px;margin:6px 0}
+    details summary{cursor:pointer;color:#1f2937}
+    small{color:var(--muted)}
+  </style>
+</head>
+<body>
+  <h1>ミニバラ盆栽愛好会 デジタル資料館</h1>
+
+  <!-- チャット：/api/chat -->
+  <div class="card" id="chat-card">
+    <div class="row" style="justify-content:space-between">
+      <div><b>Rose（チャット）</b>　<small>API: /api/chat</small></div>
+      <div class="hint">KB優先＋GENERALフォールバック</div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input id="chat-q" type="text" placeholder="例）盆栽と盆景の違いを教えてください。" />
+      <button class="primary" id="btn-send">送信</button>
+      <button id="btn-clear">クリア</button>
+      <button id="btn-copy">本文をコピー</button>
+    </div>
+    <div class="label">チャット結果（整形表示）</div>
+    <pre id="chat-text">（未取得）</pre>
+    <details>
+      <summary>開発者向け：レスポンス（生のJSON）</summary>
+      <pre id="chat-json">（未取得）</pre>
+    </details>
+  </div>
+
+  <!-- 検索：/api/search（未実装でも壊れない） -->
+  <div class="card" id="search-card">
+    <div class="row" style="justify-content:space-between">
+      <div><b>検索システム</b>　<small>API: /api/search</small></div>
+      <div class="hint">表示ルール：1位＝本文＋主要項目／2位以下＝見出し＋出典リンク＋抜粋（最大5件）</div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input id="search-q" type="text" placeholder="検索キーワードを入力" />
+      <button class="primary" id="btn-search">検索</button>
+      <button id="btn-search-clear">クリア</button>
+    </div>
+    <div class="label">検索結果（整形表示）</div>
+    <pre id="search-text">（未取得）</pre>
+    <details>
+      <summary>開発者向け：レスポンス（生のJSON）</summary>
+      <pre id="search-json">（未取得）</pre>
+    </details>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    // ===== /api/chat =====
+    async function callChat(q) {
+      const url = `/api/chat?q=${encodeURIComponent(q)}&top_k=5`;
+      const res = await fetch(url, { headers: { "Accept": "application/json" } });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(`HTTP ${res.status}: ${t}`);
+      }
+      return await res.json();
+    }
+
+    async function onSend() {
+      const qEl = $("chat-q");
+      const q = qEl?.value?.trim() || "";
+      const pretty = $("chat-text");
+      const raw = $("chat-json");
+      if (!q) { pretty.textContent="（質問が空です）"; raw.textContent="{}"; return; }
+      pretty.textContent = "送信中…";
+      raw.textContent = "…";
+      try {
+        const data = await callChat(q);
+        // ★最重要：整形表示へ data.text を必ず出す
+        pretty.textContent =
+          (data && typeof data.text === "string" && data.text.trim()) ? data.text : "（該当なし）";
+        raw.textContent = JSON.stringify(data, null, 2);
+      } catch(e) {
+        pretty.textContent = `エラー：${e.message}`;
+        raw.textContent = "{}";
+      }
+    }
+
+    function onClear() {
+      $("chat-q").value = "";
+      $("chat-text").textContent = "（未取得）";
+      $("chat-json").textContent = "（未取得）";
+    }
+
+    async function onCopy() {
+      const t = $("chat-text").textContent || "";
+      try { await navigator.clipboard.writeText(t); $("btn-copy").textContent="コピー済み";
+            setTimeout(()=>{$("btn-copy").textContent="本文をコピー"},1200); }
+      catch { const ta=document.createElement("textarea"); ta.value=t; document.body.appendChild(ta);
+              ta.select(); document.execCommand("copy"); document.body.removeChild(ta); }
+    }
+
+    $("btn-send").addEventListener("click", onSend);
+    $("btn-clear").addEventListener("click", onClear);
+    $("btn-copy").addEventListener("click", onCopy);
+    $("chat-q").addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ e.preventDefault(); onSend(); } });
+
+    // ===== /api/search =====
+    async function callSearch(q) {
+      const url = `/api/search?q=${encodeURIComponent(q)}&top_k=5`;
+      const res = await fetch(url, { headers: { "Accept": "application/json" } });
+      if (res.status === 404) return { __not_impl: true, detail: "Not Found" };
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(`HTTP ${res.status}: ${t}`);
+      }
+      return await res.json();
+    }
+
+    async function onSearch() {
+      const qEl = $("search-q");
+      const q = qEl?.value?.trim() || "";
+      const pretty = $("search-text");
+      const raw = $("search-json");
+      if (!q) { pretty.textContent="（キーワードが空です）"; raw.textContent="{}"; return; }
+      pretty.textContent = "検索中…";
+      raw.textContent = "…";
+      try {
+        const data = await callSearch(q);
+        if (data.__not_impl) {
+          pretty.textContent = "（この環境では /api/search は未対応です）";
+          raw.textContent = JSON.stringify({detail:"Not Found"}, null, 2);
+          return;
+        }
+        // 整形表示：1位は本文抜粋、2位以下は見出し＋出典
+        let prettyText = "（該当なし）";
+        if (Array.isArray(data?.items) && data.items.length) {
+          const lines = [];
+          data.items.forEach((it, i) => {
+            if (i === 0) {
+              lines.push(`【1位】${it.title || "(無題)"}`);
+              lines.push(`本文抜粋：${(it.content || "").slice(0,200)}`);
+              lines.push(`出典：${it.source || it.url || "（不明）"}`);
+              lines.push("");
+            } else {
+              lines.push(`・${it.title || "(無題)"} —— ${it.source || it.url || "（不明）"}`);
+            }
+          });
+          prettyText = lines.join("\n");
+        }
+        pretty.textContent = prettyText;
+        raw.textContent = JSON.stringify(data, null, 2);
+      } catch(e) {
+        pretty.textContent = `エラー：${e.message}`;
+        raw.textContent = "{}";
+      }
+    }
+
+    function onSearchClear() {
+      $("search-q").value = "";
+      $("search-text").textContent = "（未取得）";
+      $("search-json").textContent = "（未取得）";
+    }
+
+    $("btn-search").addEventListener("click", onSearch);
+    $("btn-search-clear").addEventListener("click", onSearchClear);
+    $("search-q").addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ e.preventDefault(); onSearch(); } });
+  </script>
+</body>
+</html>
