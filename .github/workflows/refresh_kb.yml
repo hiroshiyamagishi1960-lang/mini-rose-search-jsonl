@@ -1,7 +1,8 @@
 name: Refresh KB Daily
+
 on:
   schedule:
-    - cron: '0 18 * * *'   # JST 03:00 (UTC 18:00)
+    - cron: '0 18 * * *'   # JST 03:00（UTC 18:00）
   workflow_dispatch: {}
 
 permissions:
@@ -10,40 +11,47 @@ permissions:
 jobs:
   refresh_kb:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    # ★ここで Notion の列名を環境変数に指定（コードは一切変更不要）
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+
+      # ---- 列名マッピング（実DBと一致させる）----
+      FIELD_TITLE: "Miniature Rose Digital Archivタイトル／テーマ"
+      FIELD_AUTHOR: "講師/著者"
+      FIELD_URL: "出典URL"
+      FIELD_TEXT: "講習会等内容"
+      FIELD_ISSUE: "会報号"
+      FIELD_DATE: "開催日／発行日"
+      # -----------------------------------------
+
+      # 診断ログを出す（最初の1回は 1 のままでOK。落ち着いたら 0 にしてもよい）
+      DIAG: "1"
+      # 設計検証時のみ：空でも出力したい場合は "1"（通常は 0 推奨）
+      ALLOW_EMPTY: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.x'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Generate kb.jsonl (diagnostic mode)
-        env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-          FIELD_TITLE: タイトル
-          FIELD_AUTHOR: 著者
-          FIELD_URL: 出典URL
-          FIELD_TEXT: 本文
-          FIELD_ISSUE: 会報号
-          FIELD_DATE: 代表日付
-          DIAG: "1"
-          ALLOW_EMPTY: "1"
         run: python refresh_kb.py
 
       - name: Commit and push changes
         run: |
-          git config user.name "GitHub Actions"
+          git config user.name  "actions-user"
           git config user.email "actions@github.com"
-          git add kb.jsonl kb_integrity.txt || true
-          if ! git diff --cached --quiet; then
-            git commit -m "Auto update KB $(date '+%Y-%m-%d %H:%M')"
-            git push
-          else
-            echo "No changes to commit."
-          fi
+          git add kb.jsonl kb_integrity.txt
+          git commit -m "Auto update KB ${{ github.run_id }}" || echo "No changes"
+          git push
