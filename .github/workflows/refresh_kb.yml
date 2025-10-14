@@ -1,0 +1,45 @@
+name: Refresh KB Daily
+
+on:
+  schedule:
+    - cron: "0 18 * * *"  # JST 03:00（UTC 18:00）
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run refresh_kb
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          FIELD_TITLE: タイトル
+          FIELD_AUTHOR: 著者
+          FIELD_URL: 出典URL
+          FIELD_TEXT: 本文
+          FIELD_ISSUE: 会報号
+          FIELD_DATE: 代表日付
+        run: python refresh_kb.py
+
+      - name: Commit and push
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add kb.jsonl kb_integrity.txt || true
+          git commit -m "Auto update KB $(date '+%Y-%m-%d %H:%M')" || true
+          git push
+
+      - name: Notify Render (optional)
+        if: ${{ secrets.RENDER_DEPLOY_HOOK_URL != '' }}
+        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
