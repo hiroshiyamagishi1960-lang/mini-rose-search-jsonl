@@ -1,8 +1,7 @@
 name: Refresh KB Daily
 on:
-  # 設計段階では手動実行のみ。日次実行を再開する場合は以下を有効化:
-  # schedule:
-  #   - cron: '0 18 * * *'   # JST 03:00 (UTC 18:00)
+   schedule:
+     - cron: '0 18 * * *'   # JST 03:00 (UTC 18:00)
   workflow_dispatch: {}
 
 permissions:
