@@ -20,7 +20,7 @@
       --guide-bg:#fff1f5;--guide-bd:#ffd6e7;
       --input-blue:#eef6ff;--input-blue-focus:#e6f0ff;
       --red:#dc2626;
-      --hl:#e6f3ff;              /* 薄い青ハイライト */
+      --hl:#e6f3ff;
     }
     html,body{background:#fff;margin:0;padding:0}
     html{font-size:18px}
@@ -52,18 +52,13 @@
     .sep{opacity:.3;margin:0 .4em}
     pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:14px;margin:8px 0;font-size:16px}
     a{word-break:break-all}
-    .search-title{color:var(--red);}  /* 検索システムの見出しを赤 */
-
-    /* ハイライト（検索語 <mark> と「（本文にヒット）」用） */
+    .search-title{color:var(--red);}
     mark{background:var(--hl); padding:0 .15em; border-radius:4px;}
     .bh{background:var(--hl); padding:0 .15em; border-radius:4px;}
-
-    /* 使いかた */
     .guide h2{font-size:20px;margin:0 0 6px}
     ol.guide{margin:6px 0 0 1.2em;padding:0;line-height:1.6}
     ol.guide li{margin:.35em 0}
     .ex{display:inline-block;border:1px solid var(--bd);border-radius:999px;padding:3px 10px;margin:4px 6px 0 0;font-size:14px}
-
     @media (max-width:400px){ .card{margin:14px 0} }
   </style>
 </head>
@@ -113,13 +108,13 @@
     </div>
   </div>
 
-  <!-- 2) お知らせ（カードのまま表示） -->
+  <!-- 2) お知らせ -->
   <div class="card disabled" role="status" aria-live="polite">
     <div class="hint">お知らせ</div>
     <div style="margin-top:8px">チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。</div>
   </div>
 
-  <!-- 3) 使いかた（常時表示） -->
+  <!-- 3) 使いかた -->
   <div class="card guide" id="howto">
     <h2>使いかた</h2>
     <ol class="guide">
@@ -131,19 +126,16 @@
     </ol>
   </div>
 
-  <!-- PWA: Service Worker 登録（自動更新フロー。二重登録はしない） -->
+  <!-- PWA: Service Worker 登録 -->
   <script>
     (function(){
       if (!("serviceWorker" in navigator)) return;
-
       let reloadedOnce = false;
-
       navigator.serviceWorker.addEventListener("controllerchange", () => {
         if (reloadedOnce) return;
         reloadedOnce = true;
         window.location.reload();
       });
-
       navigator.serviceWorker.register("/static/service-worker.js", { updateViaCache: "none" })
         .then((reg) => {
           try { reg.update(); } catch(e) {}
@@ -165,6 +157,15 @@
     const $ = (id) => document.getElementById(id);
     const sanitize = (s) => (typeof s === "string") ? s : "";
     const asArray = (x) => Array.isArray(x) ? x : [];
+
+    // ★ 入力正規化（全角スペース/改行/タブを除去）
+    function normalizeInput(s){
+      return (s||"")
+        .replace(/\u3000/g, " ")     // 全角スペース→半角
+        .replace(/[\r\n\t]+/g, " ")  // 改行/タブ→空白
+        .replace(/\s+/g, " ")        // 連続空白→1
+        .trim();
+    }
 
     // 検索UI状態
     let currentPage = 1;
@@ -188,12 +189,13 @@
       });
       return {
         items: mapped,
-        total_hits: data.total_hits ?? mapped.length,
+        total_hits: (typeof data.total_hits === "number") ? data.total_hits : mapped.length,
         page: data.page ?? 1,
         page_size: data.page_size ?? 5,
         has_more: !!data.has_more,
         next_page: data.next_page ?? null,
-        error: data.error ?? null
+        error: data.error ?? null,
+        order_used: data.order_used ?? null
       };
     }
 
@@ -209,12 +211,11 @@
       return `全 ${total} 件中 ${start}–${end} 件を表示`;
     }
 
-    // ★ 常に order=latest を付与
+    // ★ 常に自サービス（相対パス）＋ cache: no-store
     async function callSearch(q, page, pageSize, order = "latest") {
-      const url = `/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}&order=${order}`;
-      const res = await fetch(url, { headers: { "Accept": "application/json" } });
-      if (res.status === 404) return { __not_impl: true, detail: "Not Found" };
-      if (!res.ok) { throw new Error(`HTTP ${res.status}: ${await res.text()}`); }
+      const url = `/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}&order=${encodeURIComponent(order)}`;
+      const res = await fetch(url, { cache: 'no-store', headers: { "Accept": "application/json" } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       return await res.json();
     }
 
@@ -223,7 +224,6 @@
       $("btn-next").disabled = !enabledNext;
     }
 
-    // 「（本文にヒット）」を薄い青で装飾
     function decorateTitle(title){
       const t = sanitize(title || "(無題)");
       return t.replace(/（本文にヒット）/g, '<span class="bh">（本文にヒット）</span>');
@@ -231,59 +231,63 @@
 
     async function renderSearch(q, page){
       const pageSize = parseInt($("page-size").value || "5", 10);
+      $("btn-search").disabled = true;
       $("search-text").textContent = "検索中…";
       $("search-json").textContent = "…";
       $("meta-line").textContent = "…";
       $("page-info").textContent = "";
       setPagerButtons(false, false);
 
-      const raw = await callSearch(q, page, pageSize);
-      if (raw.__not_impl) {
-        $("search-text").textContent = "（この環境では /api/search は未対応です）";
-        $("search-json").textContent = JSON.stringify({detail:"Not Found"}, null, 2);
-        $("meta-line").textContent = "未対応";
-        return;
+      try{
+        const raw = await callSearch(q, page, pageSize);
+        const data = normalizeSearchResponse(raw);
+        lastQuery = q;
+        currentPage = data.page;
+        lastTotal = data.total_hits;
+        lastHasMore = data.has_more;
+
+        let html = "（該当なし）";
+        const items = asArray(data.items);
+        if (typeof data.total_hits === "number" && data.total_hits === 0) {
+          html = `（該当なし：q="${q}"）`;
+        } else if (items.length) {
+          const lines = [];
+          items.forEach((it, i) => {
+            const titleDecorated = decorateTitle(it.title);
+            const content = sanitize(it.content || "");
+            const src = linkOrText(it.source || it.url || "");
+            if (i === 0) {
+              const short = content.length > 900 ? `${content.slice(0,900)} …` : content;
+              lines.push(`【${data.page}ページ 先頭】 ${titleDecorated}`);
+              lines.push(`本文抜粋：<br>${short ? short : "（なし）"}`);
+              lines.push(`出典：${src}`); lines.push("");
+            } else {
+              lines.push(`・${titleDecorated} —— ${src}`);
+            }
+          });
+          html = lines.join("\n");
+        }
+        $("search-text").innerHTML = html;
+        $("search-json").textContent = JSON.stringify(raw, null, 2);
+        const orderUsed = data.order_used || "n/a";
+        $("meta-line").textContent = `${buildMetaLine(data.total_hits, data.page, data.page_size)} ／ order_used: ${orderUsed}`;
+        $("page-info").textContent = data.has_more
+          ? `次へで続きを表示できます（${data.next_page}ページ目へ）`
+          : `最後のページです`;
+        setPagerButtons(data.page > 1, data.has_more);
+      } catch(err){
+        $("search-text").innerHTML = `<span style="color:#c00">エラー: ${sanitize(String(err.message||err))}</span>`;
+        $("search-json").textContent = "{}";
+        $("meta-line").textContent = "エラー";
+        setPagerButtons(false, false);
+      } finally{
+        $("btn-search").disabled = false;
       }
-      const data = normalizeSearchResponse(raw);
-      lastQuery = q;
-      currentPage = data.page;
-      lastTotal = data.total_hits;
-      lastHasMore = data.has_more;
-
-      let html = "（該当なし）";
-      const items = asArray(data.items);
-      if (items.length) {
-        const lines = [];
-        items.forEach((it, i) => {
-          const titleDecorated = decorateTitle(it.title);
-          const content = sanitize(it.content || "");
-          const src = linkOrText(it.source || it.url || "");
-          if (i === 0) {
-            const short = content.length > 900 ? `${content.slice(0,900)} …` : content;
-            lines.push(`【${data.page}ページ 先頭】 ${titleDecorated}`);
-            lines.push(`本文抜粋：<br>${short ? short : "（なし）"}`);
-            lines.push(`出典：${src}`); lines.push("");
-          } else {
-            lines.push(`・${titleDecorated} —— ${src}`);
-          }
-        });
-        html = lines.join("\n");
-      }
-      $("search-text").innerHTML = html;
-      $("search-json").textContent = JSON.stringify(raw, null, 2);
-
-      // order_used を明示表示
-      const orderUsed = raw && raw.order_used ? raw.order_used : "n/a";
-      $("meta-line").textContent = `${buildMetaLine(data.total_hits, data.page, data.page_size)} ／ order_used: ${orderUsed}`;
-
-      $("page-info").textContent = data.has_more
-        ? `次へで続きを表示できます（${data.next_page}ページ目へ）`
-        : `最後のページです`;
-      setPagerButtons(data.page > 1, data.has_more);
     }
 
     async function onSearch() {
-      const q = $("search-q")?.value?.trim() || "";
+      const q0 = $("search-q")?.value ?? "";
+      const q = normalizeInput(q0);
       if (!q) {
         $("search-text").textContent="（キーワードが空です）";
         $("search-json").textContent="{}";
@@ -309,7 +313,7 @@
 
     function onSearchClear(){
       $("search-q").value="";
-      $("page-size").value="5";  // クリア時も5件に戻す
+      $("page-size").value="5";
       $("search-text").textContent="（未取得）";
       $("search-json").textContent="（未取得）";
       $("meta-line").textContent="（未検索）";
