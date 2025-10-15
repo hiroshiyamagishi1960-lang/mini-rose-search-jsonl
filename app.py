@@ -360,6 +360,31 @@ def _text_hit_any(text: str, terms: List[str]) -> bool:
     return False
 
 # =============================
+# ★ ここが不足していた関数：UI表示用にタイトル/本文を整形 ★
+# =============================
+def _apply_head_and_excerpt(r: Dict[str, str],
+                            head_hl: str,
+                            text_raw: str,
+                            is_first_in_page: bool,
+                            hl_terms: List[str]) -> Dict[str, Any]:
+    """
+    1件目は本文抜粋（ハイライト付）を返す。2件目以降は「（本文にヒット）」タグのみ。
+    既存UIに合わせて title/content に詰め替える直前の中間整形。
+    """
+    title = r.get("title", "")
+    out = dict(r)
+    if is_first_in_page:
+        out["title"] = f"{head_hl or title}"
+        out["text"]  = _highlight_terms(text_raw, hl_terms) + "<br><br>"
+    else:
+        hits_in_head = (head_hl != _make_head(r))
+        text_hit = _text_hit_any(text_raw, hl_terms)
+        tag = "" if hits_in_head else ("（本文にヒット）」"[:-1] if text_hit else "")
+        out["title"] = f"{head_hl}{tag}" if head_hl else f"{title}{tag}"
+        out["text"]  = ""
+    return out
+
+# =============================
 # Notion 全取得（Notionが設定されていれば使用）
 # =============================
 NOTION_VER = "2022-06-28"
