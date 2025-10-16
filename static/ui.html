@@ -5,99 +5,329 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>ミニバラ盆栽愛好会 デジタル資料館</title>
 
-  <!-- PWA関連 -->
-  <link rel="manifest" href="/static/manifest.json">
-  <meta name="theme-color" content="#ffffff">
-  <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+  <!-- PWA: manifest / theme-color / iOS用タイトルとアイコン -->
+  <link rel="manifest" href="/static/manifest.json?v=20251006">
+  <meta name="theme-color" content="#ff6699">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="ミニバラ">
+
+  <style>
+    :root{
+      --bd:#e5e7eb;--muted:#6b7280;--pill:#fff4cc;--pillbd:#ffe08a;
+      --card:#ffffff;--bg:#fafafa;
+      --disabled-bg:#f3f4f6;
+      --guide-bg:#fff1f5;--guide-bd:#ffd6e7;
+      --input-blue:#eef6ff;--input-blue-focus:#e6f0ff;
+      --red:#dc2626;
+      --hl:#e6f3ff;
+    }
+    html,body{background:#fff;margin:0;padding:0}
+    html{font-size:18px}
+    body{
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";
+      line-height:1.8;padding:28px
+    }
+    h1{font-size:28px;margin:0 0 22px}
+    .card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:18px;margin:18px 0}
+    .card.disabled{background:var(--disabled-bg)}
+    .card.guide{background:var(--guide-bg);border-color:var(--guide-bd)}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    input[type="text"]{
+      flex:1 1 520px;padding:12px 14px;border:1px solid var(--bd);border-radius:12px;font-size:18px;
+      background:var(--input-blue);
+    }
+    input[type="text"]::placeholder{color:#9ca3af}
+    input[type="text"]:focus{
+      outline:none;border-color:#c7ccd3;box-shadow:0 0 0 3px rgba(0,0,0,.04);
+      background:var(--input-blue-focus);
+    }
+    select{padding:10px 12px;border:1px solid var(--bd);border-radius:12px;font-size:16px;background:#fff}
+    button{padding:10px 16px;border:1px solid var(--bd);border-radius:12px;background:#f7f7f7;cursor:pointer;font-size:16px}
+    button.primary{background:#e7f0ff;border-color:#9bbcff}
+    button[disabled]{opacity:.5;cursor:not-allowed}
+    .hint{display:inline-block;background:var(--pill);border:1px solid var(--pillbd);border-radius:999px;padding:6px 12px;font-size:14px}
+    .label{font-weight:700;margin:12px 0 8px}
+    .muted{color:var(--muted)}
+    .sep{opacity:.3;margin:0 .4em}
+    pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:14px;margin:8px 0;font-size:16px}
+    a{word-break:break-all}
+    .search-title{color:var(--red);}
+    mark{background:var(--hl); padding:0 .15em; border-radius:4px;}
+    .bh{background:var(--hl); padding:0 .15em; border-radius:4px;}
+    .guide h2{font-size:20px;margin:0 0 6px}
+    ol.guide{margin:6px 0 0 1.2em;padding:0;line-height:1.6}
+    ol.guide li{margin:.35em 0}
+    .ex{display:inline-block;border:1px solid var(--bd);border-radius:999px;padding:3px 10px;margin:4px 6px 0 0;font-size:14px}
+    @media (max-width:400px){ .card{margin:14px 0} }
+  </style>
 </head>
+<body>
+  <h1>ミニバラ盆栽愛好会 デジタル資料館</h1>
 
-<body class="bg-gray-50 text-gray-900">
-  <main class="max-w-3xl mx-auto p-4">
-    <h1 class="text-2xl font-bold mb-4 text-center">🌹 ミニバラ盆栽愛好会 デジタル資料館</h1>
-
-    <form id="search-form" class="flex gap-2 mb-4">
-      <input id="query" name="q" type="text" placeholder="検索語を入力（例：苔・剪定・展示会）"
-             class="flex-1 border border-gray-300 rounded px-3 py-2 focus:outline-none focus:ring"
-             required />
-      <button type="submit"
-              class="bg-rose-500 hover:bg-rose-600 text-white font-medium px-4 py-2 rounded">
-        検索
-      </button>
-    </form>
-
-    <div id="results" class="space-y-4"></div>
-    <div id="pagination" class="flex justify-between items-center mt-6 hidden">
-      <button id="prev" class="text-rose-600 hover:underline">← 前のページ</button>
-      <span id="page-info" class="text-gray-600 text-sm"></span>
-      <button id="next" class="text-rose-600 hover:underline">次のページ →</button>
+  <!-- 1) 検索：/api/search（最上段） -->
+  <div class="card" id="search-card">
+    <div class="row" style="justify-content:space-between">
+      <div><b class="search-title" style="font-size:20px">検索システム</b>　<small class="muted">API: /api/search</small></div>
+      <div class="hint">年でしぼる＋ページ送り</div>
     </div>
-  </main>
+    <div class="row" style="margin-top:10px; gap:10px">
+      <input id="search-q" type="text" placeholder="例）苔／例）コンテスト 2023／例）剪定 1999-2001" />
+      <select id="page-size" title="1ページの件数">
+        <option value="5" selected>5件</option>
+        <option value="10">10件</option>
+        <option value="20">20件</option>
+      </select>
+      <button class="primary" id="btn-search">検索</button>
+      <button id="btn-search-clear">クリア</button>
+    </div>
 
-  <footer class="text-center text-sm text-gray-500 mt-10 mb-6">
-    © 2025 ミニバラ盆栽愛好会 Digital Archive
-  </footer>
+    <div class="row" style="margin-top:8px">
+      <span class="muted" id="meta-line">（未検索）</span>
+    </div>
 
-  <script>
-  const resultsDiv = document.getElementById('results');
-  const form = document.getElementById('search-form');
-  const queryInput = document.getElementById('query');
-  const pagination = document.getElementById('pagination');
-  const prevBtn = document.getElementById('prev');
-  const nextBtn = document.getElementById('next');
-  const pageInfo = document.getElementById('page-info');
-  let currentPage = 1;
-  let currentQuery = '';
+    <div class="label">検索結果（整形表示）</div>
+    <pre id="search-text">（未取得）</pre>
 
-  async function search(page = 1) {
-    const q = queryInput.value.trim();
-    if (!q) return;
-
-    resultsDiv.innerHTML = '検索中...';
-    pagination.classList.add('hidden');
-    currentPage = page;
-    currentQuery = q;
-
-    try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=5&order=latest`);
-      const data = await res.json();
-      showResults(data);
-    } catch (err) {
-      resultsDiv.innerHTML = `<p class="text-red-600">エラーが発生しました: ${err}</p>`;
-    }
-  }
-
-  function showResults(data) {
-    if (!data.items || data.items.length === 0) {
-      resultsDiv.innerHTML = '<p class="text-gray-600">該当する資料は見つかりませんでした。</p>';
-      pagination.classList.add('hidden');
-      return;
-    }
-
-    resultsDiv.innerHTML = data.items.map(r => `
-      <div class="border border-gray-300 rounded-lg p-3 bg-white shadow-sm">
-        <h2 class="font-semibold text-lg mb-2">${r.title || '(無題)'}</h2>
-        ${r.content ? `<p class="text-sm leading-relaxed mb-2">${r.content}</p>` : ''}
-        ${r.url ? `<a href="${r.url}" target="_blank" class="text-rose-600 text-sm underline">出典を見る</a>` : ''}
+    <div class="row" style="justify-content:space-between; margin-top:8px">
+      <div>
+        <button id="btn-prev" disabled>前へ</button>
+        <span class="sep">|</span>
+        <button id="btn-next" disabled>次へ</button>
       </div>
-    `).join('');
+      <div class="muted" id="page-info"></div>
+    </div>
 
-    if (data.has_more || currentPage > 1) {
-      pagination.classList.remove('hidden');
-      pageInfo.textContent = `ページ ${currentPage}`;
-      prevBtn.disabled = currentPage <= 1;
-      nextBtn.disabled = !data.has_more;
-    } else {
-      pagination.classList.add('hidden');
+    <details style="margin-top:8px">
+      <summary>開発者向け：レスポンス（生のJSON）</summary>
+      <pre id="search-json">（未取得）</pre>
+    </details>
+
+    <div class="muted" style="margin-top:8px">
+      ※ ハイライト（薄い青）はサーバ側の <code>&lt;mark&gt;</code> と <span class="bh">（本文にヒット）</span> を装飾しています。
+    </div>
+  </div>
+
+  <!-- 2) お知らせ -->
+  <div class="card disabled" role="status" aria-live="polite">
+    <div class="hint">お知らせ</div>
+    <div style="margin-top:8px">チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。</div>
+  </div>
+
+  <!-- 3) 使いかた -->
+  <div class="card guide" id="howto">
+    <h2>使いかた</h2>
+    <ol class="guide">
+      <li><b>ことばを入れて</b>「検索」を押す。</li>
+      <li>1ページに<b>5〜20件</b>表示。先頭だけ<b>本文の抜粋</b>を表示。</li>
+      <li>続きは<b>次へ</b>、戻るときは<b>前へ</b>（ページ送り）。</li>
+      <li><b>年でしぼる</b>ときは、語尾に<b>西暦4桁</b>をつける。<span class="ex">例：コンテスト 2023</span></li>
+      <li><b>年の範囲</b>はハイフンで書く。<span class="ex">例：剪定 1999-2001</span></li>
+    </ol>
+  </div>
+
+  <!-- PWA: Service Worker 登録 -->
+  <script>
+    (function(){
+      if (!("serviceWorker" in navigator)) return;
+      let reloadedOnce = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (reloadedOnce) return;
+        reloadedOnce = true;
+        window.location.reload();
+      });
+      navigator.serviceWorker.register("/static/service-worker.js", { updateViaCache: "none" })
+        .then((reg) => {
+          try { reg.update(); } catch(e) {}
+          document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === "visible") {
+              navigator.serviceWorker.getRegistration().then(r => r && r.update());
+            }
+          });
+          setInterval(() => {
+            navigator.serviceWorker.getRegistration().then(r => r && r.update());
+          }, 30 * 60 * 1000);
+        })
+        .catch(()=>{});
+    })();
+  </script>
+
+  <!-- 検索ロジック（order=latest を強制） -->
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const sanitize = (s) => (typeof s === "string") ? s : "";
+    const asArray = (x) => Array.isArray(x) ? x : [];
+
+    // ★ 入力正規化（全角スペース/改行/タブを除去）
+    function normalizeInput(s){
+      return (s||"")
+        .replace(/\u3000/g, " ")     // 全角スペース→半角
+        .replace(/[\r\n\t]+/g, " ")  // 改行/タブ→空白
+        .replace(/\s+/g, " ")        // 連続空白→1
+        .trim();
     }
 
-    prevBtn.onclick = () => search(currentPage - 1);
-    nextBtn.onclick = () => search(currentPage + 1);
-  }
+    // 検索UI状態
+    let currentPage = 1;
+    let lastQuery = "";
+    let lastTotal = 0;
+    let lastHasMore = false;
 
-  form.addEventListener('submit', e => {
-    e.preventDefault();
-    search(1);
-  });
+    function pick(...cands){ for (const k of cands){ if (k && typeof k==="string") return k; } return ""; }
+
+    function normalizeSearchResponse(data){
+      if (!data) return {items:[], total_hits:0, page:1, page_size:5, has_more:false, next_page:null};
+      let items = [];
+      if (Array.isArray(data.items)) items = data.items;
+      else if (Array.isArray(data.results)) items = data.results;
+      const mapped = items.map(r => {
+        const title   = pick(r.title, r.tTitle, r.head, r.heading);
+        const content = pick(r.content, r.text, r.body, r.tContent);
+        const url     = pick(r.url, r.link);
+        const source  = pick(r.source, url);
+        return { title, content, url, source, rank: r.rank ?? null };
+      });
+      return {
+        items: mapped,
+        total_hits: (typeof data.total_hits === "number") ? data.total_hits : mapped.length,
+        page: data.page ?? 1,
+        page_size: data.page_size ?? 5,
+        has_more: !!data.has_more,
+        next_page: data.next_page ?? null,
+        error: data.error ?? null,
+        order_used: data.order_used ?? null
+      };
+    }
+
+    function linkOrText(url){
+      const u = sanitize(url);
+      return u ? `<a href="${u}" target="_blank" rel="noopener">${u}</a>` : "（出典なし）";
+    }
+
+    function buildMetaLine(total, page, size){
+      if (!total) return "該当なし";
+      const start = (page - 1) * size + 1;
+      const end = Math.min(total, start + size - 1);
+      return `全 ${total} 件中 ${start}–${end} 件を表示`;
+    }
+
+    // ★ 常に自サービス（相対パス）＋ cache: no-store
+    async function callSearch(q, page, pageSize, order = "latest") {
+      const url = `/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}&order=${encodeURIComponent(order)}`;
+      const res = await fetch(url, { cache: 'no-store', headers: { "Accept": "application/json" } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      return await res.json();
+    }
+
+    function setPagerButtons(enabledPrev, enabledNext){
+      $("btn-prev").disabled = !enabledPrev;
+      $("btn-next").disabled = !enabledNext;
+    }
+
+    function decorateTitle(title){
+      const t = sanitize(title || "(無題)");
+      return t.replace(/（本文にヒット）/g, '<span class="bh">（本文にヒット）</span>');
+    }
+
+    async function renderSearch(q, page){
+      const pageSize = parseInt($("page-size").value || "5", 10);
+      $("btn-search").disabled = true;
+      $("search-text").textContent = "検索中…";
+      $("search-json").textContent = "…";
+      $("meta-line").textContent = "…";
+      $("page-info").textContent = "";
+      setPagerButtons(false, false);
+
+      try{
+        const raw = await callSearch(q, page, pageSize);
+        const data = normalizeSearchResponse(raw);
+        lastQuery = q;
+        currentPage = data.page;
+        lastTotal = data.total_hits;
+        lastHasMore = data.has_more;
+
+        let html = "（該当なし）";
+        const items = asArray(data.items);
+        if (typeof data.total_hits === "number" && data.total_hits === 0) {
+          html = `（該当なし：q="${q}"）`;
+        } else if (items.length) {
+          const lines = [];
+          items.forEach((it, i) => {
+            const titleDecorated = decorateTitle(it.title);
+            const content = sanitize(it.content || "");
+            const src = linkOrText(it.source || it.url || "");
+            if (i === 0) {
+              const short = content.length > 900 ? `${content.slice(0,900)} …` : content;
+              lines.push(`【${data.page}ページ 先頭】 ${titleDecorated}`);
+              lines.push(`本文抜粋：<br>${short ? short : "（なし）"}`);
+              lines.push(`出典：${src}`); lines.push("");
+            } else {
+              lines.push(`・${titleDecorated} —— ${src}`);
+            }
+          });
+          html = lines.join("\n");
+        }
+        $("search-text").innerHTML = html;
+        $("search-json").textContent = JSON.stringify(raw, null, 2);
+        const orderUsed = data.order_used || "n/a";
+        $("meta-line").textContent = `${buildMetaLine(data.total_hits, data.page, data.page_size)} ／ order_used: ${orderUsed}`;
+        $("page-info").textContent = data.has_more
+          ? `次へで続きを表示できます（${data.next_page}ページ目へ）`
+          : `最後のページです`;
+        setPagerButtons(data.page > 1, data.has_more);
+      } catch(err){
+        $("search-text").innerHTML = `<span style="color:#c00">エラー: ${sanitize(String(err.message||err))}</span>`;
+        $("search-json").textContent = "{}";
+        $("meta-line").textContent = "エラー";
+        setPagerButtons(false, false);
+      } finally{
+        $("btn-search").disabled = false;
+      }
+    }
+
+    async function onSearch() {
+      const q0 = $("search-q")?.value ?? "";
+      const q = normalizeInput(q0);
+      if (!q) {
+        $("search-text").textContent="（キーワードが空です）";
+        $("search-json").textContent="{}";
+        $("meta-line").textContent="";
+        setPagerButtons(false, false);
+        return;
+      }
+      currentPage = 1;
+      await renderSearch(q, currentPage);
+    }
+
+    async function onNext(){
+      if (!lastQuery || !lastHasMore) return;
+      currentPage += 1;
+      await renderSearch(lastQuery, currentPage);
+    }
+
+    async function onPrev(){
+      if (!lastQuery || currentPage <= 1) return;
+      currentPage -= 1;
+      await renderSearch(lastQuery, currentPage);
+    }
+
+    function onSearchClear(){
+      $("search-q").value="";
+      $("page-size").value="5";
+      $("search-text").textContent="（未取得）";
+      $("search-json").textContent="（未取得）";
+      $("meta-line").textContent="（未検索）";
+      $("page-info").textContent="";
+      lastQuery=""; currentPage=1; lastTotal=0; lastHasMore=false;
+      setPagerButtons(false, false);
+    }
+
+    $("btn-search").addEventListener("click", onSearch);
+    $("btn-search-clear").addEventListener("click", onSearchClear);
+    $("btn-next").addEventListener("click", onNext);
+    $("btn-prev").addEventListener("click", onPrev);
+    $("search-q").addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ e.preventDefault(); onSearch(); } });
+    $("page-size").addEventListener("change", async ()=>{ if(lastQuery){ currentPage=1; await renderSearch(lastQuery, currentPage); } });
   </script>
 </body>
 </html>
