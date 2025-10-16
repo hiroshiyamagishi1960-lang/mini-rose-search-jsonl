@@ -1,187 +1,227 @@
-# app.py — Mini Rose Search API（正式簡略版・JSONL専用）
-# 版: stable-jsonl-2025-10-16-proper
-# 特徴: 日本語検索最適化 / UI維持 / 診断機能完備 / 軽量高速版
+# app.py — Mini Rose Search API（JSONL版：mini-rose-search-jsonl 用）
+# 方針反映版：日本語短語ファジー抑止 / 代表日=開催日/発行日 / order=latest でページング前ソート / UI変更なし
+# 版: jsonl-2025-10-16-stable
 
-import os, re, json, unicodedata, datetime as dt, hashlib
-from typing import List, Dict, Any
+import os, re, json, unicodedata, datetime as dt
+from typing import List, Dict, Any, Tuple, Optional
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import requests
+from urllib.parse import urlparse, urlunparse
 
-# ==== 基本設定 ====
-APP_VERSION = "stable-jsonl-2025-10-16-proper"
-KB_URL = os.getenv("KB_URL", "").strip()
-KB_PATH = "kb.jsonl"
-CACHE_FILE = "kb_cache.jsonl"
+# ==== 環境変数 ====
+KB_URL = os.getenv("KB_URL", "https://raw.githubusercontent.com/hiroshiyamagishi1960-lang/mini-rose-search-jsonl/main/kb.jsonl")
+JSON_HEADERS = {"content-type": "application/json; charset=utf-8"}
 
-# ==== FastAPI 初期化 ====
-app = FastAPI(title="Mini Rose Search API", version=APP_VERSION)
+app = FastAPI(title="Mini Rose Search API", version="jsonl-2025-10-16-stable")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ==== 正規化関数 ====
-def normalize(text: str) -> str:
-    """日本語・英数字を統一的に正規化する"""
-    if not text:
-        return ""
-    text = unicodedata.normalize("NFKC", text)
-    text = text.lower()
-    # 句読点・空白を整理
-    text = re.sub(r"[、。,．，｡･・「」『』（）()［］\[\]{}<>〈〉【】!?！？…‥]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+# ==== UI ====
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
-def tokenize_like_japanese(text: str) -> List[str]:
-    """
-    日本語用の簡易トークナイズ（分かち書き風）
-    長い単語列を3〜5文字単位で分割して部分一致精度を向上させる
-    """
-    text = normalize(text)
-    if not text:
-        return []
-    # 英数字と漢字・かなを分離
-    parts = re.findall(r"[a-zA-Z0-9]+|[一-龥ぁ-んァ-ンー]+", text)
-    tokens = []
-    for p in parts:
-        if len(p) > 5:
-            # 長すぎる単語をスライス
-            tokens += [p[i:i+3] for i in range(0, len(p), 3)]
-        else:
-            tokens.append(p)
-    return tokens
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    path = "static/ui.html"
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            html = f.read()
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+    return HTMLResponse("<h1>Not Found</h1>", status_code=404, headers={"Cache-Control": "no-store"})
 
-# ==== KB 読み込み ====
-def load_kb() -> List[Dict[str, Any]]:
-    """KBをURLまたはローカルから読み込む"""
-    if KB_URL:
-        try:
-            res = requests.get(KB_URL, timeout=10)
-            if res.status_code == 200:
-                with open(KB_PATH, "w", encoding="utf-8") as f:
-                    f.write(res.text)
-        except Exception as e:
-            print("⚠️ KB_URL load failed:", e)
-    path = KB_PATH if os.path.exists(KB_PATH) else CACHE_FILE
-    if not os.path.exists(path):
-        print("⚠️ No KB found.")
-        return []
-    items = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                items.append(json.loads(line))
-            except Exception:
-                continue
-    print(f"📚 KB loaded: {len(items)} records")
+# =============================
+# 日本語かなフォールディング／同義語辞書
+# =============================
+def _nfkc(s: Optional[str]) -> str:
+    return unicodedata.normalize("NFKC", s or "")
+
+_SMALL_TO_BASE = str.maketrans({"ぁ":"あ","ぃ":"い","ぅ":"う","ぇ":"え","ぉ":"お","ゃ":"や","ゅ":"ゆ","ょ":"よ","ゎ":"わ","っ":"つ","ゕ":"か","ゖ":"け"})
+
+_A_SET=set("あかさたなはまやらわがざだばぱぁゃゎっ"); _I_SET=set("いきしちにひみりぎじぢびぴぃ")
+_U_SET=set("うくすつぬふむゆるぐずづぶぷぅゅっ"); _E_SET=set("えけせてねへめれげぜでべぺぇ")
+_O_SET=set("おこそとのほもよろをごぞどぼぽぉょ")
+
+def _kana_to_hira(s:str)->str:
+    out=[]
+    for ch in s:
+        code=ord(ch)
+        if 0x30A1<=code<=0x30F6: out.append(chr(code-0x60))
+        elif ch in("ヵ","ヶ"): out.append({"ヵ":"か","ヶ":"け"}[ch])
+        else: out.append(ch)
+    return "".join(out)
+
+def _long_to_vowel(prev:str)->str:
+    if not prev:return""
+    if prev in _A_SET:return"あ"
+    if prev in _I_SET:return"い"
+    if prev in _U_SET:return"う"
+    if prev in _E_SET:return"え"
+    if prev in _O_SET:return"お"
+    return""
+
+def fold_kana(s:str)->str:
+    if not s:return""
+    s=unicodedata.normalize("NFKC",s); s=_kana_to_hira(s); s=s.translate(_SMALL_TO_BASE)
+    buf=[]
+    for ch in s:
+        buf.append(_long_to_vowel(buf[-1]) if ch=="ー" else ch)
+    d=unicodedata.normalize("NFD","".join(buf))
+    d="".join(c for c in d if ord(c)not in(0x3099,0x309A))
+    return unicodedata.normalize("NFC",d).lower().strip()
+
+def hira_to_kata(s:str)->str:
+    out=[]
+    for ch in s:
+        code=ord(ch)
+        if 0x3041<=code<=0x3096: out.append(chr(code+0x60))
+        elif ch in("ゕ","ゖ"): out.append({"ゕ":"ヵ","ゖ":"ヶ"}[ch])
+        else: out.append(ch)
+    return"".join(out)
+
+KANJI_EQ={"苔":{"こけ","コケ"},"剪定":{"せん定","せんてい"},"施肥":{"肥料","追肥"},"用土":{"土","土の配合"},"挿し木":{"さし木","さし芽"},"接ぎ木":{"つぎ木","つぎき"},"植え替え":{"うえ替え","うえかえ"},"黒星病":{"クロボシ","黒点病"},"薔薇":{"バラ","ばら"},"ミニバラ":{"ミニ薔薇","みにばら"}}
+REVERSE_EQ={v: {k} for k,vs in KANJI_EQ.items() for v in vs}
+for k,vs in KANJI_EQ.items():
+    for v in vs: REVERSE_EQ.setdefault(v,set()).add(k)
+    REVERSE_EQ.setdefault(k,set()).add(k)
+
+def expand_with_domain_dict(term:str)->set:
+    out=set()
+    if term in KANJI_EQ: out|=KANJI_EQ[term]
+    if term in REVERSE_EQ: out|=REVERSE_EQ[term]
+    return out
+
+# =============================
+# KBロード（JSONL）
+# =============================
+def _load_kb(url:str)->List[Dict[str,Any]]:
+    items=[]
+    try:
+        r=requests.get(url,timeout=10)
+        r.raise_for_status()
+        for line in r.text.splitlines():
+            if line.strip():
+                try: items.append(json.loads(line))
+                except: pass
+    except Exception as e:
+        print("[WARN] KB load failed:",e)
     return items
 
-KB_DATA = load_kb()
-KB_HASH = hashlib.sha256(json.dumps(KB_DATA, ensure_ascii=False).encode()).hexdigest()[:12]
+KB_DATA=_load_kb(KB_URL)
+print(f"[INIT] KB loaded: {len(KB_DATA)} records from {KB_URL}")
 
-# ==== ハイライト ====
-def highlight_text(text: str, query: str) -> str:
-    """検索語句を <mark> でハイライト"""
-    q = re.escape(normalize(query))
-    if not q:
-        return text
-    return re.sub(q, lambda m: f"<mark>{m.group(0)}</mark>", text, flags=re.IGNORECASE)
+# =============================
+# 年フィルタ／代表日抽出
+# =============================
+def _nfkcnum(s:str)->str: return unicodedata.normalize("NFKC",s or "")
 
-# ==== 検索ロジック ====
-def search_kb(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    q_norm = normalize(query)
-    tokens = tokenize_like_japanese(q_norm)
-    if not tokens:
-        return []
+def _parse_year_any(s:str)->Optional[int]:
+    m=re.search(r"(19|20|21)\d{2}",_nfkcnum(s))
+    return int(m.group(0)) if m else None
 
-    results = []
+def _years_from_text(s:str)->List[int]:
+    ys=[int(y)for y in re.findall(r"(19|20|21)\d{2}",_nfkcnum(s))]
+    return sorted(set(ys))
+
+def _record_years(r:Dict[str,Any])->List[int]:
+    ys=set()
+    for k in("issue","date_primary","title","text","url"):
+        ys.update(_years_from_text(str(r.get(k,""))))
+    return sorted(ys)
+
+def _best_date(rec:Dict[str,Any])->dt.date:
+    ys=_record_years(rec)
+    return dt.date(max(ys),1,1) if ys else dt.date(1970,1,1)
+
+# =============================
+# 検索ロジック
+# =============================
+def jp_terms(q:str)->List[str]:
+    if not q:return[]
+    qn=_nfkc(q).replace("　"," ")
+    toks=[t for t in qn.split() if t]
+    return list(dict.fromkeys(toks))
+
+def expand_terms(terms:List[str])->List[str]:
+    out=set()
+    for t in terms:
+        out|={t,fold_kana(t),hira_to_kata(fold_kana(t))}
+        out|=expand_with_domain_dict(t)
+    return sorted(out)
+
+def _match_text(text:str,terms:List[str])->bool:
+    if not text:return False
+    t_low=text.lower(); t_fold=fold_kana(text)
+    for term in terms:
+        if term.lower() in t_low or fold_kana(term) in t_fold:
+            return True
+    return False
+
+def search_jsonl(q:str,year=None,year_from=None,year_to=None)->List[Dict[str,Any]]:
+    if not KB_DATA:return[]
+    terms=expand_terms(jp_terms(q))
+    results=[]
     for rec in KB_DATA:
-        title = rec.get("title", "")
-        content = rec.get("content", "")
-        url = rec.get("url", "")
-        full_text = normalize(title + " " + content)
-        score = sum(1 for t in tokens if t in full_text)
-        if score > 0:
-            snippet = content[:1200]
-            snippet = highlight_text(snippet, q_norm)
-            results.append({
-                "title": title or "(無題)",
-                "content": snippet,
-                "url": url,
-                "source": url,
-                "score": score
-            })
+        if _match_text(str(rec.get("title","")),terms) or _match_text(str(rec.get("content","")),terms):
+            if year or year_from or year_to:
+                ys=_record_years(rec)
+                if not ys: continue
+                if year and year not in ys: continue
+                lo=year_from or -10**9; hi=year_to or 10**9
+                if not any(lo<=y<=hi for y in ys): continue
+            results.append(rec)
+    results.sort(key=lambda r:_best_date(r),reverse=True)
+    return results
 
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_k]
-
-# ==== API エンドポイント ====
-@app.get("/health2")
-def health2():
-    """システムヘルス"""
-    return {
-        "ok": True,
-        "has_kb": bool(KB_DATA),
-        "kb_size": len(KB_DATA),
-        "kb_url": KB_URL,
-        "kb_hash": KB_HASH
-    }
-
-@app.get("/diag2")
-def diag2():
-    """詳細診断"""
-    return {
-        "version_hint": "jsonl-diag2",
-        "kb_url": KB_URL,
-        "has_kb": bool(KB_DATA),
-        "kb_size": len(KB_DATA),
-        "kb_sha": KB_HASH,
-        "loaded_at": dt.datetime.now().isoformat(timespec="seconds")
-    }
-
-@app.get("/api/search")
-def api_search(
-    q: str = Query(..., description="検索語句"),
-    page: int = 1,
-    page_size: int = 5,
-):
-    """KB全文検索"""
-    if not q.strip():
-        return {"items": [], "total_hits": 0, "error": "empty query"}
-    results = search_kb(q, top_k=page_size)
-    total = len(results)
-    return {
-        "items": results,
-        "total_hits": total,
-        "page": page,
-        "page_size": page_size,
-        "has_more": total > page * page_size,
-        "next_page": page + 1 if total > page * page_size else None
-    }
-
-@app.get("/ui")
-def ui_page():
-    """検索UI"""
-    try:
-        with open("static/ui.html", "r", encoding="utf-8") as f:
-            return HTMLResponse(f.read())
-    except FileNotFoundError:
-        return HTMLResponse("<h2>UI not found</h2>", status_code=404)
+# =============================
+# API
+# =============================
+@app.get("/health")
+def health():
+    return JSONResponse({"ok":True,"kb_url":KB_URL,"kb_size":len(KB_DATA)},headers=JSON_HEADERS)
 
 @app.get("/version")
 def version():
-    """バージョン情報"""
-    return PlainTextResponse(APP_VERSION)
+    return JSONResponse({"version":app.version},headers=JSON_HEADERS)
+
+@app.get("/diag")
+def diag(q:str=Query("",description="確認")):
+    return JSONResponse({"query":q,"years":_years_from_text(q)},headers=JSON_HEADERS)
+
+@app.get("/api/search")
+def api_search(q:str=Query("",description="検索語"),page:int=1,page_size:int=5,order:str="latest"):
+    try:
+        if not q.strip():
+            return JSONResponse({"items":[],"total_hits":0,"page":1,"page_size":page_size,"has_more":False},headers=JSON_HEADERS)
+        ranked=search_jsonl(q)
+        total=len(ranked)
+        start=(page-1)*page_size; end=start+page_size
+        slice_=ranked[start:end]
+        items=[]
+        for i,r in enumerate(slice_):
+            items.append({
+                "title":r.get("title",""),
+                "content":r.get("content","")[:900],
+                "url":r.get("url",""),
+                "source":r.get("url",""),
+                "rank":start+i+1
+            })
+        return JSONResponse({
+            "items":items,
+            "total_hits":total,
+            "page":page,
+            "page_size":page_size,
+            "has_more":end<total,
+            "next_page":page+1 if end<total else None,
+            "order_used":order
+        },headers=JSON_HEADERS)
+    except Exception as e:
+        return JSONResponse({"items":[],"error":str(e)},headers=JSON_HEADERS)
 
 @app.get("/")
 def root():
-    """ルート確認"""
-    return {"message": "Mini Rose Search API running", "version": APP_VERSION}
-
-# ==== ここまで ====
+    return PlainTextResponse("Mini Rose Search JSONL API running.\n",headers={"content-type":"text/plain; charset=utf-8"})
