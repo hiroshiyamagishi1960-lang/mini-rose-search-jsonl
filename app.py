@@ -987,3 +987,45 @@ def api_chat(q:str=Query("", description="質問文（会話用）"),
 def root():
     return PlainTextResponse("Mini Rose Search API is running.\n",
                              headers={"content-type":"text/plain; charset=utf-8"})
+# ==== 最下部追加：診断・確認用エンドポイント ===============================
+
+@app.get("/health2")
+def health2():
+    """kb.jsonl の読み込み確認"""
+    _, kb_sha, kb_lines = load_kb(force=False) if KB_URL or os.path.exists(KB_PATH) else ([], "", 0)
+    return JSONResponse({
+        "ok": True,
+        "has_kb": bool(kb_lines > 0),
+        "kb_size": kb_lines,
+        "kb_sha256": (kb_sha[:40] if kb_sha else None),
+        "kb_url": KB_URL,
+        "kb_path": KB_PATH,
+        "version_hint": "jsonl-health2"
+    }, headers=JSON_HEADERS)
+
+@app.post("/kb/reload")
+def kb_reload():
+    """kb.jsonl の再読み込み"""
+    _, kb_sha, kb_lines = load_kb(force=True)
+    return JSONResponse({
+        "reloaded": True,
+        "has_kb": bool(kb_lines > 0),
+        "kb_size": kb_lines,
+        "kb_sha256": (kb_sha[:40] if kb_sha else None),
+        "kb_url": KB_URL,
+        "kb_path": KB_PATH
+    }, headers=JSON_HEADERS)
+
+@app.get("/diag2")
+def diag2():
+    """簡易診断（KB の有無など）"""
+    _, kb_sha, kb_lines = load_kb(force=False) if KB_URL or os.path.exists(KB_PATH) else ([], "", 0)
+    return JSONResponse({
+        "version_hint": "jsonl-diag2",
+        "kb_url": KB_URL,
+        "has_kb": bool(kb_lines > 0),
+        "kb_size": kb_lines,
+        "kb_sha256": (kb_sha[:40] if kb_sha else None),
+    }, headers=JSON_HEADERS)
+
+# ==== 追加ここまで ==========================================================
