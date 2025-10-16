@@ -4,51 +4,100 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>ミニバラ盆栽愛好会 デジタル資料館</title>
-  <style>
-    body { font-family: "Hiragino Sans","Helvetica Neue",sans-serif; margin: 2em; }
-    input { width: 80%; padding: .6em; font-size: 1rem; }
-    button { padding: .6em 1.2em; margin-left: .4em; }
-    #results { margin-top: 2em; }
-    .item { border-bottom: 1px solid #ddd; padding: .8em 0; }
-    .item a { text-decoration: none; color: #336699; }
-    mark { background: #fff59d !important; font-weight: bold; }
-    small { color: #666; }
-  </style>
+
+  <!-- PWA関連 -->
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#ffffff">
+  <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
 </head>
-<body>
-  <h1>🌹 ミニバラ盆栽愛好会 デジタル資料館</h1>
-  <input id="q" placeholder="検索語を入力（例：苔・剪定・コンテスト）" />
-  <button onclick="doSearch()">検索</button>
-  <div id="results"></div>
+
+<body class="bg-gray-50 text-gray-900">
+  <main class="max-w-3xl mx-auto p-4">
+    <h1 class="text-2xl font-bold mb-4 text-center">🌹 ミニバラ盆栽愛好会 デジタル資料館</h1>
+
+    <form id="search-form" class="flex gap-2 mb-4">
+      <input id="query" name="q" type="text" placeholder="検索語を入力（例：苔・剪定・展示会）"
+             class="flex-1 border border-gray-300 rounded px-3 py-2 focus:outline-none focus:ring"
+             required />
+      <button type="submit"
+              class="bg-rose-500 hover:bg-rose-600 text-white font-medium px-4 py-2 rounded">
+        検索
+      </button>
+    </form>
+
+    <div id="results" class="space-y-4"></div>
+    <div id="pagination" class="flex justify-between items-center mt-6 hidden">
+      <button id="prev" class="text-rose-600 hover:underline">← 前のページ</button>
+      <span id="page-info" class="text-gray-600 text-sm"></span>
+      <button id="next" class="text-rose-600 hover:underline">次のページ →</button>
+    </div>
+  </main>
+
+  <footer class="text-center text-sm text-gray-500 mt-10 mb-6">
+    © 2025 ミニバラ盆栽愛好会 Digital Archive
+  </footer>
 
   <script>
-  async function doSearch(page=1) {
-    const q = document.getElementById("q").value.trim();
-    const res = document.getElementById("results");
-    if(!q){ res.innerHTML = "検索語を入力してください。"; return; }
-    res.innerHTML = "検索中...";
-    const resp = await fetch(`/api/search?q=${encodeURIComponent(q)}&page=${page}&_=${Date.now()}`, {cache:"no-store"});
-    const data = await resp.json();
-    if(!data.items || data.items.length===0){ res.innerHTML="該当なし"; return; }
+  const resultsDiv = document.getElementById('results');
+  const form = document.getElementById('search-form');
+  const queryInput = document.getElementById('query');
+  const pagination = document.getElementById('pagination');
+  const prevBtn = document.getElementById('prev');
+  const nextBtn = document.getElementById('next');
+  const pageInfo = document.getElementById('page-info');
+  let currentPage = 1;
+  let currentQuery = '';
 
-    res.innerHTML = `<p>🔍 ${data.total_hits} 件ヒット (${data.page}/${Math.ceil(data.total_hits/data.page_size)})</p>`;
-    data.items.forEach(r=>{
-      const div=document.createElement("div");
-      div.className="item";
-      div.innerHTML = `
-        <a href="${r.url||'#'}" target="_blank">${r.title||"(無題)"}</a><br>
-        <div>${r.content||""}</div>
-      `;
-      res.appendChild(div);
-    });
+  async function search(page = 1) {
+    const q = queryInput.value.trim();
+    if (!q) return;
 
-    if(data.has_more){
-      const btn=document.createElement("button");
-      btn.textContent="次のページ ▶";
-      btn.onclick=()=>doSearch(data.next_page);
-      res.appendChild(btn);
+    resultsDiv.innerHTML = '検索中...';
+    pagination.classList.add('hidden');
+    currentPage = page;
+    currentQuery = q;
+
+    try {
+      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=5&order=latest`);
+      const data = await res.json();
+      showResults(data);
+    } catch (err) {
+      resultsDiv.innerHTML = `<p class="text-red-600">エラーが発生しました: ${err}</p>`;
     }
   }
+
+  function showResults(data) {
+    if (!data.items || data.items.length === 0) {
+      resultsDiv.innerHTML = '<p class="text-gray-600">該当する資料は見つかりませんでした。</p>';
+      pagination.classList.add('hidden');
+      return;
+    }
+
+    resultsDiv.innerHTML = data.items.map(r => `
+      <div class="border border-gray-300 rounded-lg p-3 bg-white shadow-sm">
+        <h2 class="font-semibold text-lg mb-2">${r.title || '(無題)'}</h2>
+        ${r.content ? `<p class="text-sm leading-relaxed mb-2">${r.content}</p>` : ''}
+        ${r.url ? `<a href="${r.url}" target="_blank" class="text-rose-600 text-sm underline">出典を見る</a>` : ''}
+      </div>
+    `).join('');
+
+    if (data.has_more || currentPage > 1) {
+      pagination.classList.remove('hidden');
+      pageInfo.textContent = `ページ ${currentPage}`;
+      prevBtn.disabled = currentPage <= 1;
+      nextBtn.disabled = !data.has_more;
+    } else {
+      pagination.classList.add('hidden');
+    }
+
+    prevBtn.onclick = () => search(currentPage - 1);
+    nextBtn.onclick = () => search(currentPage + 1);
+  }
+
+  form.addEventListener('submit', e => {
+    e.preventDefault();
+    search(1);
+  });
   </script>
 </body>
 </html>
