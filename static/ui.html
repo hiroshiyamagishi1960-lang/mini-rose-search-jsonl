@@ -74,16 +74,20 @@
   </div>
 
   <script>
-    // ★★★★★ ここだけ編集すればOK（作業簡略化のため固定）
-    const API_BASE = "https://mini-rose-search-jsonl.onrender.com";  // ← “ヒットしているほう” のドメインに固定
+    // ===== 接続先（ここを固定） =====
+    const API_BASE = "https://mini-rose-search-jsonl.onrender.com";
     document.getElementById("api-label").textContent = API_BASE + "/api/search";
 
-    // 旧SWのキャッシュ無効化
+    // 旧Service Workerを解除（キャッシュ汚染対策）
     (async function unregisterSW(){
       if (!("serviceWorker" in navigator)) return;
-      try { const regs = await navigator.serviceWorker.getRegistrations(); for (const r of regs){ try{ await r.unregister(); }catch(e){} } } catch(e){}
+      try {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        for (const r of regs) { try { await r.unregister(); } catch(e){} }
+      } catch(e){}
     })();
 
+    // ===== ユーティリティ =====
     const $ = (id) => document.getElementById(id);
     const sanitize = (s) => (typeof s === "string") ? s : "";
     const asArray = (x) => Array.isArray(x) ? x : [];
