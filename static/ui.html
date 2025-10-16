@@ -3,185 +3,344 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>ミニバラ盆栽愛好会｜検索（JSONL版）</title>
-  <meta name="robots" content="noindex" />
+  <title>ミニバラ盆栽愛好会 デジタル資料館 ｜ UI-TEST-20251016-2135</title>
+
+  <!-- PWA: manifest / theme-color / iOS用タイトルとアイコン -->
+  <link rel="manifest" href="/static/manifest.json?v=20251006">
+  <meta name="theme-color" content="#ff6699">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="ミニバラ">
+
   <style>
-    :root{--bd:#e5e7eb;--muted:#6b7280;--pill:#fff4cc;--pillbd:#ffe08a;--card:#ffffff;--bg:#fafafa;--hl:#e6f3ff;--error:#b91c1c;}
+    :root{
+      --bd:#e5e7eb;--muted:#6b7280;--pill:#fff4cc;--pillbd:#ffe08a;
+      --card:#ffffff;--bg:#fafafa;
+      --disabled-bg:#f3f4f6;
+      --guide-bg:#fff1f5;--guide-bd:#ffd6e7;
+      --input-blue:#eef6ff;--input-blue-focus:#e6f0ff;
+      --red:#dc2626;
+      --hl:#e6f3ff;
+    }
     html,body{background:#fff;margin:0;padding:0}
     html{font-size:18px}
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";line-height:1.7;padding:28px}
-    h1{font-size:26px;margin:0 0 18px}
+    body{
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";
+      line-height:1.8;padding:28px
+    }
+    h1{font-size:28px;margin:0 0 22px}
+    .card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:18px;margin:18px 0}
+    .card.disabled{background:var(--disabled-bg)}
+    .card.guide{background:var(--guide-bg);border-color:var(--guide-bd)}
     .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-    .card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:16px;margin:16px 0}
-    .muted{color:var(--muted)}
-    .hint{display:inline-block;background:var(--pill);border:1px solid var(--pillbd);border-radius:999px;padding:6px 10px;font-size:14px}
-    input[type="text"]{flex:1 1 520px;padding:12px 14px;border:1px solid var(--bd);border-radius:12px;font-size:18px;background:#f7fbff}
+    input[type="text"]{
+      flex:1 1 520px;padding:12px 14px;border:1px solid var(--bd);border-radius:12px;font-size:18px;
+      background:var(--input-blue);
+    }
     input[type="text"]::placeholder{color:#9ca3af}
+    input[type="text"]:focus{
+      outline:none;border-color:#c7ccd3;box-shadow:0 0 0 3px rgba(0,0,0,.04);
+      background:var(--input-blue-focus);
+    }
     select{padding:10px 12px;border:1px solid var(--bd);border-radius:12px;font-size:16px;background:#fff}
     button{padding:10px 16px;border:1px solid var(--bd);border-radius:12px;background:#f7f7f7;cursor:pointer;font-size:16px}
     button.primary{background:#e7f0ff;border-color:#9bbcff}
     button[disabled]{opacity:.5;cursor:not-allowed}
-    .sep{opacity:.35;margin:0 .4em}
-    .meta{margin-top:6px}
-    .list{margin:10px 0 0;padding:0;list-style:none}
-    .item{border-top:1px solid var(--bd);padding:12px 0}
-    .item:first-child{border-top:0}
-    .title{font-weight:700}
-    .src a{word-break:break-all}
-    .excerpt{background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:12px;margin-top:6px;white-space:pre-wrap;word-break:break-word}
-    .noresult{color:#111}
-    mark{background:var(--hl);padding:0 .15em;border-radius:4px}
-    details > summary{cursor:pointer}
-    .error{color:var(--error)}
-    @media (max-width:420px){ .card{margin:12px 0} }
+    .hint{display:inline-block;background:var(--pill);border:1px solid var(--pillbd);border-radius:999px;padding:6px 12px;font-size:14px}
+    .label{font-weight:700;margin:12px 0 8px}
+    .muted{color:var(--muted)}
+    .sep{opacity:.3;margin:0 .4em}
+    pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:14px;margin:8px 0;font-size:16px}
+    a{word-break:break-all}
+    .search-title{color:var(--red);}
+    mark{background:var(--hl); padding:0 .15em; border-radius:4px;}
+    .bh{background:var(--hl); padding:0 .15em; border-radius:4px;}
+    .guide h2{font-size:20px;margin:0 0 6px}
+    ol.guide{margin:6px 0 0 1.2em;padding:0;line-height:1.6}
+    ol.guide li{margin:.35em 0}
+    .ex{display:inline-block;border:1px solid var(--bd);border-radius:999px;padding:3px 10px;margin:4px 6px 0 0;font-size:14px}
+    @media (max-width:400px){ .card{margin:14px 0} }
   </style>
 </head>
 <body>
-  <h1>ミニバラ盆栽愛好会｜検索（JSONL版）</h1>
+  <h1>ミニバラ盆栽愛好会 デジタル資料館 ｜ UI-TEST-20251016-2135</h1>
 
+  <!-- 1) 検索：/api/search（最上段） -->
   <div class="card" id="search-card">
     <div class="row" style="justify-content:space-between">
-      <div><span class="hint">API: <code id="api-label"></code></span></div>
-      <div class="muted">年はクエリに西暦を含めてください（例：<code>コンテスト 2023</code> / <code>剪定 1999-2001</code>）</div>
+      <div>
+        <b class="search-title" style="font-size:20px">検索システム</b>
+        <span class="sep"></span>
+        <small class="muted">API: <span id="api-label">/api/search</span></small>
+        <span class="sep"></span>
+        <span class="hint" id="build-id">UIビルド: UI-TEST-20251016-2135</span>
+      </div>
+      <div class="hint">年でしぼる＋ページ送り</div>
     </div>
-
-    <div class="row" style="margin-top:10px">
-      <input id="q" type="text" placeholder="例）苔／例）コンテスト／例）剪定 1999-2001" />
+    <div class="row" style="margin-top:10px; gap:10px">
+      <input id="search-q" type="text" placeholder="例）苔／例）コンテスト 2023／例）剪定 1999-2001" />
       <select id="page-size" title="1ページの件数">
         <option value="5" selected>5件</option>
         <option value="10">10件</option>
         <option value="20">20件</option>
       </select>
       <button class="primary" id="btn-search">検索</button>
-      <button id="btn-clear">クリア</button>
-      <button id="btn-cache" title="古いキャッシュを消して再読込">キャッシュ削除</button>
+      <button id="btn-search-clear">クリア</button>
     </div>
 
-    <div class="meta muted" id="meta">（未検索）</div>
-
-    <div class="card" id="result-card" style="margin-top:12px">
-      <div id="result-area" class="noresult muted">（未取得）</div>
-      <ul id="list" class="list" hidden></ul>
+    <div class="row" style="margin-top:8px">
+      <span class="muted" id="meta-line">（未検索）</span>
     </div>
 
-    <div class="row" style="justify-content:space-between; margin-top:6px">
+    <div class="label">検索結果（整形表示）</div>
+    <pre id="search-text">（未取得）</pre>
+
+    <div class="row" style="justify-content:space-between; margin-top:8px">
       <div>
         <button id="btn-prev" disabled>前へ</button>
         <span class="sep">|</span>
         <button id="btn-next" disabled>次へ</button>
       </div>
-      <div class="muted" id="pageinfo"></div>
+      <div class="muted" id="page-info"></div>
     </div>
 
     <details style="margin-top:8px">
-      <summary>開発者向け：レスポンス（JSON）</summary>
-      <pre id="raw" style="white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid var(--bd);border-radius:12px;padding:12px;margin-top:6px">（未取得）</pre>
+      <summary>開発者向け：レスポンス（生のJSON）</summary>
+      <pre id="search-json">（未取得）</pre>
     </details>
+
+    <div class="muted" style="margin-top:8px">
+      ※ ハイライト（薄い青）はサーバ側の <code>&lt;mark&gt;</code> と <span class="bh">（本文にヒット）</span> を装飾しています。
+    </div>
   </div>
 
-  <script>
-    // ===== 接続先（ここを固定） =====
-    const API_BASE = "https://mini-rose-search-jsonl.onrender.com"; // JSONL側のAPI（データがある本体）
-    document.getElementById("api-label").textContent = API_BASE + "/api/search";
+  <!-- 2) お知らせ -->
+  <div class="card disabled" role="status" aria-live="polite">
+    <div class="hint">お知らせ</div>
+    <div style="margin-top:8px">チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。</div>
+  </div>
 
-    // 旧Service Workerの解除（古いキャッシュの影響を防ぐ）
-    (async function unregisterSW(){
-      if (!("serviceWorker" in navigator)) return;
-      try {
-        const regs = await navigator.serviceWorker.getRegistrations();
-        for (const r of regs) { try { await r.unregister(); } catch(e){} }
-      } catch(e){}
+  <!-- 3) 使いかた -->
+  <div class="card guide" id="howto">
+    <h2>使いかた</h2>
+    <ol class="guide">
+      <li><b>ことばを入れて</b>「検索」を押す。</li>
+      <li>1ページに<b>5〜20件</b>表示。先頭だけ<b>本文の抜粋</b>を表示。</li>
+      <li>続きは<b>次へ</b>、戻るときは<b>前へ</b>（ページ送り）。</li>
+      <li><b>年でしぼる</b>ときは、語尾に<b>西暦4桁</b>をつける。<span class="ex">例：コンテスト 2023</span></li>
+      <li><b>年の範囲</b>はハイフンで書く。<span class="ex">例：剪定 1999-2001</span></li>
+    </ol>
+  </div>
+
+  <!-- PWA: Service Worker 登録 -->
+  <script>
+    // 表示用のAPIラベルとビルドID（ここだけで「新UIか」を判定できます）
+    (function(){
+      // ここでは敢えて相対のまま（/api/search）にしておきます。タイトルとビルドIDが見えれば「新UIが配信された」証拠になります。
+      document.getElementById("api-label").textContent = "/api/search";
+      document.getElementById("build-id").textContent = "UIビルド: UI-TEST-20251016-2135";
     })();
 
-    // ===== ユーティリティ =====
+    (function(){
+      if (!("serviceWorker" in navigator)) return;
+      let reloadedOnce = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (reloadedOnce) return;
+        reloadedOnce = true;
+        window.location.reload();
+      });
+      navigator.serviceWorker.register("/static/service-worker.js", { updateViaCache: "none" })
+        .then((reg) => {
+          try { reg.update(); } catch(e) {}
+          document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === "visible") {
+              navigator.serviceWorker.getRegistration().then(r => r && r.update());
+            }
+          });
+          setInterval(() => {
+            navigator.serviceWorker.getRegistration().then(r => r && r.update());
+          }, 30 * 60 * 1000);
+        })
+        .catch(()=>{});
+    })();
+  </script>
+
+  <!-- 検索ロジック（order=latest を強制） -->
+  <script>
     const $ = (id) => document.getElementById(id);
     const sanitize = (s) => (typeof s === "string") ? s : "";
     const asArray = (x) => Array.isArray(x) ? x : [];
 
+    // 入力正規化（全角スペース/改行/タブを除去）
     function normalizeInput(s){
-      return (s||"").replace(/\u3000/g," ").replace(/[\r\n\t]+/g," ").replace(/\s+/g," ").trim();
+      return (s||"")
+        .replace(/\u3000/g, " ")     // 全角スペース→半角
+        .replace(/[\r\n\t]+/g, " ")  // 改行/タブ→空白
+        .replace(/\s+/g, " ")        // 連続空白→1
+        .trim();
     }
 
-    async function callSearch(q, page, pageSize, order="latest"){
-      const url = `${API_BASE}/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}&order=${encodeURIComponent(order)}`;
-      const res = await fetch(url, { cache: "no-store", headers: { "Accept": "application/json" } });
+    // 検索UI状態
+    let currentPage = 1;
+    let lastQuery = "";
+    let lastTotal = 0;
+    let lastHasMore = false;
+
+    function pick(...cands){ for (const k of cands){ if (k && typeof k==="string") return k; } return ""; }
+
+    function normalizeSearchResponse(data){
+      if (!data) return {items:[], total_hits:0, page:1, page_size:5, has_more:false, next_page:null};
+      let items = [];
+      if (Array.isArray(data.items)) items = data.items;
+      else if (Array.isArray(data.results)) items = data.results;
+      const mapped = items.map(r => {
+        const title   = pick(r.title, r.tTitle, r.head, r.heading);
+        const content = pick(r.content, r.text, r.body, r.tContent);
+        const url     = pick(r.url, r.link);
+        const source  = pick(r.source, url);
+        return { title, content, url, source, rank: r.rank ?? null };
+      });
+      return {
+        items: mapped,
+        total_hits: (typeof data.total_hits === "number") ? data.total_hits : mapped.length,
+        page: data.page ?? 1,
+        page_size: data.page_size ?? 5,
+        has_more: !!data.has_more,
+        next_page: data.next_page ?? null,
+        error: data.error ?? null,
+        order_used: data.order_used ?? null
+      };
+    }
+
+    function linkOrText(url){
+      const u = sanitize(url);
+      return u ? `<a href="${u}" target="_blank" rel="noopener">${u}</a>` : "（出典なし）";
+    }
+
+    function buildMetaLine(total, page, size){
+      if (!total) return "該当なし";
+      const start = (page - 1) * size + 1;
+      const end = Math.min(total, start + size - 1);
+      return `全 ${total} 件中 ${start}–${end} 件を表示`;
+    }
+
+    // 相対パスのまま。今回は「タイトル・ビルドIDが変わるか」の検証が目的
+    async function callSearch(q, page, pageSize, order = "latest") {
+      const url = `/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}&order=${encodeURIComponent(order)}`;
+      const res = await fetch(url, { cache: 'no-store', headers: { "Accept": "application/json" } });
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       return await res.json();
     }
 
-    let currentPage = 1, lastQuery = "", lastTotal = 0, lastHasMore = false;
-
-    function buildMeta(total, page, size){
-      if (!Number.isFinite(total) || total <= 0) return "該当なし";
-      const start = (page - 1) * size + 1, end = Math.min(total, start + size - 1);
-      return `全 ${total} 件中 ${start}–${end} 件を表示`;
-    }
-    function linkOrText(url){ const u=sanitize(url); return u ? `<a href="${u}" target="_blank" rel="noopener">${u}</a>` : "（出典なし）"; }
-
-    function renderItems(data){
-      const list = $("list"), area = $("result-area"), items = asArray(data.items);
-      if (typeof data.total_hits === "number" && data.total_hits === 0){
-        list.hidden = true; area.classList.add("noresult"); area.innerText = `（該当なし：q="${lastQuery}"）`; return;
-      }
-      if (!items.length){
-        list.hidden = true; area.classList.remove("muted"); area.innerHTML = `<span>このページには表示できる項目がありません。<b>前へ</b>で戻ってください。</span>`; return;
-      }
-      list.innerHTML = "";
-      items.forEach((it, idx) => {
-        const li = document.createElement("li"); li.className = "item";
-        const title = sanitize(it.title || "(無題)"), body = sanitize(it.content || "");
-        const src = linkOrText(it.source || it.url || "");
-        li.innerHTML = (idx===0)
-          ? `<div class="title">【${data.page}ページ 先頭】 ${title}</div><div class="excerpt">${body||"（本文抜粋なし）"}</div><div class="src muted">出典：${src}</div>`
-          : `<div class="title">・${title}</div><div class="src muted">出典：${src}</div>`;
-        list.appendChild(li);
-      });
-      list.hidden = false; area.classList.remove("noresult"); area.classList.add("muted"); area.innerText = "（整形表示）";
+    function setPagerButtons(enabledPrev, enabledNext){
+      $("btn-prev").disabled = !enabledPrev;
+      $("btn-next").disabled = !enabledNext;
     }
 
-    function setPager(page, hasMore){
-      $("btn-prev").disabled = page <= 1; $("btn-next").disabled = !hasMore;
-      $("pageinfo").innerText = hasMore ? `次へで ${page+1} ページ目` : `最後のページです`;
+    function decorateTitle(title){
+      const t = sanitize(title || "(無題)");
+      return t.replace(/（本文にヒット）/g, '<span class="bh">（本文にヒット）</span>');
     }
 
-    async function doSearch(q, page){
-      const size = parseInt($("page-size").value || "5", 10);
-      $("btn-search").disabled = true; $("btn-prev").disabled = true; $("btn-next").disabled = true;
-      $("result-area").innerText = "検索中…"; $("list").hidden = true; $("raw").textContent = "…"; $("meta").textContent = "…"; $("pageinfo").textContent = "";
+    async function renderSearch(q, page){
+      const pageSize = parseInt($("page-size").value || "5", 10);
+      $("btn-search").disabled = true;
+      $("search-text").textContent = "検索中…";
+      $("search-json").textContent = "…";
+      $("meta-line").textContent = "…";
+      $("page-info").textContent = "";
+      setPagerButtons(false, false);
+
       try{
-        const raw = await callSearch(q, page, size);
-        lastQuery = q; currentPage = raw.page ?? page; lastTotal = +raw.total_hits || 0; lastHasMore = !!raw.has_more;
-        $("raw").textContent = JSON.stringify(raw, null, 2);
-        $("meta").textContent = buildMeta(lastTotal, currentPage, raw.page_size ?? size);
-        renderItems(raw); setPager(currentPage, lastHasMore);
+        const raw = await callSearch(q, page, pageSize);
+        const data = normalizeSearchResponse(raw);
+        lastQuery = q;
+        currentPage = data.page;
+        lastTotal = data.total_hits;
+        lastHasMore = data.has_more;
+
+        let html = "（該当なし）";
+        const items = asArray(data.items);
+        if (typeof data.total_hits === "number" && data.total_hits === 0) {
+          html = `（該当なし：q="${q}"）`;
+        } else if (items.length) {
+          const lines = [];
+          items.forEach((it, i) => {
+            const titleDecorated = decorateTitle(it.title);
+            const content = sanitize(it.content || "");
+            const src = linkOrText(it.source || it.url || "");
+            if (i === 0) {
+              const short = content.length > 900 ? `${content.slice(0,900)} …` : content;
+              lines.push(`【${data.page}ページ 先頭】 ${titleDecorated}`);
+              lines.push(`本文抜粋：<br>${short ? short : "（なし）"}`);
+              lines.push(`出典：${src}`); lines.push("");
+            } else {
+              lines.push(`・${titleDecorated} —— ${src}`);
+            }
+          });
+          html = lines.join("\n");
+        }
+        $("search-text").innerHTML = html;
+        $("search-json").textContent = JSON.stringify(raw, null, 2);
+        const orderUsed = data.order_used || "n/a";
+        $("meta-line").textContent = `${buildMetaLine(data.total_hits, data.page, data.page_size)} ／ order_used: ${orderUsed}`;
+        $("page-info").textContent = data.has_more
+          ? `次へで続きを表示できます（${data.next_page}ページ目へ）`
+          : `最後のページです`;
+        setPagerButtons(data.page > 1, data.has_more);
       } catch(err){
-        $("result-area").innerHTML = `<span class="error">エラー：${sanitize(String(err.message||err))}</span>`;
-        $("raw").textContent = "{}"; $("meta").textContent = "エラー"; $("btn-prev").disabled = true; $("btn-next").disabled = true;
+        $("search-text").innerHTML = `<span style="color:#c00">エラー: ${sanitize(String(err.message||err))}</span>`;
+        $("search-json").textContent = "{}";
+        $("meta-line").textContent = "エラー";
+        setPagerButtons(false, false);
       } finally{
         $("btn-search").disabled = false;
       }
     }
 
-    async function onSearch(){
-      const q = normalizeInput($("q").value || ""); if (!q){
-        $("result-area").innerText = "（キーワードが空です）"; $("list").hidden = true; $("raw").textContent = "{}";
-        $("meta").textContent = "（未検索）"; $("pageinfo").textContent = ""; $("btn-prev").disabled = true; $("btn-next").disabled = true;
-        lastQuery=""; currentPage=1; lastTotal=0; lastHasMore=false; return;
+    async function onSearch() {
+      const q0 = $("search-q")?.value ?? "";
+      const q = normalizeInput(q0);
+      if (!q) {
+        $("search-text").textContent="（キーワードが空です）";
+        $("search-json").textContent="{}";
+        $("meta-line").textContent="";
+        setPagerButtons(false, false);
+        return;
       }
-      currentPage = 1; await doSearch(q, currentPage);
+      currentPage = 1;
+      await renderSearch(q, currentPage);
     }
-    async function onNext(){ if (!lastQuery || !lastHasMore) return; currentPage += 1; await doSearch(lastQuery, currentPage); }
-    async function onPrev(){ if (!lastQuery || currentPage <= 1) return; currentPage -= 1; await doSearch(lastQuery, currentPage); }
-    function onClear(){ $("q").value=""; $("page-size").value="5"; $("result-area").innerText="（未取得）"; $("list").hidden=true; $("raw").textContent="（未取得）"; $("meta").textContent="（未検索）"; $("pageinfo").textContent=""; lastQuery=""; currentPage=1; lastTotal=0; lastHasMore=false; $("btn-prev").disabled=true; $("btn-next").disabled=true; }
-    async function clearCachesAndReload(){ try{ if ("caches" in window){ const keys = await caches.keys(); await Promise.all(keys.map(k => caches.delete(k))); } }catch(e){} location.reload(); }
+
+    async function onNext(){
+      if (!lastQuery || !lastHasMore) return;
+      currentPage += 1;
+      await renderSearch(lastQuery, currentPage);
+    }
+
+    async function onPrev(){
+      if (!lastQuery || currentPage <= 1) return;
+      currentPage -= 1;
+      await renderSearch(lastQuery, currentPage);
+    }
+
+    function onSearchClear(){
+      $("search-q").value="";
+      $("page-size").value="5";
+      $("search-text").textContent="（未取得）";
+      $("search-json").textContent="（未取得）";
+      $("meta-line").textContent="（未検索）";
+      $("page-info").textContent="";
+      lastQuery=""; currentPage=1; lastTotal=0; lastHasMore=false;
+      setPagerButtons(false, false);
+    }
 
     $("btn-search").addEventListener("click", onSearch);
-    $("btn-clear").addEventListener("click", onClear);
+    $("btn-search-clear").addEventListener("click", onSearchClear);
     $("btn-next").addEventListener("click", onNext);
     $("btn-prev").addEventListener("click", onPrev);
-    $("q").addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ e.preventDefault(); onSearch(); } });
-    $("page-size").addEventListener("change", async ()=>{ if(lastQuery){ currentPage=1; await doSearch(lastQuery, currentPage); } });
-    $("btn-cache").addEventListener("click", clearCachesAndReload);
+    $("search-q").addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ e.preventDefault(); onSearch(); } });
+    $("page-size").addEventListener("change", async ()=>{ if(lastQuery){ currentPage=1; await renderSearch(lastQuery, currentPage); } });
   </script>
 </body>
 </html>
