@@ -7,12 +7,14 @@
   <meta name="robots" content="noindex" />
   <style>
     :root{--bd:#e5e7eb;--muted:#6b7280;--pill:#fff4cc;--pillbd:#ffe08a;--card:#ffffff;--bg:#fafafa;--hl:#e6f3ff;--error:#b91c1c;}
-    html,body{background:#fff;margin:0;padding:0} html{font-size:18px}
+    html,body{background:#fff;margin:0;padding:0}
+    html{font-size:18px}
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";line-height:1.7;padding:28px}
     h1{font-size:26px;margin:0 0 18px}
     .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     .card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:16px;margin:16px 0}
-    .muted{color:var(--muted)} .hint{display:inline-block;background:var(--pill);border:1px solid var(--pillbd);border-radius:999px;padding:6px 10px;font-size:14px}
+    .muted{color:var(--muted)}
+    .hint{display:inline-block;background:var(--pill);border:1px solid var(--pillbd);border-radius:999px;padding:6px 10px;font-size:14px}
     input[type="text"]{flex:1 1 520px;padding:12px 14px;border:1px solid var(--bd);border-radius:12px;font-size:18px;background:#f7fbff}
     input[type="text"]::placeholder{color:#9ca3af}
     select{padding:10px 12px;border:1px solid var(--bd);border-radius:12px;font-size:16px;background:#fff}
@@ -22,11 +24,15 @@
     .sep{opacity:.35;margin:0 .4em}
     .meta{margin-top:6px}
     .list{margin:10px 0 0;padding:0;list-style:none}
-    .item{border-top:1px solid var(--bd);padding:12px 0} .item:first-child{border-top:0}
-    .title{font-weight:700} .src a{word-break:break-all}
+    .item{border-top:1px solid var(--bd);padding:12px 0}
+    .item:first-child{border-top:0}
+    .title{font-weight:700}
+    .src a{word-break:break-all}
     .excerpt{background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:12px;margin-top:6px;white-space:pre-wrap;word-break:break-word}
-    .noresult{color:#111} mark{background:var(--hl);padding:0 .15em;border-radius:4px}
-    details > summary{cursor:pointer} .error{color:var(--error)}
+    .noresult{color:#111}
+    mark{background:var(--hl);padding:0 .15em;border-radius:4px}
+    details > summary{cursor:pointer}
+    .error{color:var(--error)}
     @media (max-width:420px){ .card{margin:12px 0} }
   </style>
 </head>
@@ -75,10 +81,10 @@
 
   <script>
     // ===== 接続先（ここを固定） =====
-    const API_BASE = "https://mini-rose-search-jsonl.onrender.com";
+    const API_BASE = "https://mini-rose-search-jsonl.onrender.com"; // JSONL側のAPI（データがある本体）
     document.getElementById("api-label").textContent = API_BASE + "/api/search";
 
-    // 旧Service Workerを解除（キャッシュ汚染対策）
+    // 旧Service Workerの解除（古いキャッシュの影響を防ぐ）
     (async function unregisterSW(){
       if (!("serviceWorker" in navigator)) return;
       try {
