@@ -10,7 +10,86 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import requests
 from urllib.parse import urlparse, urlunparse
+import httpx
+# === ここから追記（app.pyのimportsの下あたり） ==========================
+import os, time, json
+from typing import Optional
+from fastapi import APIRouter
+import httpx
 
+DIAG = {
+    "kb_url": os.getenv("KB_URL", "").strip(),
+    "has_kb": False,
+    "kb_size": 0,
+    "loaded_at": None,
+    "last_error": None,
+    "etag": None,
+}
+
+_kb_lines_cache: Optional[list[str]] = None
+router_diag = APIRouter()
+
+async def _fetch_kb_text(url: str) -> str:
+    # 生RAWを確実に取得するための最小実装
+    headers = {
+        "User-Agent": "mini-rose-search-jsonl/diag",
+        "Accept": "text/plain,*/*",
+    }
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        # ETag等（あれば）保存
+        DIAG["etag"] = r.headers.get("ETag")
+        return r.text
+
+async def _load_kb(force: bool = False) -> None:
+    global _kb_lines_cache
+    try:
+        if not DIAG["kb_url"]:
+            raise RuntimeError("KB_URL is empty")
+        if _kb_lines_cache is not None and not force:
+            # 既に読み込み済み
+            return
+        text = await _fetch_kb_text(DIAG["kb_url"])
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        _kb_lines_cache = lines
+        DIAG["kb_size"] = len(lines)
+        DIAG["has_kb"] = len(lines) > 0
+        DIAG["loaded_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        DIAG["last_error"] = None
+    except Exception as e:
+        DIAG["has_kb"] = False
+        DIAG["kb_size"] = 0
+        DIAG["last_error"] = repr(e)
+
+@router_diag.get("/kb/status")
+async def kb_status():
+    await _load_kb(force=False)
+    return DIAG
+
+@router_diag.post("/kb/reload")
+async def kb_reload():
+    await _load_kb(force=True)
+    return DIAG
+
+@router_diag.get("/health2")
+async def health2():
+    await _load_kb(force=False)
+    return {"ok": True, "has_kb": DIAG["has_kb"], "kb_size": DIAG["kb_size"], "kb_url": DIAG["kb_url"]}
+
+@router_diag.get("/diag2")
+async def diag2():
+    await _load_kb(force=False)
+    return {"version_hint": "jsonl-diag2", **DIAG}
+
+# FastAPI本体にマウント（既存 app 変数がある前提）
+try:
+    app.include_router(router_diag)
+except Exception:
+    # app が未定義のタイミングなら後で include してもOK
+    pass
+# === 追記ここまで =========================================================
 # ==== 環境変数（Notion：あれば優先。無ければJSONLフォールバック） ====
 NOTION_TOKEN       = os.getenv("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
