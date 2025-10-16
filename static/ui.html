@@ -3,21 +3,16 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>ミニバラ盆栽愛好会｜検索</title>
+  <title>ミニバラ盆栽愛好会｜検索（JSONL版）</title>
   <meta name="robots" content="noindex" />
   <style>
-    :root{
-      --bd:#e5e7eb;--muted:#6b7280;--pill:#fff4cc;--pillbd:#ffe08a;
-      --card:#ffffff;--bg:#fafafa;--hl:#e6f3ff;--error:#b91c1c;
-    }
-    html,body{background:#fff;margin:0;padding:0}
-    html{font-size:18px}
+    :root{--bd:#e5e7eb;--muted:#6b7280;--pill:#fff4cc;--pillbd:#ffe08a;--card:#ffffff;--bg:#fafafa;--hl:#e6f3ff;--error:#b91c1c;}
+    html,body{background:#fff;margin:0;padding:0} html{font-size:18px}
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";line-height:1.7;padding:28px}
     h1{font-size:26px;margin:0 0 18px}
     .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     .card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:16px;margin:16px 0}
-    .muted{color:var(--muted)}
-    .hint{display:inline-block;background:var(--pill);border:1px solid var(--pillbd);border-radius:999px;padding:6px 10px;font-size:14px}
+    .muted{color:var(--muted)} .hint{display:inline-block;background:var(--pill);border:1px solid var(--pillbd);border-radius:999px;padding:6px 10px;font-size:14px}
     input[type="text"]{flex:1 1 520px;padding:12px 14px;border:1px solid var(--bd);border-radius:12px;font-size:18px;background:#f7fbff}
     input[type="text"]::placeholder{color:#9ca3af}
     select{padding:10px 12px;border:1px solid var(--bd);border-radius:12px;font-size:16px;background:#fff}
@@ -27,25 +22,20 @@
     .sep{opacity:.35;margin:0 .4em}
     .meta{margin-top:6px}
     .list{margin:10px 0 0;padding:0;list-style:none}
-    .item{border-top:1px solid var(--bd);padding:12px 0}
-    .item:first-child{border-top:0}
-    .title{font-weight:700}
-    .src a{word-break:break-all}
+    .item{border-top:1px solid var(--bd);padding:12px 0} .item:first-child{border-top:0}
+    .title{font-weight:700} .src a{word-break:break-all}
     .excerpt{background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:12px;margin-top:6px;white-space:pre-wrap;word-break:break-word}
-    .noresult{color:#111}
-    mark{background:var(--hl);padding:0 .15em;border-radius:4px}
-    details > summary{cursor:pointer}
-    .error{color:var(--error)}
+    .noresult{color:#111} mark{background:var(--hl);padding:0 .15em;border-radius:4px}
+    details > summary{cursor:pointer} .error{color:var(--error)}
     @media (max-width:420px){ .card{margin:12px 0} }
   </style>
 </head>
 <body>
-  <h1>ミニバラ盆栽愛好会｜検索</h1>
+  <h1>ミニバラ盆栽愛好会｜検索（JSONL版）</h1>
 
-  <!-- 検索フォーム -->
   <div class="card" id="search-card">
     <div class="row" style="justify-content:space-between">
-      <div><span class="hint">API: /api/search</span></div>
+      <div><span class="hint">API: <code id="api-label"></code></span></div>
       <div class="muted">年はクエリに西暦を含めてください（例：<code>コンテスト 2023</code> / <code>剪定 1999-2001</code>）</div>
     </div>
 
@@ -63,13 +53,11 @@
 
     <div class="meta muted" id="meta">（未検索）</div>
 
-    <!-- 結果 -->
     <div class="card" id="result-card" style="margin-top:12px">
       <div id="result-area" class="noresult muted">（未取得）</div>
       <ul id="list" class="list" hidden></ul>
     </div>
 
-    <!-- ページャ -->
     <div class="row" style="justify-content:space-between; margin-top:6px">
       <div>
         <button id="btn-prev" disabled>前へ</button>
@@ -79,7 +67,6 @@
       <div class="muted" id="pageinfo"></div>
     </div>
 
-    <!-- デバッグ（生JSON） -->
     <details style="margin-top:8px">
       <summary>開発者向け：レスポンス（JSON）</summary>
       <pre id="raw" style="white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid var(--bd);border-radius:12px;padding:12px;margin-top:6px">（未取得）</pre>
@@ -87,198 +74,97 @@
   </div>
 
   <script>
-    // ====== 基本ユーティリティ ======
+    // ★★★★★ ここだけ編集すればOK（作業簡略化のため固定）
+    const API_BASE = "https://mini-rose-search-jsonl.onrender.com";  // ← “ヒットしているほう” のドメインに固定
+    document.getElementById("api-label").textContent = API_BASE + "/api/search";
+
+    // 旧SWのキャッシュ無効化
+    (async function unregisterSW(){
+      if (!("serviceWorker" in navigator)) return;
+      try { const regs = await navigator.serviceWorker.getRegistrations(); for (const r of regs){ try{ await r.unregister(); }catch(e){} } } catch(e){}
+    })();
+
     const $ = (id) => document.getElementById(id);
     const sanitize = (s) => (typeof s === "string") ? s : "";
     const asArray = (x) => Array.isArray(x) ? x : [];
 
-    // 既存のService Workerがあれば解除（旧UIのキャッシュ汚染を防止）
-    (async function unregisterSW(){
-      if (!("serviceWorker" in navigator)) return;
-      try {
-        const regs = await navigator.serviceWorker.getRegistrations();
-        for (const r of regs) { try { await r.unregister(); } catch(e){} }
-      } catch(e){}
-    })();
-
-    // 入力正規化（全角スペース/改行/タブ→半角1つ、前後trim）
     function normalizeInput(s){
-      return (s||"")
-        .replace(/\u3000/g," ")        // 全角スペース→半角
-        .replace(/[\r\n\t]+/g," ")     // 改行/タブ→空白
-        .replace(/\s+/g," ")           // 連続空白→1
-        .trim();
+      return (s||"").replace(/\u3000/g," ").replace(/[\r\n\t]+/g," ").replace(/\s+/g," ").trim();
     }
 
-    // APIコール（相対パス＆no-store固定）
     async function callSearch(q, page, pageSize, order="latest"){
-      const url = `/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}&order=${encodeURIComponent(order)}`;
+      const url = `${API_BASE}/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}&order=${encodeURIComponent(order)}`;
       const res = await fetch(url, { cache: "no-store", headers: { "Accept": "application/json" } });
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       return await res.json();
     }
 
-    // UI状態
-    let currentPage = 1;
-    let lastQuery = "";
-    let lastTotal = 0;
-    let lastHasMore = false;
+    let currentPage = 1, lastQuery = "", lastTotal = 0, lastHasMore = false;
 
     function buildMeta(total, page, size){
       if (!Number.isFinite(total) || total <= 0) return "該当なし";
-      const start = (page - 1) * size + 1;
-      const end = Math.min(total, start + size - 1);
+      const start = (page - 1) * size + 1, end = Math.min(total, start + size - 1);
       return `全 ${total} 件中 ${start}–${end} 件を表示`;
     }
-
-    function linkOrText(url){
-      const u = sanitize(url);
-      return u ? `<a href="${u}" target="_blank" rel="noopener">${u}</a>` : "（出典なし）";
-    }
+    function linkOrText(url){ const u=sanitize(url); return u ? `<a href="${u}" target="_blank" rel="noopener">${u}</a>` : "（出典なし）"; }
 
     function renderItems(data){
-      const list = $("list");
-      const area = $("result-area");
-      const items = asArray(data.items);
-
-      // 判定は total_hits のみ
+      const list = $("list"), area = $("result-area"), items = asArray(data.items);
       if (typeof data.total_hits === "number" && data.total_hits === 0){
-        list.hidden = true;
-        area.classList.add("noresult");
-        area.innerText = `（該当なし：q="${lastQuery}"）`;
-        return;
+        list.hidden = true; area.classList.add("noresult"); area.innerText = `（該当なし：q="${lastQuery}"）`; return;
       }
-
-      // total_hits>0 だがこのページに項目がない（ページ外）の場合
       if (!items.length){
-        list.hidden = true;
-        area.classList.remove("muted");
-        area.innerHTML = `<span>このページには表示できる項目がありません。<b>前へ</b>で戻ってください。</span>`;
-        return;
+        list.hidden = true; area.classList.remove("muted"); area.innerHTML = `<span>このページには表示できる項目がありません。<b>前へ</b>で戻ってください。</span>`; return;
       }
-
-      // 通常表示
       list.innerHTML = "";
       items.forEach((it, idx) => {
-        const li = document.createElement("li");
-        li.className = "item";
-        const title = sanitize(it.title || "(無題)");
-        const body = sanitize(it.content || "");
+        const li = document.createElement("li"); li.className = "item";
+        const title = sanitize(it.title || "(無題)"), body = sanitize(it.content || "");
         const src = linkOrText(it.source || it.url || "");
-        if (idx === 0){
-          li.innerHTML = `
-            <div class="title">【${data.page}ページ 先頭】 ${title}</div>
-            <div class="excerpt">${body ? body : "（本文抜粋なし）"}</div>
-            <div class="src muted">出典：${src}</div>
-          `;
-        } else {
-          li.innerHTML = `
-            <div class="title">・${title}</div>
-            <div class="src muted">出典：${src}</div>
-          `;
-        }
+        li.innerHTML = (idx===0)
+          ? `<div class="title">【${data.page}ページ 先頭】 ${title}</div><div class="excerpt">${body||"（本文抜粋なし）"}</div><div class="src muted">出典：${src}</div>`
+          : `<div class="title">・${title}</div><div class="src muted">出典：${src}</div>`;
         list.appendChild(li);
       });
-      list.hidden = false;
-      area.classList.remove("noresult");
-      area.classList.add("muted");
-      area.innerText = "（整形表示）";
+      list.hidden = false; area.classList.remove("noresult"); area.classList.add("muted"); area.innerText = "（整形表示）";
     }
 
     function setPager(page, hasMore){
-      $("btn-prev").disabled = page <= 1;
-      $("btn-next").disabled = !hasMore;
+      $("btn-prev").disabled = page <= 1; $("btn-next").disabled = !hasMore;
       $("pageinfo").innerText = hasMore ? `次へで ${page+1} ページ目` : `最後のページです`;
     }
 
     async function doSearch(q, page){
       const size = parseInt($("page-size").value || "5", 10);
-      $("btn-search").disabled = true;
-      $("btn-prev").disabled = true;
-      $("btn-next").disabled = true;
-      $("result-area").innerText = "検索中…";
-      $("list").hidden = true;
-      $("raw").textContent = "…";
-      $("meta").textContent = "…";
-      $("pageinfo").textContent = "";
-
+      $("btn-search").disabled = true; $("btn-prev").disabled = true; $("btn-next").disabled = true;
+      $("result-area").innerText = "検索中…"; $("list").hidden = true; $("raw").textContent = "…"; $("meta").textContent = "…"; $("pageinfo").textContent = "";
       try{
         const raw = await callSearch(q, page, size);
-        lastQuery = q;
-        currentPage = raw.page ?? page;
-        lastTotal = typeof raw.total_hits === "number" ? raw.total_hits : 0;
-        lastHasMore = !!raw.has_more;
-
+        lastQuery = q; currentPage = raw.page ?? page; lastTotal = +raw.total_hits || 0; lastHasMore = !!raw.has_more;
         $("raw").textContent = JSON.stringify(raw, null, 2);
         $("meta").textContent = buildMeta(lastTotal, currentPage, raw.page_size ?? size);
-        renderItems(raw);
-        setPager(currentPage, lastHasMore);
+        renderItems(raw); setPager(currentPage, lastHasMore);
       } catch(err){
         $("result-area").innerHTML = `<span class="error">エラー：${sanitize(String(err.message||err))}</span>`;
-        $("raw").textContent = "{}";
-        $("meta").textContent = "エラー";
-        $("btn-prev").disabled = true;
-        $("btn-next").disabled = true;
+        $("raw").textContent = "{}"; $("meta").textContent = "エラー"; $("btn-prev").disabled = true; $("btn-next").disabled = true;
       } finally{
         $("btn-search").disabled = false;
       }
     }
 
-    // ハンドラ
     async function onSearch(){
-      const q = normalizeInput($("q").value || "");
-      if (!q){
-        $("result-area").innerText = "（キーワードが空です）";
-        $("list").hidden = true;
-        $("raw").textContent = "{}";
-        $("meta").textContent = "（未検索）";
-        $("pageinfo").textContent = "";
-        $("btn-prev").disabled = true;
-        $("btn-next").disabled = true;
-        lastQuery=""; currentPage=1; lastTotal=0; lastHasMore=false;
-        return;
+      const q = normalizeInput($("q").value || ""); if (!q){
+        $("result-area").innerText = "（キーワードが空です）"; $("list").hidden = true; $("raw").textContent = "{}";
+        $("meta").textContent = "（未検索）"; $("pageinfo").textContent = ""; $("btn-prev").disabled = true; $("btn-next").disabled = true;
+        lastQuery=""; currentPage=1; lastTotal=0; lastHasMore=false; return;
       }
-      currentPage = 1;
-      await doSearch(q, currentPage);
+      currentPage = 1; await doSearch(q, currentPage);
     }
+    async function onNext(){ if (!lastQuery || !lastHasMore) return; currentPage += 1; await doSearch(lastQuery, currentPage); }
+    async function onPrev(){ if (!lastQuery || currentPage <= 1) return; currentPage -= 1; await doSearch(lastQuery, currentPage); }
+    function onClear(){ $("q").value=""; $("page-size").value="5"; $("result-area").innerText="（未取得）"; $("list").hidden=true; $("raw").textContent="（未取得）"; $("meta").textContent="（未検索）"; $("pageinfo").textContent=""; lastQuery=""; currentPage=1; lastTotal=0; lastHasMore=false; $("btn-prev").disabled=true; $("btn-next").disabled=true; }
+    async function clearCachesAndReload(){ try{ if ("caches" in window){ const keys = await caches.keys(); await Promise.all(keys.map(k => caches.delete(k))); } }catch(e){} location.reload(); }
 
-    async function onNext(){
-      if (!lastQuery || !lastHasMore) return;
-      currentPage += 1;
-      await doSearch(lastQuery, currentPage);
-    }
-
-    async function onPrev(){
-      if (!lastQuery || currentPage <= 1) return;
-      currentPage -= 1;
-      await doSearch(lastQuery, currentPage);
-    }
-
-    function onClear(){
-      $("q").value = "";
-      $("page-size").value = "5";
-      $("result-area").innerText = "（未取得）";
-      $("list").hidden = true;
-      $("raw").textContent = "（未取得）";
-      $("meta").textContent = "（未検索）";
-      $("pageinfo").textContent = "";
-      lastQuery=""; currentPage=1; lastTotal=0; lastHasMore=false;
-      $("btn-prev").disabled = true;
-      $("btn-next").disabled = true;
-    }
-
-    async function clearCachesAndReload(){
-      // Cache Storage を削除してリロード（旧UIの残骸対策）
-      try{
-        if ("caches" in window){
-          const keys = await caches.keys();
-          await Promise.all(keys.map(k => caches.delete(k)));
-        }
-      }catch(e){}
-      location.reload();
-    }
-
-    // イベント
     $("btn-search").addEventListener("click", onSearch);
     $("btn-clear").addEventListener("click", onClear);
     $("btn-next").addEventListener("click", onNext);
