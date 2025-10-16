@@ -1,6 +1,6 @@
 # app.py — Mini Rose Search API（JSONL版：mini-rose-search-jsonl 用）
 # 方針反映版：日本語短語ファジー抑止 / 代表日=開催日/発行日 / order=latest でページング前ソート / UI変更なし
-# 版: jsonl-2025-10-16-stable
+# 版: jsonl-2025-10-16-stable+fix-content-text-body-description
 
 import os, re, json, unicodedata, datetime as dt
 from typing import List, Dict, Any, Tuple, Optional
@@ -15,7 +15,7 @@ from urllib.parse import urlparse, urlunparse
 KB_URL = os.getenv("KB_URL", "https://raw.githubusercontent.com/hiroshiyamagishi1960-lang/mini-rose-search-jsonl/main/kb.jsonl")
 JSON_HEADERS = {"content-type": "application/json; charset=utf-8"}
 
-app = FastAPI(title="Mini Rose Search API", version="jsonl-2025-10-16-stable")
+app = FastAPI(title="Mini Rose Search API", version="jsonl-2025-10-16-stable+fix")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
@@ -96,6 +96,15 @@ def expand_with_domain_dict(term:str)->set:
     return out
 
 # =============================
+# ユーティリティ
+# =============================
+def _pick(*cands):
+    for v in cands:
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+# =============================
 # KBロード（JSONL）
 # =============================
 def _load_kb(url:str)->List[Dict[str,Any]]:
@@ -129,7 +138,7 @@ def _years_from_text(s:str)->List[int]:
 
 def _record_years(r:Dict[str,Any])->List[int]:
     ys=set()
-    for k in("issue","date_primary","title","text","url"):
+    for k in("issue","date_primary","title","text","content","body","description","url"):
         ys.update(_years_from_text(str(r.get(k,""))))
     return sorted(ys)
 
@@ -161,20 +170,35 @@ def _match_text(text:str,terms:List[str])->bool:
             return True
     return False
 
-def search_jsonl(q:str,year=None,year_from=None,year_to=None)->List[Dict[str,Any]]:
-    if not KB_DATA:return[]
-    terms=expand_terms(jp_terms(q))
-    results=[]
+def search_jsonl(q:str, year=None, year_from=None, year_to=None)->List[Dict[str,Any]]:
+    if not KB_DATA:
+        return []
+    terms = expand_terms(jp_terms(q))
+    if not terms:
+        return []
+
+    results = []
     for rec in KB_DATA:
-        if _match_text(str(rec.get("title","")),terms) or _match_text(str(rec.get("content","")),terms):
+        title = str(rec.get("title", ""))
+        body  = str(_pick(rec.get("content",""), rec.get("text",""), rec.get("body",""), rec.get("description","")))
+
+        # ★ 検索ヒット判定：title または 本文（content/text/body/description）
+        if _match_text(title, terms) or _match_text(body, terms):
+            # 年フィルタ（必要なときだけ適用）
             if year or year_from or year_to:
-                ys=_record_years(rec)
-                if not ys: continue
-                if year and year not in ys: continue
-                lo=year_from or -10**9; hi=year_to or 10**9
-                if not any(lo<=y<=hi for y in ys): continue
+                ys = _record_years(rec)
+                if not ys:
+                    continue
+                lo = year_from or -10**9
+                hi = year_to   or  10**9
+                if year and year not in ys:
+                    continue
+                if not any(lo <= y <= hi for y in ys):
+                    continue
             results.append(rec)
-    results.sort(key=lambda r:_best_date(r),reverse=True)
+
+    # 新しいもの順
+    results.sort(key=lambda r:_best_date(r), reverse=True)
     return results
 
 # =============================
@@ -196,19 +220,20 @@ def diag(q:str=Query("",description="確認")):
 def api_search(q:str=Query("",description="検索語"),page:int=1,page_size:int=5,order:str="latest"):
     try:
         if not q.strip():
-            return JSONResponse({"items":[],"total_hits":0,"page":1,"page_size":page_size,"has_more":False},headers=JSON_HEADERS)
+            return JSONResponse({"items":[],"total_hits":0,"page":1,"page_size":page_size,"has_more":False,"next_page":None,"error":None,"order_used":order},headers=JSON_HEADERS)
         ranked=search_jsonl(q)
         total=len(ranked)
         start=(page-1)*page_size; end=start+page_size
         slice_=ranked[start:end]
         items=[]
-        for i,r in enumerate(slice_):
+        for i, r in enumerate(slice_):
+            body = _pick(r.get("content",""), r.get("text",""), r.get("body",""), r.get("description",""))
             items.append({
-                "title":r.get("title",""),
-                "content":r.get("content","")[:900],
-                "url":r.get("url",""),
-                "source":r.get("url",""),
-                "rank":start+i+1
+                "title": r.get("title",""),
+                "content": body[:900],  # 先頭だけ抜粋
+                "url": r.get("url",""),
+                "source": r.get("url",""),
+                "rank": start + i + 1
             })
         return JSONResponse({
             "items":items,
@@ -216,11 +241,12 @@ def api_search(q:str=Query("",description="検索語"),page:int=1,page_size:int=
             "page":page,
             "page_size":page_size,
             "has_more":end<total,
-            "next_page":page+1 if end<total else None,
+            "next_page":(page+1) if end<total else None,
+            "error":None,
             "order_used":order
         },headers=JSON_HEADERS)
     except Exception as e:
-        return JSONResponse({"items":[],"error":str(e)},headers=JSON_HEADERS)
+        return JSONResponse({"items":[],"total_hits":0,"page":1,"page_size":page_size,"has_more":False,"next_page":None,"error":str(e),"order_used":order},headers=JSON_HEADERS)
 
 @app.get("/")
 def root():
