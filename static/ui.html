@@ -107,13 +107,13 @@
       </div>
     </details>
 
-    <!-- お知らせ（復活） -->
+    <!-- お知らせ -->
     <div class="notice">
       <strong>お知らせ</strong><br/>
       チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。
     </div>
 
-    <!-- 使いかた（復活） -->
+    <!-- 使いかた -->
     <div class="howto">
       <h3>使いかた</h3>
       <ol style="margin:6px 0 0;padding-left:1.2em">
@@ -127,40 +127,75 @@
   </div>
 
 <script>
-  /* ===== 挙動 ===== */
+  /* ===== 仕様に合わせた挙動 ===== */
   const PAGE_SIZE = 5; // 常に5件固定
   const $ = (id) => document.getElementById(id);
   const asArray = (x) => Array.isArray(x) ? x : [];
-  const sanitize = (s) => (typeof s === "string") ? s : "";
-  const stripExceptMark = (h) => sanitize(h).replace(/<(?!\/?mark\b)[^>]+>/g, "");
-  const hasMark = (h) => /<mark>/.test(h||"");
 
-  // 先頭：<mark>活かして約300字（±40）
-  function approx300(html, target=300){
-    const s = stripExceptMark(html);
-    const plain = s.replace(/<\/?mark>/g,"");
-    if (plain.length <= target+40) return s;
-    const m = s.indexOf("<mark>");
-    if (m === -1) return plain.slice(0,target) + "…";
-    const end = s.indexOf("</mark>", m);
-    const half = Math.floor(target/2);
-    const start = Math.max(0, m - half);
-    const finish = Math.min(s.length, (end>-1?end+7:m+6) + half);
-    return (start>0?"…":"") + s.slice(start, finish) + (finish<s.length?"…":"");
-  }
-  // 残り：<mark>前後だけ（無ければ先頭160）
-  function aroundMark(html, side=80, fallback=160){
-    const s = stripExceptMark(html);
-    const m = s.indexOf("<mark>");
-    if (m === -1){
-      const t = s.replace(/<\/?mark>/g,"");
-      return t.length > fallback ? t.slice(0,fallback) + "…" : t;
+  /* HTMLを解析して「表示文字数」でトリミング（<mark>は保持） */
+  function htmlSlicePreserveMark(html, start, end){
+    const div = document.createElement("div");
+    div.innerHTML = html || "";
+    let pos = 0, out = "";
+    function walk(node, inMark=false){
+      if (pos >= end) return;
+      if (node.nodeType === 1){ // element
+        const isMark = node.tagName && node.tagName.toLowerCase() === "mark";
+        const nowMark = inMark || isMark;
+        node.childNodes.forEach(n => walk(n, nowMark));
+      }else if (node.nodeType === 3){ // text
+        const text = node.nodeValue || "";
+        const len = text.length;
+        if (pos + len <= start){ pos += len; return; }
+        const s = Math.max(0, start - pos);
+        const e = Math.min(len, end - pos);
+        const chunk = text.slice(s, e);
+        if (chunk){
+          if (inMark) out += "<mark>" + chunk + "</mark>";
+          else out += chunk;
+        }
+        pos += len;
+      }
     }
-    const end = s.indexOf("</mark>", m);
-    const start = Math.max(0, m - side);
-    const finish = Math.min(s.length, (end>-1?end+7:m+6) + side);
-    return (start>0?"…":"") + s.slice(start,finish) + (finish<s.length?"…":"");
+    walk(div, false);
+    return out;
   }
+  function firstNHTML(html, n){
+    const div = document.createElement("div");
+    div.innerHTML = html || "";
+    const total = (div.textContent || "").length;
+    const end = Math.min(n, total);
+    let s = htmlSlicePreserveMark(html, 0, end);
+    if (end < total) s += "…";
+    return s;
+  }
+  function aroundFirstMarkHTML(html, side=80, fallback=160){
+    const div = document.createElement("div");
+    div.innerHTML = html || "";
+    const total = (div.textContent || "").length;
+    // mark位置を特定
+    let pos = 0, markStart = null, markEnd = null;
+    (function find(node){
+      if (node.nodeType === 1){
+        if (node.tagName && node.tagName.toLowerCase()==="mark"){
+          const t = node.textContent || "";
+          markStart = pos; markEnd = pos + t.length;
+        }
+        node.childNodes.forEach(find);
+      }else if (node.nodeType === 3){
+        pos += (node.nodeValue || "").length;
+      }
+    })(div);
+    if (markStart==null){
+      // markが無ければ先頭fallback
+      return firstNHTML(html, fallback);
+    }
+    const start = Math.max(0, markStart - side);
+    const end   = Math.min(total, markEnd + side);
+    let out = (start>0?"…":"") + htmlSlicePreserveMark(html, start, end) + (end<total?"…":"");
+    return out;
+  }
+  function hasMark(html){ return /<mark>/.test(html||""); }
 
   async function jget(url){
     const r = await fetch(url, {cache:"no-store", headers:{Accept:"application/json"}});
@@ -170,10 +205,10 @@
   function normalize(raw, page){
     const items = asArray(raw?.items)||asArray(raw?.results)||[];
     const norm = items.map(it=>{
-      const title = stripExceptMark(it.title||"(無題)");
-      const content = sanitize(it.content||it.text||"");
-      const url = sanitize(it.url||it.source||"");
-      const date = sanitize(it.date||it.date_primary||"");
+      const title = (it.title || "(無題)").replace(/<(?!\/?mark\b)[^>]+>/g,""); // タイトルは素の文字（markなし）
+      const content = String(it.content || it.text || "");
+      const url = String(it.url || it.source || "");
+      const date = String(it.date || it.date_primary || "");
       const rank = (typeof it.rank==="number") ? it.rank : null;
       return {title,content,url,date,rank};
     });
@@ -190,18 +225,21 @@
     return `${total} 件中 ${start}–${end} 件を表示　/　order_used: ${order_used||"unknown"}`;
   }
   function rowFirst(it){
+    const snippet = firstNHTML(it.content, 300); // ★ 先頭は約300字
+    const hit = hasMark(it.content) ? '<span class="hit">（本文にヒット）</span>' : '';
     return `
       <div class="result">
-        <div class="title">${it.title}${hasMark(it.content)?'<span class="hit">（本文にヒット）</span>':''}</div>
-        <div class="snippet">${approx300(it.content,300)}</div>
+        <div class="title">${it.title}${hit}</div>
+        <div class="snippet">${snippet}</div>
         ${it.url?`<div class="src"><a href="${it.url}" target="_blank" rel="noopener">本文表示（クリックして下さい。）</a></div>`:""}
       </div>`;
   }
   function rowRest(it){
+    const snippet = aroundFirstMarkHTML(it.content, 80, 160); // ★ 2〜5件はハイライト周辺
     return `
       <div class="result">
         <div class="title">${it.title}</div>
-        <div class="snippet">${aroundMark(it.content,80,160)}</div>
+        <div class="snippet">${snippet}</div>
         ${it.url?`<div class="src"><a href="${it.url}" target="_blank" rel="noopener">本文表示（クリックして下さい。）</a></div>`:""}
       </div>`;
   }
@@ -218,10 +256,34 @@
       const url=`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(ord)}`;
       const raw=await jget(url); $("raw").textContent=JSON.stringify(raw,null,2);
       const data=normalize(raw,page);
-      if(data.order_used && $("order").value!==data.order_used){ $("order").value=data.order_used; }
+      if(data.order_used && $("order").value!==data.order_used){ $("order").value=data.order_used; } // APIに合わせる
+
       const items=data.items;
       if(!items.length){ $("meta").textContent="該当なし"; return; }
+
       $("results").innerHTML = rowFirst(items[0]) + items.slice(1).map(rowRest).join("");
       $("meta").textContent = metaText(data.total,data.page,items.length,data.order_used);
       $("prev").disabled = page<=1; $("next").disabled=!data.has_more; window.__page=page;
     }catch(e){
+      $("meta").textContent=`エラー：${String(e.message||e)}`;
+    }finally{ $("btnSearch").disabled=false; }
+  }
+
+  // イベント（ID保険つき：btnSearch / doSearch どちらでも動く）
+  document.getElementById("btnSearch")?.addEventListener("click", ()=>doSearch(1));
+  document.getElementById("doSearch") ?.addEventListener("click", ()=>doSearch(1));
+  $("btnClear").addEventListener("click", ()=>{ $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; $("raw").textContent="（未取得）"; $("prev").disabled=true; $("next").disabled=true; });
+  $("prev").addEventListener("click", ()=>{ const p=Math.max(1,(window.__page||1)-1); doSearch(p); });
+  $("next").addEventListener("click", ()=>{ const p=(window.__page||1)+1; doSearch(p); });
+  $("q").addEventListener("keydown",(e)=>{ if(e.key==="Enter"){ doSearch(1); } });
+  $("order").addEventListener("change", ()=>doSearch(1));
+
+  // 版表示 & ?q=
+  (async ()=>{
+    try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{}
+    const usp=new URLSearchParams(location.search);
+    if(usp.get("q")){ $("q").value=usp.get("q"); doSearch(1); }
+  })();
+</script>
+</body>
+</html>
