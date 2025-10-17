@@ -1,4 +1,4 @@
-# app.py — Mini Rose Search API（JSONL：フレーズ優先＋近接加点＋order対応）
+# app.py — Mini Rose Search API（JSONL：フレーズ優先＋近接加点＋関連順を既定）
 # 版: jsonl-2025-10-17-relevance-boost
 
 import os, re, json, unicodedata, datetime as dt
@@ -9,12 +9,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import requests
 
+# ==== 設定 ====
+# KB（JSONL）の場所。Render の環境変数 KB_URL で差し替え可
 KB_URL = os.getenv("KB_URL", "https://raw.githubusercontent.com/hiroshiyamagishi1960-lang/mini-rose-search-jsonl/main/kb.jsonl")
 JSON_HEADERS = {"content-type": "application/json; charset=utf-8"}
 
 app = FastAPI(title="Mini Rose Search API", version="jsonl-2025-10-17-relevance-boost")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
 
+# ==== UI（旧UI互換：/ui は no-store）====
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -27,13 +30,15 @@ def ui():
         return HTMLResponse(html, headers={"Cache-Control": "no-store"})
     return HTMLResponse("<h1>UI not found</h1>", headers={"Cache-Control": "no-store"})
 
-# ---------- 日本語正規化・かなフォールド ----------
+# =============================
+# かなフォールディング（表記ゆれ吸収）
+# =============================
 def _nfkc(s: Optional[str]) -> str: return unicodedata.normalize("NFKC", s or "")
 _SMALL_TO_BASE = str.maketrans({"ぁ":"あ","ぃ":"い","ぅ":"う","ぇ":"え","ぉ":"お","ゃ":"や","ゅ":"ゆ","ょ":"よ","ゎ":"わ","っ":"つ","ゕ":"か","ゖ":"け"})
 _A=set("あかさたなはまやらわがざだばぱぁゃゎっ"); _I=set("いきしちにひみりぎじぢびぴぃ")
 _U=set("うくすつぬふむゆるぐずづぶぷぅゅっ"); _E=set("えけせてねへめれげぜでべぺぇ"); _O=set("おこそとのほもよろをごぞどぼぽぉょ")
 def _kana_to_hira(s:str)->str:
-    out=[]; 
+    out=[]
     for ch in s:
         o=ord(ch)
         if 0x30A1<=o<=0x30F6: out.append(chr(o-0x60))
@@ -65,7 +70,9 @@ def hira_to_kata(s:str)->str:
         else: out.append(ch)
     return "".join(out)
 
-# ---------- 同義語辞書 ----------
+# =============================
+# 同義語辞書（ドメイン語彙）
+# =============================
 KANJI_EQ: Dict[str,set] = {
     "苔":{"こけ","コケ"},
     "剪定":{"せん定","せんてい"},
@@ -77,7 +84,7 @@ KANJI_EQ: Dict[str,set] = {
     "黒星病":{"クロボシ","黒点病"},
     "薔薇":{"バラ","ばら"},
     "ミニバラ":{"ミニ薔薇","みにばら"},
-    # イベント語の橋渡し
+    # イベント関連
     "コンテスト":{"大会","表彰","コンクール"},
     "結果":{"発表","報告","結果発表"},
 }
@@ -91,7 +98,9 @@ def expand_with_domain_dict(term:str)->set:
     if term in REVERSE_EQ: out|=REVERSE_EQ[term]
     return out
 
-# ---------- KBロード ----------
+# =============================
+# KBロード（JSONL）
+# =============================
 def _load_kb(url:str)->List[Dict[str,Any]]:
     items=[]
     try:
@@ -104,9 +113,11 @@ def _load_kb(url:str)->List[Dict[str,Any]]:
         print("[WARN] KB load failed:",e)
     return items
 KB_DATA=_load_kb(KB_URL)
-print(f"[INIT] KB loaded: {len(KB_DATA)} records")
+print(f"[INIT] KB loaded: {len(KB_DATA)} records from {KB_URL}")
 
-# ---------- 年抽出 ----------
+# =============================
+# 年抽出・代表日（年フィルタ／latest用）
+# =============================
 def _nfkcnum(s:str)->str: return unicodedata.normalize("NFKC",s or "")
 _RANGE_SEP = r"(?:-|–|—|~|〜|～|\.{2})"
 def parse_year_from_query(q:str)->Tuple[str,Optional[int],Optional[int]]:
@@ -137,7 +148,9 @@ def _best_date(rec:Dict[str,Any])->dt.date:
     ys=_record_years(rec)
     return dt.date(max(ys),1,1) if ys else dt.date(1970,1,1)
 
-# ---------- クエリ解析 ----------
+# =============================
+# クエリ解析（語の抽出／複合語救済）
+# =============================
 _JP_WORDS = re.compile(r"[一-龥ぁ-んァ-ンー]{2,}|[A-Za-z0-9]{2,}")
 SPLIT_TOKENS=("結果","発表","報告","案内","募集","開催","決定")
 def normalize_query(q:str)->str:
@@ -159,6 +172,7 @@ def jp_terms(q:str)->List[str]:
     qn=normalize_query(q).replace("　"," ")
     toks=[t for t in qn.split() if t]
     toks+=_JP_WORDS.findall(qn)
+    # 単一語のときは複合語救済を追加
     if len([t for t in qn.split() if t])==1 and len(toks)<=3:
         toks = list(dict.fromkeys(toks + split_compound(qn)))
     uniq=[]; seen=set()
@@ -175,7 +189,9 @@ def expand_terms(terms:List[str])->List[str]:
         out|=expand_with_domain_dict(t)
     return sorted({s for s in out if s})
 
-# ---------- ハイライト・スニペット ----------
+# =============================
+# ハイライト・スニペット（当たり位置抜粋）
+# =============================
 def _record_text_all(rec:Dict[str,Any])->str:
     buf=[]
     def walk(x):
@@ -219,11 +235,13 @@ def _make_snippet_and_highlight(text:str, keys:List[str], ctx:int=90, maxlen:int
     snip=prefix+esc+suffix
     return (snip if len(snip)<=maxlen+40 else snip[:maxlen]+"…", True)
 
-# ---------- スコアリング（フレーズ＆近接ボーナス） ----------
-W_TITLE, W_TEXT = 2.0, 1.4
-PHRASE_TITLE_BONUS = 4.0   # タイトルで「コンテスト結果」等の完全一致
-PHRASE_BODY_BONUS  = 2.2   # 本文での完全一致
-COOCCUR_WINDOW = 30        # 30文字以内の共起で加点
+# =============================
+# スコアリング（関連度）＋フレーズ／近接加点
+# =============================
+W_TITLE, W_TEXT = 2.0, 1.4                         # 重み（タイトル＞本文）
+PHRASE_TITLE_BONUS = 4.0                            # タイトルの完全フレーズ一致（例：コンテスト結果）
+PHRASE_BODY_BONUS  = 2.2                            # 本文の完全フレーズ一致
+COOCCUR_WINDOW = 30                                 # 近接（共起）判定の窓幅（30文字以内）
 COOCCUR_TITLE_BONUS = 1.5
 COOCCUR_BODY_BONUS  = 1.2
 
@@ -263,13 +281,13 @@ def _score_record(rec:Dict[str,Any], terms_all:List[str], base_terms:List[str], 
         if tf in t_f:   sc+=W_TITLE*0.95; matched=True
         if tf in b_f:   sc+=W_TEXT*0.95;  matched=True
 
-    # 完全フレーズの強化（タイトル＞本文）
+    # フレーズ一致を強く評価（タイトル＞本文）
     for ph in _phrase_candidates(q_raw, base_terms):
         ph_f=fold_kana(ph)
         if ph.lower() in t_low or ph_f in t_f: sc+=PHRASE_TITLE_BONUS; matched=True
         if ph.lower() in b_low or ph_f in b_f: sc+=PHRASE_BODY_BONUS;  matched=True
 
-    # 近接（“コンテスト”と“結果”が近い等）
+    # 近接（コンテスト と 結果 が近い等）
     if _near_cooccur(title, base_terms, COOCCUR_WINDOW): sc+=COOCCUR_TITLE_BONUS; matched=True
     if _near_cooccur(body,  base_terms, COOCCUR_WINDOW): sc+=COOCCUR_BODY_BONUS;  matched=True
 
@@ -282,7 +300,6 @@ def _score_record(rec:Dict[str,Any], terms_all:List[str], base_terms:List[str], 
                 sc+=W_TEXT*0.7; matched=True; break
     return sc if matched else 0.0
 
-# ---------- 検索本体（スコア＋日付を返す） ----------
 def search_jsonl_scored(q:str, year=None, year_from=None, year_to=None)->Tuple[List[Tuple[float,dt.date,Dict[str,Any]]], List[str]]:
     if not KB_DATA: return [], []
     base_terms=jp_terms(q)
@@ -293,7 +310,8 @@ def search_jsonl_scored(q:str, year=None, year_from=None, year_to=None)->Tuple[L
         title=str(rec.get("title",""))
         body =str(rec.get("content","") or rec.get("text","") or rec.get("body",""))
         alltxt=_record_text_all(rec)
-        # 粗フィルタ
+
+        # 粗フィルタ（軽く当たりを見る）
         def _hit_any():
             for txt in (title, body, alltxt):
                 t_low=txt.lower(); t_fold=fold_kana(txt)
@@ -318,7 +336,9 @@ def search_jsonl_scored(q:str, year=None, year_from=None, year_to=None)->Tuple[L
         scored.append((score, _best_date(rec), rec))
     return scored, base_terms
 
-# ---------- API ----------
+# =============================
+# API
+# =============================
 @app.get("/health")
 def health():
     return JSONResponse({"ok":True,"kb_url":KB_URL,"kb_size":len(KB_DATA)}, headers=JSON_HEADERS)
@@ -338,7 +358,7 @@ def api_search(
     q:str=Query("", description="検索語（末尾に年/年範囲も可）"),
     page:int=1,
     page_size:int=5,
-    order:str=Query("relevance", description="relevance | latest")
+    order:str=Query("relevance", description="relevance（関連順） | latest（最新順）")
 ):
     try:
         q_raw=(q or "").strip()
@@ -354,7 +374,7 @@ def api_search(
         if total==0:
             return JSONResponse({"items":[],"total_hits":0,"page":1,"page_size":page_size,"has_more":False,"next_page":None,"error":None,"order_used":order}, headers=JSON_HEADERS)
 
-        # 並べ替え：関連順 or 最新順
+        # 並べ替え：関連順（既定） or 最新順
         if order.lower()=="latest":
             scored.sort(key=lambda t:(t[1], t[0]), reverse=True)   # date → score
         else:
@@ -374,15 +394,13 @@ def api_search(
         for i,(score, d, r) in enumerate(slice_):
             title=str(r.get("title","") or "(無題)")
             body =str(r.get("content","") or r.get("text","") or r.get("body",""))
-            # ヒット箇所でスニペット
+            # ヒット箇所で抜粋＋<mark>
             title_pos=_find_first(title, hl_keys)
             body_pos =_find_first(body,  hl_keys)
-            if body_pos is not None:
-                snippet,_=_make_snippet_and_highlight(body, hl_keys, ctx=90, maxlen=360)
-                tag="（本文にヒット）"
-            else:
-                snippet,_=_make_snippet_and_highlight(body, hl_keys, ctx=90, maxlen=360)
-                tag="" if title_pos is None else "（タイトルにヒット）"
+            snippet,_=_make_snippet_and_highlight(body, hl_keys, ctx=90, maxlen=360)
+            tag=""
+            if body_pos is not None: tag="（本文にヒット）"
+            elif title_pos is not None: tag="（タイトルにヒット）"
             items.append({
                 "title": title + (tag or ""),
                 "content": snippet,
