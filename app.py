@@ -1,13 +1,14 @@
 # app.py — 正規化内蔵・安定版（Notion直読み相当の構造に整えてから検索）
-# 版: jsonl-2025-10-17-normalized-stable-v2
+# 版: jsonl-2025-10-17-normalized-stable-v3
 # 仕様:
 #  - 取り込み時に JSONL を「直読み版と同等の構造」に正規化
 #      (title / text / url / issue / date / author / section + 合成 header)
 #  - 並び既定は relevance（関連順）; latest も指定可（?order=latest）
-#  - 「コンテスト結果」などのフレーズ一致・近接を重視（header/title > text）
+#  - header/title を重視し、フレーズ/近接で加点（「コンテスト結果」を自然に上位へ）
 #  - 返却: title（<mark>でハイライト）, content(抜粋~500字), url, rank, date を含む
 #  - タイトル末尾などに混入した「｜ UI-TEST-YYYYMMDD-HHMM」を除去
-#  - CORS 全許可／UIは変更不要（/ui があれば配信）
+#  - /health に kb_size_raw / kb_size_norm / kb_fingerprint を表示
+#  - CORS 全許可／UIは /static/ui.html を no-store で配信（存在すれば）
 
 import os, re, json, unicodedata, datetime as dt, hashlib
 from typing import List, Dict, Any, Tuple, Optional
@@ -21,7 +22,7 @@ import requests
 KB_URL = os.getenv("KB_URL", "https://raw.githubusercontent.com/hiroshiyamagishi1960-lang/mini-rose-search-jsonl/main/kb.jsonl")
 JSON_HEADERS = {"content-type": "application/json; charset=utf-8"}
 
-app = FastAPI(title="Mini Rose Search API", version="jsonl-2025-10-17-normalized-stable-v2")
+app = FastAPI(title="Mini Rose Search API", version="jsonl-2025-10-17-normalized-stable-v3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
 
 # ====== UI（任意。同梱されていれば no-store で配信） ======
@@ -99,7 +100,8 @@ URL_KEYS   = ["url","source","リンク","参照","出典URL"]
 
 def _pick(rec:Dict[str,Any], keys:List[str])->str:
     for k in keys:
-        if k in rec and _nfkc(rec[k]): return _nfkc(rec[k])
+        if k in rec and _nfkc(rec[k]):
+            return _nfkc(rec[k])
     return ""
 
 def _first_nonempty_line(text:str)->str:
@@ -134,8 +136,10 @@ def _load_raw(url:str)->List[Dict[str,Any]]:
         r=requests.get(url,timeout=20); r.raise_for_status()
         for line in r.text.splitlines():
             if line.strip():
-                try: items.append(json.loads(line))
-                except: pass
+                try:
+                    items.append(json.loads(line))
+                except Exception:
+                    pass
     except Exception as e:
         print("[WARN] KB load failed:",e)
     return items
@@ -143,7 +147,7 @@ def _load_raw(url:str)->List[Dict[str,Any]]:
 def _normalize_record(rec:Dict[str,Any])->Dict[str,Any]:
     title_raw = _pick(rec, TITLE_KEYS)
     text      = _pick(rec, TEXT_KEYS)
-    issue     = _parse_issue(_pick(rec, ISSUES_KEYS)) if (ISSUES_KEYS:=[k for k in ISSUE_KEYS]) else _parse_issue(_pick(rec, ISSUE_KEYS))  # safety
+    issue     = _parse_issue(_pick(rec, ISSUE_KEYS))
     date      = _pick(rec, DATE_KEYS)   # 開催日/発行日優先
     author    = _pick(rec, AUTH_KEYS)
     section   = _pick(rec, SECT_KEYS)
@@ -154,16 +158,17 @@ def _normalize_record(rec:Dict[str,Any])->Dict[str,Any]:
     title_base = _strip_ui_test_label(title_base)
 
     # 合成ヘッダ（号・年・タイトル）＋ UI-TEST ラベル除去
-    years = _years_from_text(date)
+    years = _years_from_text(date) or _years_from_text(text)
     year_str = str(max(years)) if years else ""
-    header = " | ".join([p for p in [_parse_issue(_pick(rec, ISSUE_KEYS)), year_str, title_base] if p])
+    header_parts = [p for p in [issue, year_str, title_base] if p]
+    header = " | ".join(header_parts) if header_parts else title_base
     header = _strip_ui_test_label(header)
 
     return {
         "title": title_base,
         "text": _nfkc(text),
         "url": url,
-        "issue": _parse_issue(_pick(rec, ISSUE_KEYS)),
+        "issue": issue,
         "date": date,
         "author": author,
         "section": section,
@@ -212,7 +217,6 @@ def expand_terms(terms:List[str])->List[str]:
     out=set()
     for t in terms:
         ft=fold_kana(t); out|={t, ft, hira_to_kata(ft)}
-        # 必要最低限の同義語（“結果発表”等）は本文で拾えるのでここは簡素に
     return sorted({s for s in out if s})
 
 def _record_text_all_norm(rec:Dict[str,Any])->str:
@@ -221,13 +225,16 @@ def _record_text_all_norm(rec:Dict[str,Any])->str:
     return "\n".join([_nfkc(p) for p in parts if _nfkc(p)])
 
 def _html_escape(s:str)->str:
-    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 def _build_hl_keys(terms:List[str])->List[str]:
+    # 長い語を先にして一発置換でハイライト（重複<mark>防止）
     hs=set()
     for t in terms:
+        if not t: continue
         hs.add(t)
-        ft=fold_kana(t); hs.add(ft); hs.add(hira_to_kata(ft))
+        ft=fold_kana(t)
+        hs.add(ft); hs.add(hira_to_kata(ft))
     return sorted({h for h in hs if h}, key=len, reverse=True)
 
 def _find_first(text:str, keys:List[str])->Optional[int]:
@@ -241,11 +248,17 @@ def _find_first(text:str, keys:List[str])->Optional[int]:
     return best
 
 def _highlight_text(text:str, keys:List[str])->str:
-    esc=_html_escape(text or "")
-    for k in keys:
-        if not k: continue
-        esc=re.compile(re.escape(_html_escape(k)), re.IGNORECASE).sub(lambda m:f"<mark>{m.group(0)}</mark>", esc)
-    return esc
+    esc = _html_escape(text or "")
+    uniq=[]
+    for k in _build_hl_keys(keys):
+        h=_html_escape(k)
+        if h and h not in uniq:
+            uniq.append(h)
+    if not uniq:
+        return esc
+    # longest-first の OR を1回だけ適用 → ネスト/二重<mark>を防止
+    pat = re.compile("(" + "|".join(map(re.escape, uniq)) + ")", re.IGNORECASE)
+    return pat.sub(r"<mark>\1</mark>", esc)
 
 def _make_snippet_and_highlight(text:str, keys:List[str], ctx:int=120, maxlen:int=500)->Tuple[str,bool]:
     if not text: return ("", False)
@@ -265,6 +278,7 @@ PHRASE_HEAD_BONUS, PHRASE_TITLE_BONUS, PHRASE_TEXT_BONUS = 4.6, 4.2, 2.2
 COOCCUR_WINDOW = 30
 COOCCUR_HEAD_BONUS, COOCCUR_TEXT_BONUS = 1.7, 1.2
 
+# 「コンテスト結果」ゆるい表記
 PHRASE_PAT_RESULTS = re.compile(r"コンテスト(?:\s|　|の|:|：|・|,|，|。|．|-|–|—|~|〜|～|/|／){0,2}結果")
 
 def _near_cooccur(text:str, terms_base:List[str], w:int)->bool:
@@ -281,13 +295,11 @@ def _phrase_candidates(q_raw:str, base_terms:List[str])->List[str]:
     c=set()
     qn=_nfkc(q_raw).strip()
     if qn: c.add(qn)
-    # ベース語を連結したフレーズも候補に
     if len(base_terms)>=2:
         for i in range(len(base_terms)):
             for j in range(i+1,len(base_terms)):
                 c.add(base_terms[i]+base_terms[j])
                 c.add(base_terms[j]+base_terms[i])
-    # 「コンテスト結果」ゆるい表記
     c.add("コンテスト結果")
     return sorted({x for x in c if len(x)>=2}, key=len, reverse=True)
 
@@ -430,28 +442,32 @@ def api_search(
         slice_=scored[start:end]
 
         # ハイライト用キー（タイトルにも<mark>適用）
-        hl_keys=_build_hl_keys(expand_terms(base_terms))
+        hl_terms = expand_terms(base_terms)
 
         items=[]
         for i,(score, d, r) in enumerate(slice_):
             head  = _strip_ui_test_label(_nfkc(r.get("header","")))
             title = _strip_ui_test_label(_nfkc(r.get("title","")))
             text  = _nfkc(r.get("text",""))
-            date  = _nfkc(r.get("date",""))  # ← 返却に必ず含める
+            date_field = _nfkc(r.get("date",""))
 
-            # タイトルは合成ヘッダ優先で表示し、<mark>でハイライト
+            # タイトルは合成ヘッダ優先で表示し、<mark>でハイライト（重複<mark>防止版）
             display_title_source = head or title or "(無題)"
-            title_highlighted = _highlight_text(display_title_source, hl_keys)
+            title_highlighted = _highlight_text(display_title_source, hl_terms)
 
             # 本文は ~500字の抜粋（ヒット周辺に<mark>）
-            snippet,_ = _make_snippet_and_highlight(text, hl_keys, ctx=120, maxlen=500)
+            snippet,_ = _make_snippet_and_highlight(text, hl_terms, ctx=120, maxlen=500)
+
+            # 日付は date が無ければ年でフォールバック
+            bd = _best_date(r)
+            date_out = date_field or (str(bd.year) if bd.year > 1970 else "")
 
             items.append({
                 "title": title_highlighted,     # ← タイトルにもハイライトを反映
                 "content": snippet,             # ← 抜粋 ~500字
                 "url": _nfkc(r.get("url","")),
                 "rank": start+i+1,
-                "date": date                    # ← 日付（開催日/発行日）を返却
+                "date": date_out                # ← 開催日/発行日 or 年（フォールバック）
             })
 
         return JSONResponse({
