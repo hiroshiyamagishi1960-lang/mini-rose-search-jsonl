@@ -9,13 +9,13 @@
     :root{
       --bg:#fafafa; --card:#ffffff; --b:#e5e7eb; --muted:#64748b; --txt:#0f172a;
       --accent:#ef4444; --pill:#fff7ed; --pillbd:#fed7aa; --link:#2563eb;
-      --hl:#e6f3ff; --warn:#fff7cc; --warn-b:#fde68a; --note:#ffeff0; --note-b:#fecdd3;
+      --hl:#e6f3ff; --warn:#fff7cc; --warn-b:#fde68a;
     }
     html,body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;line-height:1.7}
-    html{font-size:18px} /* スマホでも読みやすい基準 */
-    @media (min-width:1024px){ html{font-size:18px} } /* PCはそのまま */
+    html{font-size:18px}
+    @media (max-width:480px){ html{font-size:19px} } /* スマホで更に少し大きめ */
 
-    .container{max-width:1020px;margin:18px auto;padding:0 16px}
+    .container{max-width:1000px;margin:18px auto;padding:0 16px}
     h1{margin:0 0 12px;font-size:26px}
     .accent{color:var(--accent);font-weight:700}
 
@@ -27,9 +27,9 @@
     input[type="text"],select,button{
       border:1px solid var(--b);border-radius:10px;background:#fff;font-size:16px;line-height:1.2
     }
-    input[type="text"]{flex:1 1 420px;padding:12px 14px;min-width:260px}
+    input[type="text"]{flex:1 1 460px;padding:12px 14px;min-width:260px}
     select{padding:10px 12px}
-    button{padding:10px 16px;cursor:pointer;background:#f8fafc}
+    button{padding:10px 16px;cursor:pointer;background:#f8fafc;min-height:44px}
     button.primary{background:#e7f0ff;border-color:#bfdbfe}
     button[disabled]{opacity:.5;cursor:not-allowed}
 
@@ -41,27 +41,25 @@
     .meta{font-size:14px;margin-bottom:8px}
 
     .result{border:1px solid var(--b);border-radius:14px;padding:12px;background:#fff;margin-bottom:12px}
-    .title{font-weight:700;font-size:18px;margin-bottom:4px}
+    .title{font-weight:700;font-size:20px;margin-bottom:4px}
     .snippet{white-space:pre-wrap;word-break:break-word}
-    .src{font-size:13px}
-    .src a{word-break:break-all;color:var(--link);text-decoration:none}
+    .hit{display:inline-block;font-size:12px;color:#1d4ed8;background:#e0ecff;border:1px solid #bfdbfe;border-radius:999px;padding:2px 8px;margin-left:6px}
+    .src{font-size:15px;margin-top:8px}
+    .src a{
+      display:inline-block; padding:8px 10px; border:1px solid var(--b); border-radius:10px;
+      color:var(--link); text-decoration:none; word-break:break-all;
+      -webkit-tap-highlight-color:transparent;
+    }
+    .src a:focus-visible{ outline:2px solid #93c5fd; outline-offset:2px }
 
     .pager{display:flex;gap:8px;justify-content:flex-start;margin-top:8px}
+
+    details summary{cursor:pointer;padding:12px 16px;border-bottom:1px solid var(--b)}
     .json{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:#0b1020;color:#d1e7ff;border-radius:12px;padding:10px;overflow:auto}
 
-    .callout{background:#fff;border:1px solid var(--b);border-radius:14px;padding:12px 14px}
-    .notice{background:var(--warn);border:1px solid var(--warn-b);border-radius:14px;padding:12px 14px}
-    .howto{background:var(--note);border:1px solid var(--note-b);border-radius:14px;padding:14px}
-    .howto h3{margin:0 0 8px}
-    .badge{display:inline-block;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px;font-size:11px}
+    .notice{background:var(--warn);border:1px solid var(--warn-b);border-radius:14px;padding:12px 14px;margin-top:16px}
 
     mark{background:var(--hl);padding:0 .15em;border-radius:3px}
-    @media (max-width:480px){
-      h1{font-size:24px}
-      .title{font-size:18px}
-      input[type="text"]{font-size:18px}
-      .json{font-size:11px}
-    }
   </style>
 </head>
 <body>
@@ -76,11 +74,7 @@
 
       <div class="row" style="margin-top:8px">
         <input id="q" type="text" placeholder="例） 苔　／　例） コンテスト 2023　／　例） 剪定 1999-2001" />
-        <select id="pageSize" title="1ページの件数">
-          <option value="5" selected>5件</option>
-          <option value="10">10件</option>
-          <option value="20">20件</option>
-        </select>
+        <!-- 常に5件固定。page_size セレクタは削除 -->
         <select id="order" title="並び順">
           <option value="relevance" selected>関連順</option>
           <option value="latest">最新順</option>
@@ -108,44 +102,37 @@
       </div>
     </div>
 
-    <details class="section" style="margin-top:12px">
-      <summary style="padding:12px 16px;cursor:pointer;border-bottom:1px solid var(--b)">開発者向け：レスポンス（生のJSON）</summary>
+    <details class="section" style="margin-top:12px" open>
+      <summary>開発者向け：レスポンス（生のJSON）</summary>
       <div class="body">
-        <div class="muted small">※ タイトルと本文の<strong>ハイライト（薄い青）</strong>はサーバ側の <code>&lt;mark&gt;</code> と「<span class="badge">本文にヒット</span>」の文字列をそのまま表示しています（UIは <code>innerHTML</code> で描画）。</div>
+        <div class="muted" style="margin-bottom:6px">
+          ※ タイトルと本文の<strong>ハイライト（薄い青）</strong>はサーバの <code>&lt;mark&gt;</code> をそのまま表示します。<span class="hit">（本文にヒット）</span> は UI 側で本文に <code>&lt;mark&gt;</code> がある場合に付与します。
+        </div>
         <div id="raw" class="json">（未取得）</div>
       </div>
     </details>
 
-    <div class="notice" style="margin-top:16px">
+    <div class="notice">
       <strong>お知らせ</strong><br/>
       チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。
-    </div>
-
-    <div class="howto" style="margin-top:12px">
-      <h3>使いかた</h3>
-      <ol style="margin:6px 0 0;padding-left:1.2em">
-        <li>ことばを入れて「検索」を押す。</li>
-        <li>1ページに <strong>5〜20件</strong>表示。先頭だけ<strong>本文の抜粋</strong>を表示。</li>
-        <li>続きは次へ、戻るときは前へ（ページ送り）。</li>
-        <li>年でしぼるときは、語尾に西暦4桁をつける。 <span class="badge">例：コンテスト 2023</span></li>
-        <li>年の範囲はハイフンで書く。 <span class="badge">例：剪定 1999-2001</span></li>
-      </ol>
     </div>
   </div>
 
   <script>
-    // ---- ユーティリティ
+    /* ===== ユーティリティ ===== */
+    const PAGE_SIZE = 5; // ★ 常に5件固定
     const $ = (id) => document.getElementById(id);
     const asArray = (x) => Array.isArray(x) ? x : [];
     const sanitize = (s) => (typeof s === "string") ? s : "";
 
-    // 指定タグ以外のHTMLタグを除去（<mark>は残す）
+    // 指定タグ以外を除去（<mark>は残す）
     function stripExceptMark(html){
       return sanitize(html).replace(/<(?!\/?mark\b)[^>]+>/g, "");
     }
+    function containsMark(html){ return /<mark>/.test(html||""); }
 
-    // <mark>の前後を抽出（なければ先頭を短く）
-    function aroundMark(html, side = 70, fallbackLen = 150){
+    // <mark>周辺だけ（無ければ先頭短文）
+    function aroundMark(html, side = 80, fallbackLen = 160){
       const s = stripExceptMark(html);
       const m = s.indexOf("<mark>");
       if (m === -1){
@@ -160,27 +147,26 @@
       return headEll + s.slice(start, finish) + tailEll;
     }
 
-    // 先頭用：<mark>を活かしつつ約500字（±50）
+    // 先頭用：<mark>活かして約500字（±50）
     function approx500(html, target = 500){
       const s = stripExceptMark(html);
       const clean = s.replace(/<\/?mark>/g,"");
       if (clean.length <= target + 50) return s;
-      // できれば最初の<mark>を中心に切り取る
       const m = s.indexOf("<mark>");
       if (m === -1) return clean.slice(0, target) + "…";
       const end = s.indexOf("</mark>", m);
       const half = Math.floor(target / 2);
       const start = Math.max(0, m - half);
-      const finish = Math.min(s.length, end + 7 + half);
+      const finish = Math.min(s.length, (end > -1 ? end + 7 : m + 6) + half);
       const headEll = start > 0 ? "…" : "";
       const tailEll = finish < s.length ? "…" : "";
       return headEll + s.slice(start, finish) + tailEll;
     }
 
-    function normalizeResponse(raw, page, size){
+    function normalizeResponse(raw, page){
       const items = asArray(raw?.items) || asArray(raw?.results) || [];
       const norm = items.map(it => {
-        const title = sanitize(it.title || "");
+        const title = stripExceptMark(it.title || "(無題)");
         const content = sanitize(it.content || it.text || "");
         const url = sanitize(it.url || it.source || "");
         const date = sanitize(it.date || it.date_primary || "");
@@ -190,25 +176,26 @@
       const total = (typeof raw?.total_hits === "number") ? raw.total_hits : norm.length;
       const has_more = !!raw?.has_more;
       const order_used = raw?.order_used || null;
-      return { items: norm, total, page, size, has_more, order_used };
+      return { items: norm, total, page, has_more, order_used };
     }
 
-    function buildMeta(total, page, size, order_used, shownCount){
+    function buildMeta(total, page, shownCount, order_used){
       if (!Number.isFinite(total)) return "（未取得）";
-      const start = (page - 1) * size + 1;
+      const start = (page - 1) * PAGE_SIZE + 1;
       const end = Math.min(total, start + shownCount - 1);
       return `${total} 件中 ${start}–${end} 件を表示　/　order_used: ${order_used || "unknown"}`;
     }
 
     function rowHTMLFirst(it){
       const titleHTML = it.title || "(無題)";
+      const hit = containsMark(it.content) ? `<span class="hit">（本文にヒット）</span>` : "";
       const snippet = approx500(it.content, 500);
-      const date = it.date ? `<span class="badge">日付: ${it.date}</span> ` : "";
-      const rank = (it.rank!=null) ? `<span class="badge">順位: ${it.rank}</span>` : "";
+      const date = it.date ? `<span class="hit" style="background:#eef2ff;border-color:#c7d2fe;color:#3730a3">日付: ${it.date}</span> ` : "";
+      const rank = (it.rank!=null) ? `<span class="hit" style="background:#eef2ff;border-color:#c7d2fe;color:#3730a3">順位: ${it.rank}</span>` : "";
       const src = it.url ? `<div class="src">出典： <a href="${it.url}" target="_blank" rel="noopener">${it.url}</a></div>` : "";
       return `
         <div class="result">
-          <div class="title">${titleHTML}</div>
+          <div class="title">${titleHTML}${hit}</div>
           <div class="muted" style="margin-bottom:6px">${date}${rank}</div>
           <div class="snippet">${snippet}</div>
           ${src}
@@ -216,7 +203,7 @@
     }
     function rowHTMLRest(it){
       const titleHTML = it.title || "(無題)";
-      const snippet = aroundMark(it.content, 80, 160); // ハイライト周辺のみ
+      const snippet = aroundMark(it.content, 80, 160);
       const src = it.url ? `<div class="src">出典： <a href="${it.url}" target="_blank" rel="noopener">${it.url}</a></div>` : "";
       return `
         <div class="result">
@@ -241,16 +228,17 @@
         $("prev").disabled = true; $("next").disabled = true;
         return;
       }
-      const size = Number($("pageSize").value||5);
-      const order = $("order").value;
       $("btnSearch").disabled = true; $("prev").disabled = true; $("next").disabled = true;
       $("meta").textContent = "検索中…"; $("results").innerHTML = "";
       try{
-        const url = `/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${size}&order=${encodeURIComponent(order)}`;
+        const order = $("order").value;
+        const url = `/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(order)}`;
         const raw = await fetchJSON(url);
         $("raw").textContent = JSON.stringify(raw, null, 2);
 
-        const data = normalizeResponse(raw, page, size);
+        const data = normalizeResponse(raw, page);
+        if (data.order_used && $("order").value !== data.order_used){ $("order").value = data.order_used; } // ★ APIの実際とUI表示を一致
+
         const items = data.items;
         if (items.length === 0){
           $("meta").textContent = "該当なし";
@@ -258,17 +246,16 @@
           $("btnSearch").disabled = false; return;
         }
 
-        // 描画：先頭=約500字、残り=ハイライト周辺
+        // 先頭=約500字、残り=ハイライト周辺
         const first = rowHTMLFirst(items[0]);
         const rest  = items.slice(1).map(rowHTMLRest).join("");
         $("results").innerHTML = first + rest;
 
-        // メタ：実際に表示した件数で end を計算
-        const shown = items.length;
-        $("meta").textContent = buildMeta(data.total, data.page, data.size, data.order_used, shown);
+        $("meta").textContent = buildMeta(data.total, data.page, items.length, data.order_used);
 
         $("prev").disabled = page<=1;
         $("next").disabled = !data.has_more;
+        window.__page = page;
       }catch(err){
         $("meta").textContent = `エラー：${String(err.message||err)}`;
         $("results").innerHTML = "";
@@ -284,17 +271,19 @@
       $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; $("raw").textContent="（未取得）";
       $("prev").disabled=true; $("next").disabled=true;
     });
-    $("prev").addEventListener("click", ()=>{ const p = Math.max(1, (window.__page||1) - 1); window.__page=p; search(p); });
-    $("next").addEventListener("click", ()=>{ const p = (window.__page||1) + 1; window.__page=p; search(p); });
-    $("q").addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ window.__page=1; search(1); } });
-    $("pageSize").addEventListener("change", ()=>{ window.__page=1; search(1); });
-    $("order").addEventListener("change", ()=>{ window.__page=1; search(1); });
+    $("prev").addEventListener("click", ()=>{ const p=Math.max(1,(window.__page||1)-1); search(p); });
+    $("next").addEventListener("click", ()=>{ const p=(window.__page||1)+1; search(p); });
+    $("q").addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ search(1); } });
+    $("order").addEventListener("change", ()=>{ search(1); });
 
-    // 版表示
+    // 版表示 & ?q= 即時検索
     (async ()=>{
-      try{ const v = await fetchJSON("/version"); $("ver").textContent = v.version || "—"; }catch{}
+      try{
+        const v = await fetchJSON("/version");
+        document.getElementById("ver").textContent = v.version || "—";
+      }catch{}
       const usp = new URLSearchParams(location.search);
-      if (usp.get("q")){ $("q").value = usp.get("q"); window.__page=1; search(1); }
+      if (usp.get("q")){ $("q").value = usp.get("q"); search(1); }
     })();
   </script>
 </body>
