@@ -10,14 +10,13 @@ from fastapi.staticfiles import StaticFiles
 import requests
 
 # ==== 設定 ====
-# KB（JSONL）の場所。Render の環境変数 KB_URL で差し替え可
 KB_URL = os.getenv("KB_URL", "https://raw.githubusercontent.com/hiroshiyamagishi1960-lang/mini-rose-search-jsonl/main/kb.jsonl")
 JSON_HEADERS = {"content-type": "application/json; charset=utf-8"}
 
 app = FastAPI(title="Mini Rose Search API", version="jsonl-2025-10-17-relevance-boost")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
 
-# ==== UI（旧UI互換：/ui は no-store）====
+# ==== UI（/ui は no-store で常に最新）====
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -38,7 +37,7 @@ _SMALL_TO_BASE = str.maketrans({"ぁ":"あ","ぃ":"い","ぅ":"う","ぇ":"え",
 _A=set("あかさたなはまやらわがざだばぱぁゃゎっ"); _I=set("いきしちにひみりぎじぢびぴぃ")
 _U=set("うくすつぬふむゆるぐずづぶぷぅゅっ"); _E=set("えけせてねへめれげぜでべぺぇ"); _O=set("おこそとのほもよろをごぞどぼぽぉょ")
 def _kana_to_hira(s:str)->str:
-    out=[]
+    out=[]; 
     for ch in s:
         o=ord(ch)
         if 0x30A1<=o<=0x30F6: out.append(chr(o-0x60))
@@ -172,7 +171,6 @@ def jp_terms(q:str)->List[str]:
     qn=normalize_query(q).replace("　"," ")
     toks=[t for t in qn.split() if t]
     toks+=_JP_WORDS.findall(qn)
-    # 単一語のときは複合語救済を追加
     if len([t for t in qn.split() if t])==1 and len(toks)<=3:
         toks = list(dict.fromkeys(toks + split_compound(qn)))
     uniq=[]; seen=set()
@@ -238,10 +236,10 @@ def _make_snippet_and_highlight(text:str, keys:List[str], ctx:int=90, maxlen:int
 # =============================
 # スコアリング（関連度）＋フレーズ／近接加点
 # =============================
-W_TITLE, W_TEXT = 2.0, 1.4                         # 重み（タイトル＞本文）
-PHRASE_TITLE_BONUS = 4.0                            # タイトルの完全フレーズ一致（例：コンテスト結果）
-PHRASE_BODY_BONUS  = 2.2                            # 本文の完全フレーズ一致
-COOCCUR_WINDOW = 30                                 # 近接（共起）判定の窓幅（30文字以内）
+W_TITLE, W_TEXT = 2.0, 1.4
+PHRASE_TITLE_BONUS = 4.0
+PHRASE_BODY_BONUS  = 2.2
+COOCCUR_WINDOW = 30
 COOCCUR_TITLE_BONUS = 1.5
 COOCCUR_BODY_BONUS  = 1.2
 
@@ -281,17 +279,17 @@ def _score_record(rec:Dict[str,Any], terms_all:List[str], base_terms:List[str], 
         if tf in t_f:   sc+=W_TITLE*0.95; matched=True
         if tf in b_f:   sc+=W_TEXT*0.95;  matched=True
 
-    # フレーズ一致を強く評価（タイトル＞本文）
+    # フレーズ一致（タイトル＞本文）
     for ph in _phrase_candidates(q_raw, base_terms):
         ph_f=fold_kana(ph)
         if ph.lower() in t_low or ph_f in t_f: sc+=PHRASE_TITLE_BONUS; matched=True
         if ph.lower() in b_low or ph_f in b_f: sc+=PHRASE_BODY_BONUS;  matched=True
 
-    # 近接（コンテスト と 結果 が近い等）
+    # 近接（“コンテスト”と“結果”が近い等）
     if _near_cooccur(title, base_terms, COOCCUR_WINDOW): sc+=COOCCUR_TITLE_BONUS; matched=True
     if _near_cooccur(body,  base_terms, COOCCUR_WINDOW): sc+=COOCCUR_BODY_BONUS;  matched=True
 
-    # 取りこぼし救済：全フィールド連結
+    # 取りこぼし救済（全フィールド走査）
     if not matched:
         alltxt=_record_text_all(rec); a_low=low(alltxt); a_f=fk(alltxt)
         for t in terms_all:
@@ -311,7 +309,7 @@ def search_jsonl_scored(q:str, year=None, year_from=None, year_to=None)->Tuple[L
         body =str(rec.get("content","") or rec.get("text","") or rec.get("body",""))
         alltxt=_record_text_all(rec)
 
-        # 粗フィルタ（軽く当たりを見る）
+        # 粗フィルタ
         def _hit_any():
             for txt in (title, body, alltxt):
                 t_low=txt.lower(); t_fold=fold_kana(txt)
