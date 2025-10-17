@@ -5,127 +5,162 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ミニバラ盆栽愛好会 | 検索（JSONL版）</title>
   <style>
-    :root{--c1:#0f172a;--c2:#475569;--c3:#94a3b8;--a:#2563eb;--bg:#f8fafc}
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";background:var(--bg);color:var(--c1);margin:0}
-    header{padding:16px 20px;background:white;border-bottom:1px solid #e2e8f0;position:sticky;top:0;z-index:2}
-    h1{margin:0;font-size:18px}
-    .bar{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-    input[type="text"]{flex:1;min-width:220px;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px}
-    select,button{padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;background:white}
-    button.primary{background:var(--a);color:#fff;border-color:var(--a)}
-    main{max-width:980px;margin:20px auto;padding:0 16px}
-    .meta{font-size:12px;color:var(--c2);margin:8px 0 12px}
-    .card{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:14px 14px 10px;margin-bottom:12px}
-    .title{font-weight:700;font-size:16px;line-height:1.4;margin-bottom:6px}
-    .info{font-size:12px;color:var(--c2);display:flex;gap:10px;flex-wrap:wrap}
-    .snippet{margin-top:8px;color:#111827;font-size:14px;line-height:1.7}
-    .snippet, .title{word-break:break-word}
-    .foot{margin:24px 0 40px;color:var(--c3);font-size:12px}
-    .links a{color:var(--a);text-decoration:none}
-    mark{background:#cdeafe;padding:0 2px;border-radius:2px}
-    .pill{display:inline-block;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px;font-size:11px}
+    :root{--bg:#f7fafc;--card:#fff;--b:#e2e8f0;--txt:#0f172a;--sub:#475569;--link:#2563eb;--note:#f1f5f9}
+    html,body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+    header{background:#fff;border-bottom:1px solid var(--b);padding:18px 16px}
+    header h1{margin:0;font-size:20px}
+    .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+    input[type="text"],select,button{border:1px solid var(--b);border-radius:8px;padding:10px 12px;background:#fff}
+    input[type="text"]{flex:1;min-width:260px}
+    button.primary{background:var(--link);color:#fff;border-color:var(--link)}
+    main{max-width:980px;margin:18px auto;padding:0 16px}
+    .crumbs{font-size:12px;color:var(--sub);margin:6px 0 14px}
+    .section{background:var(--card);border:1px solid var(--b);border-radius:12px;margin-bottom:16px}
+    .section h2{margin:0;padding:12px 14px;border-bottom:1px solid var(--b);font-size:16px}
+    .section .body{padding:12px 14px}
+    .result-block{border:1px dashed var(--b);background:#fff;border-radius:10px;padding:10px 12px;margin-bottom:12px}
+    .r-title{font-weight:700;font-size:15px;margin-bottom:6px}
+    .r-title a{color:inherit;text-decoration:none}
+    .r-meta{font-size:12px;color:var(--sub);margin:2px 0 6px}
+    .r-snippet{font-size:14px;line-height:1.7}
+    .outlink{color:var(--link);text-decoration:none;word-break:break-all}
+    mark{background:#cdeafe;border-radius:2px;padding:0 2px}
+    .pager{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
+    .pill{display:inline-block;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px;font-size:11px;margin-right:6px}
+    .notice{background:var(--note);border:1px solid var(--b);border-radius:12px;padding:10px 12px}
+    .muted{color:var(--sub);font-size:12px}
+    .json{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;font-size:12px;background:#0b1020;color:#d1e7ff;border-radius:10px;padding:10px;overflow:auto}
+    .small{font-size:12px}
   </style>
 </head>
 <body>
-<header>
-  <h1>ミニバラ盆栽愛好会 | 検索（JSONL版）</h1>
-  <div class="bar">
-    <input id="q" type="text" placeholder="例：コンテスト結果 / 黒星病 2024 / 盆景 1999-2001" />
-    <select id="pageSize">
-      <option value="5">5件</option>
-      <option value="10">10件</option>
-      <option value="20">20件</option>
-    </select>
-    <select id="order">
-      <option value="relevance">関連順</option>
-      <option value="latest">最新順</option>
-    </select>
-    <button class="primary" id="doSearch">検索</button>
-    <button id="clear">クリア</button>
-  </div>
-  <div class="meta">
-    API: <code>/api/search</code> |
-    版: <span id="ver">…</span> |
-    <span class="links">
-      <a href="/health" target="_blank">/health</a> ・
-      <a href="/version" target="_blank">/version</a>
-    </span>
-  </div>
-</header>
+  <header>
+    <h1>ミニバラ盆栽愛好会 | 検索（JSONL版）</h1>
+    <div class="toolbar">
+      <input id="q" type="text" placeholder="例：コンテスト結果 / 黒星病 2024 / 盆景 1999-2001" />
+      <select id="pageSize">
+        <option value="5">5件</option>
+        <option value="10">10件</option>
+        <option value="20">20件</option>
+      </select>
+      <select id="order">
+        <option value="relevance">関連順</option>
+        <option value="latest">最新順</option>
+      </select>
+      <button id="doSearch" class="primary">検索</button>
+      <button id="clear">クリア</button>
+    </div>
+    <div class="crumbs">
+      API: <code>/api/search</code> |
+      版: <span id="ver">…</span> |
+      <a href="/health" target="_blank">/health</a> ・ <a href="/version" target="_blank">/version</a>
+    </div>
+  </header>
 
-<main>
-  <div id="resultMeta" class="meta"></div>
-  <div id="list"></div>
-  <div class="foot" id="footNote">
-    ※ タイトルと本文の<strong>ハイライト（薄い青）</strong>はサーバからの
-    <code>&lt;mark&gt;</code> をそのまま表示しています（UIは <code>innerHTML</code> で描画）。
-  </div>
-</main>
+  <main>
+    <div class="section">
+      <h2>検索結果（整形表示）</h2>
+      <div class="body">
+        <div id="meta" class="muted">（未取得）</div>
+        <div id="results"></div>
+        <div class="pager">
+          <button id="prev">前へ</button>
+          <button id="next">次へ</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="notice small">
+      ※ タイトルと本文の<strong>ハイライト</strong>（薄い青）はサーバからの <code>&lt;mark&gt;</code> をそのまま表示しています（UIは <code>innerHTML</code> で描画）。<br/>
+      ※ 抜粋はヒット周辺を<strong>約500字</strong>表示。日付は JSON の <code>date</code>（無ければ年）を表示します。
+    </div>
+
+    <div class="section" style="margin-top:16px;">
+      <h2>開発者向け：レスポンス（生のJSON）</h2>
+      <div class="body">
+        <div id="json" class="json">（未取得）</div>
+      </div>
+    </div>
+  </main>
 
 <script>
-(async function bootstrap(){
+(async function init(){
   // 版表示
-  try{
+  try {
     const v = await fetch('/version').then(r=>r.json());
     document.getElementById('ver').textContent = v.version || 'unknown';
-  }catch(_){}
+  } catch {}
 
   const elQ = document.getElementById('q');
   const elPS= document.getElementById('pageSize');
   const elOrd=document.getElementById('order');
-  const elBtn=document.getElementById('doSearch');
-  const elClr=document.getElementById('clear');
-  const elList=document.getElementById('list');
-  const elMeta=document.getElementById('resultMeta');
+  const elList=document.getElementById('results');
+  const elMeta=document.getElementById('meta');
+  const elPrev=document.getElementById('prev');
+  const elNext=document.getElementById('next');
+  const elJson=document.getElementById('json');
 
-  // 既定：関連順（サーバも既定relevance）。UIから latest を強制しません。
+  // 既定は関連順（サーバ既定と一致）
   elOrd.value = 'relevance';
+
+  let state={page:1,total:0,pageSize:5,order:'relevance',q:''};
 
   function rowHTML(item){
     const titleHTML = item.title || '(無題)';
     const url = item.url || '#';
-    const date = item.date || '';
+    const date = item.date ? `<span class="pill">日付: ${item.date}</span>` : '';
+    const rank = item.rank != null ? `<span class="pill">順位: ${item.rank}</span>` : '';
     const snippetHTML = item.content || '';
+    const source = item.url ? `<div>出典： <a class="outlink" href="${url}" target="_blank" rel="noopener noreferrer">${url}</a></div>` : '';
 
     return `
-      <div class="card">
-        <div class="title"><a href="${url}" target="_blank" rel="noopener noreferrer">
-          ${titleHTML}
-        </a></div>
-        <div class="info">
-          ${date ? `<span class="pill">日付: ${date}</span>` : ``}
-          <span class="pill">順位: ${item.rank ?? ''}</span>
-          ${item.url ? `<span class="pill">外部リンク</span>`:``}
-        </div>
-        <div class="snippet">${snippetHTML}</div>
+      <div class="result-block">
+        <div class="r-title"><a href="${url}" target="_blank" rel="noopener noreferrer">${titleHTML}</a></div>
+        <div class="r-meta">${date}${rank}</div>
+        <div class="r-snippet">${snippetHTML}</div>
+        ${source}
       </div>
     `;
   }
 
-  async function search(page=1){
+  async function search(page){
     const q = elQ.value.trim();
-    if(!q){ elList.innerHTML=''; elMeta.textContent=''; return; }
+    if(!q){ elList.innerHTML=''; elMeta.textContent='（未取得）'; elJson.textContent='（未取得）'; return; }
 
-    const pageSize = Number(elPS.value) || 5;
-    const order = elOrd.value; // relevance / latest
-    const url = `/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}&order=${encodeURIComponent(order)}`;
+    state.page = page;
+    state.pageSize = Number(elPS.value)||5;
+    state.order = elOrd.value;
+    state.q = q;
 
+    const url = `/api/search?q=${encodeURIComponent(q)}&page=${state.page}&page_size=${state.pageSize}&order=${encodeURIComponent(state.order)}`;
     const res = await fetch(url);
     const js = await res.json();
 
-    elMeta.textContent = `${js.total_hits} 件中 ${js.items.length ? js.items[0].rank : 0}–${js.items.length ? js.items[js.items.length-1].rank : 0} 件を表示 / order_used: ${js.order_used}`;
+    // メタ
+    const first = js.items.length ? js.items[0].rank : 0;
+    const last  = js.items.length ? js.items[js.items.length-1].rank : 0;
+    elMeta.textContent = `${js.total_hits} 件中 ${first}-${last} 件を表示 / order_used: ${js.order_used}`;
+
+    // 本文（innerHTML で <mark> を生かす）
     elList.innerHTML = js.items.map(rowHTML).join('');
+
+    // JSON
+    elJson.textContent = JSON.stringify(js, null, 2);
+
+    // ページング
+    elPrev.disabled = state.page<=1;
+    elNext.disabled = !js.has_more;
   }
 
-  elBtn.addEventListener('click', ()=>search(1));
-  elClr.addEventListener('click', ()=>{
-    elQ.value=''; elList.innerHTML=''; elMeta.textContent='';
+  document.getElementById('doSearch').addEventListener('click', ()=>search(1));
+  document.getElementById('clear').addEventListener('click', ()=>{
+    elQ.value=''; elList.innerHTML=''; elMeta.textContent='（未取得）'; elJson.textContent='（未取得）';
   });
-
-  // Enter で検索
+  elPrev.addEventListener('click', ()=> search(Math.max(1, state.page-1)));
+  elNext.addEventListener('click', ()=> search(state.page+1));
   elQ.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ search(1); } });
 
-  // URLに ?q= があればそれで検索
+  // ?q= 付きで開かれたら即検索
   const usp = new URLSearchParams(location.search);
   if(usp.get('q')){ elQ.value = usp.get('q'); search(1); }
 })();
