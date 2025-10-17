@@ -8,12 +8,12 @@
   <style>
     :root{
       --bg:#fafafa; --card:#ffffff; --b:#e5e7eb; --muted:#64748b; --txt:#0f172a;
-      --accent:#ef4444; --pill:#fff7ed; --pillbd:#fed7aa; --link:#2563eb;
-      --hl:#e6f3ff; --warn:#fff7cc; --warn-b:#fde68a;
+      --accent:#ef4444; --pill:#fff7ed; --pillbd:#fed7aa; --link:#1d4ed8;
+      --hl:#e6f3ff; --warn:#fff7cc; --warn-b:#fde68a; --navy:#1e3a8a; --qbg:#eaf3ff;
     }
     html,body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;line-height:1.7}
     html{font-size:18px}
-    @media (max-width:480px){ html{font-size:19px} } /* スマホで更に少し大きめ */
+    @media (max-width:480px){ html{font-size:19px} }
 
     .container{max-width:1000px;margin:18px auto;padding:0 16px}
     h1{margin:0 0 12px;font-size:26px}
@@ -27,7 +27,14 @@
     input[type="text"],select,button{
       border:1px solid var(--b);border-radius:10px;background:#fff;font-size:16px;line-height:1.2
     }
-    input[type="text"]{flex:1 1 460px;padding:12px 14px;min-width:260px}
+    /* ★検索欄＝濃紺の太い枠＋薄い青の背景 */
+    #q{
+      flex:1 1 480px; min-width:260px;
+      padding:12px 14px; border:3px solid var(--navy); background:var(--qbg);
+      outline:none;
+    }
+    #q:focus{ box-shadow:0 0 0 3px rgba(30,58,138,.15) }
+
     select{padding:10px 12px}
     button{padding:10px 16px;cursor:pointer;background:#f8fafc;min-height:44px}
     button.primary{background:#e7f0ff;border-color:#bfdbfe}
@@ -45,8 +52,9 @@
     .snippet{white-space:pre-wrap;word-break:break-word}
     .hit{display:inline-block;font-size:12px;color:#1d4ed8;background:#e0ecff;border:1px solid #bfdbfe;border-radius:999px;padding:2px 8px;margin-left:6px}
     .src{font-size:15px;margin-top:8px}
+    /* ★出典リンク＝押しやすいボタン風 */
     .src a{
-      display:inline-block; padding:8px 10px; border:1px solid var(--b); border-radius:10px;
+      display:inline-block; padding:10px 12px; border:1px solid var(--b); border-radius:10px;
       color:var(--link); text-decoration:none; word-break:break-all;
       -webkit-tap-highlight-color:transparent;
     }
@@ -73,8 +81,7 @@
       </div>
 
       <div class="row" style="margin-top:8px">
-        <input id="q" type="text" placeholder="例） 苔　／　例） コンテスト 2023　／　例） 剪定 1999-2001" />
-        <!-- 常に5件固定。page_size セレクタは削除 -->
+        <input id="q" type="text" placeholder="例） 苔 ／ 例） コンテスト 2023 ／ 例） 剪定 1999-2001" />
         <select id="order" title="並び順">
           <option value="relevance" selected>関連順</option>
           <option value="latest">最新順</option>
@@ -106,185 +113,4 @@
       <summary>開発者向け：レスポンス（生のJSON）</summary>
       <div class="body">
         <div class="muted" style="margin-bottom:6px">
-          ※ タイトルと本文の<strong>ハイライト（薄い青）</strong>はサーバの <code>&lt;mark&gt;</code> をそのまま表示します。<span class="hit">（本文にヒット）</span> は UI 側で本文に <code>&lt;mark&gt;</code> がある場合に付与します。
-        </div>
-        <div id="raw" class="json">（未取得）</div>
-      </div>
-    </details>
-
-    <div class="notice">
-      <strong>お知らせ</strong><br/>
-      チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。
-    </div>
-  </div>
-
-  <script>
-    /* ===== ユーティリティ ===== */
-    const PAGE_SIZE = 5; // ★ 常に5件固定
-    const $ = (id) => document.getElementById(id);
-    const asArray = (x) => Array.isArray(x) ? x : [];
-    const sanitize = (s) => (typeof s === "string") ? s : "";
-
-    // 指定タグ以外を除去（<mark>は残す）
-    function stripExceptMark(html){
-      return sanitize(html).replace(/<(?!\/?mark\b)[^>]+>/g, "");
-    }
-    function containsMark(html){ return /<mark>/.test(html||""); }
-
-    // <mark>周辺だけ（無ければ先頭短文）
-    function aroundMark(html, side = 80, fallbackLen = 160){
-      const s = stripExceptMark(html);
-      const m = s.indexOf("<mark>");
-      if (m === -1){
-        const t = s.replace(/<\/?mark>/g,"");
-        return t.length > fallbackLen ? t.slice(0, fallbackLen) + "…" : t;
-      }
-      const end = s.indexOf("</mark>", m);
-      const start = Math.max(0, m - side);
-      const finish = Math.min(s.length, (end > -1 ? end + 7 : m + 6) + side);
-      const headEll = start > 0 ? "…" : "";
-      const tailEll = finish < s.length ? "…" : "";
-      return headEll + s.slice(start, finish) + tailEll;
-    }
-
-    // 先頭用：<mark>活かして約500字（±50）
-    function approx500(html, target = 500){
-      const s = stripExceptMark(html);
-      const clean = s.replace(/<\/?mark>/g,"");
-      if (clean.length <= target + 50) return s;
-      const m = s.indexOf("<mark>");
-      if (m === -1) return clean.slice(0, target) + "…";
-      const end = s.indexOf("</mark>", m);
-      const half = Math.floor(target / 2);
-      const start = Math.max(0, m - half);
-      const finish = Math.min(s.length, (end > -1 ? end + 7 : m + 6) + half);
-      const headEll = start > 0 ? "…" : "";
-      const tailEll = finish < s.length ? "…" : "";
-      return headEll + s.slice(start, finish) + tailEll;
-    }
-
-    function normalizeResponse(raw, page){
-      const items = asArray(raw?.items) || asArray(raw?.results) || [];
-      const norm = items.map(it => {
-        const title = stripExceptMark(it.title || "(無題)");
-        const content = sanitize(it.content || it.text || "");
-        const url = sanitize(it.url || it.source || "");
-        const date = sanitize(it.date || it.date_primary || "");
-        const rank = (typeof it.rank === "number") ? it.rank : null;
-        return { title, content, url, date, rank };
-      });
-      const total = (typeof raw?.total_hits === "number") ? raw.total_hits : norm.length;
-      const has_more = !!raw?.has_more;
-      const order_used = raw?.order_used || null;
-      return { items: norm, total, page, has_more, order_used };
-    }
-
-    function buildMeta(total, page, shownCount, order_used){
-      if (!Number.isFinite(total)) return "（未取得）";
-      const start = (page - 1) * PAGE_SIZE + 1;
-      const end = Math.min(total, start + shownCount - 1);
-      return `${total} 件中 ${start}–${end} 件を表示　/　order_used: ${order_used || "unknown"}`;
-    }
-
-    function rowHTMLFirst(it){
-      const titleHTML = it.title || "(無題)";
-      const hit = containsMark(it.content) ? `<span class="hit">（本文にヒット）</span>` : "";
-      const snippet = approx500(it.content, 500);
-      const date = it.date ? `<span class="hit" style="background:#eef2ff;border-color:#c7d2fe;color:#3730a3">日付: ${it.date}</span> ` : "";
-      const rank = (it.rank!=null) ? `<span class="hit" style="background:#eef2ff;border-color:#c7d2fe;color:#3730a3">順位: ${it.rank}</span>` : "";
-      const src = it.url ? `<div class="src">出典： <a href="${it.url}" target="_blank" rel="noopener">${it.url}</a></div>` : "";
-      return `
-        <div class="result">
-          <div class="title">${titleHTML}${hit}</div>
-          <div class="muted" style="margin-bottom:6px">${date}${rank}</div>
-          <div class="snippet">${snippet}</div>
-          ${src}
-        </div>`;
-    }
-    function rowHTMLRest(it){
-      const titleHTML = it.title || "(無題)";
-      const snippet = aroundMark(it.content, 80, 160);
-      const src = it.url ? `<div class="src">出典： <a href="${it.url}" target="_blank" rel="noopener">${it.url}</a></div>` : "";
-      return `
-        <div class="result">
-          <div class="title">${titleHTML}</div>
-          <div class="snippet">${snippet}</div>
-          ${src}
-        </div>`;
-    }
-
-    async function fetchJSON(url){
-      const res = await fetch(url, {cache:"no-store", headers:{ "Accept":"application/json" }});
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    }
-
-    async function search(page){
-      const q = $("q").value.trim();
-      if (!q){
-        $("results").innerHTML = "";
-        $("meta").textContent = "（未取得）";
-        $("raw").textContent = "（未取得）";
-        $("prev").disabled = true; $("next").disabled = true;
-        return;
-      }
-      $("btnSearch").disabled = true; $("prev").disabled = true; $("next").disabled = true;
-      $("meta").textContent = "検索中…"; $("results").innerHTML = "";
-      try{
-        const order = $("order").value;
-        const url = `/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(order)}`;
-        const raw = await fetchJSON(url);
-        $("raw").textContent = JSON.stringify(raw, null, 2);
-
-        const data = normalizeResponse(raw, page);
-        if (data.order_used && $("order").value !== data.order_used){ $("order").value = data.order_used; } // ★ APIの実際とUI表示を一致
-
-        const items = data.items;
-        if (items.length === 0){
-          $("meta").textContent = "該当なし";
-          $("prev").disabled = page<=1; $("next").disabled = false && data.has_more;
-          $("btnSearch").disabled = false; return;
-        }
-
-        // 先頭=約500字、残り=ハイライト周辺
-        const first = rowHTMLFirst(items[0]);
-        const rest  = items.slice(1).map(rowHTMLRest).join("");
-        $("results").innerHTML = first + rest;
-
-        $("meta").textContent = buildMeta(data.total, data.page, items.length, data.order_used);
-
-        $("prev").disabled = page<=1;
-        $("next").disabled = !data.has_more;
-        window.__page = page;
-      }catch(err){
-        $("meta").textContent = `エラー：${String(err.message||err)}`;
-        $("results").innerHTML = "";
-        $("prev").disabled = true; $("next").disabled = true;
-      }finally{
-        $("btnSearch").disabled = false;
-      }
-    }
-
-    // ---- イベント
-    $("btnSearch").addEventListener("click", ()=>search(1));
-    $("btnClear").addEventListener("click", ()=>{
-      $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; $("raw").textContent="（未取得）";
-      $("prev").disabled=true; $("next").disabled=true;
-    });
-    $("prev").addEventListener("click", ()=>{ const p=Math.max(1,(window.__page||1)-1); search(p); });
-    $("next").addEventListener("click", ()=>{ const p=(window.__page||1)+1; search(p); });
-    $("q").addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ search(1); } });
-    $("order").addEventListener("change", ()=>{ search(1); });
-
-    // 版表示 & ?q= 即時検索
-    (async ()=>{
-      try{
-        const v = await fetchJSON("/version");
-        document.getElementById("ver").textContent = v.version || "—";
-      }catch{}
-      const usp = new URLSearchParams(location.search);
-      if (usp.get("q")){ $("q").value = usp.get("q"); search(1); }
-    })();
-  </script>
-</body>
-</html>
+          ※ タイトルと本文の<strong>ハイライト（薄い青）<
