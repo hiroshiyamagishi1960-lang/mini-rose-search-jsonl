@@ -1,12 +1,6 @@
 # app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版）
-# 一般化された多語検索対応:
-#  - 空白=AND, "|"=OR, "-語"=NOT, "..."=フレーズ一致
-#  - 語尾の一般ルール（結果/報告/案内/募集/要項/記録/予定/日程…）
-#  - こけ/コケ/苔 の同一視（かな折り＋同義語）
-#  - 先頭カード=本文冒頭~300字固定、以降=ヒット周辺~160字
-#  - 例外でもHTTP200でJSONを返しUIが落ちない
-#  - /diag でKB自己診断
-# 2025-10-18 general-v1
+# 一般化された多語検索＋実用性改善（タイトル取得強化／年フィルタ柔軟化）
+# 2025-10-18 general-v2
 
 import os, io, re, json, hashlib, unicodedata
 from datetime import datetime
@@ -33,7 +27,7 @@ app.add_middleware(
 # ===== 設定 =====
 KB_URL = os.getenv("KB_URL", "").strip()
 KB_PATH = os.getenv("KB_PATH", "/data/kb.jsonl").strip() or "/data/kb.jsonl"
-VERSION = os.getenv("APP_VERSION", "jsonl-2025-10-18-general-v1")
+VERSION = os.getenv("APP_VERSION", "jsonl-2025-10-18-general-v2")
 
 # ===== 文字整形 =====
 KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
@@ -79,7 +73,7 @@ SYNONYMS: Dict[str, List[str]] = {
     "苔": ["コケ", "こけ"],
     "コケ": ["苔", "こけ"],
     "こけ": ["苔", "コケ"],
-    # よく使う一般語尾（ひら・カナも吸収）
+    # 汎用語尾
     "結果": ["けっか", "ケッカ"],
     "報告": ["ほうこく", "ホウコク", "レポート"],
     "案内": ["あんない", "アンナイ", "ご案内"],
@@ -92,9 +86,7 @@ SYNONYMS: Dict[str, List[str]] = {
     "一覧": ["いちらん", "イチラン"],
     "まとめ": ["マトメ"],
 }
-SUFFIXES = set([
-    "結果","報告","案内","募集","要項","記録","予定","日程","要領","一覧","まとめ"
-])
+SUFFIXES = set(["結果","報告","案内","募集","要項","記録","予定","日程","要領","一覧","まとめ"])
 
 # ===== KB 確保 =====
 def ensure_kb() -> Tuple[int, str]:
@@ -129,16 +121,35 @@ def _startup():
     except Exception:
         KB_LINES, KB_HASH = 0, ""
 
-# ===== ユーティリティ =====
+# ===== ユーティリティ（日時） =====
+JP_DATE_PATTERNS = [
+    re.compile(r"^(\d{4})年(\d{1,2})月(\d{1,2})日?$"),
+    re.compile(r"^(\d{4})年(\d{1,2})月$"),
+    re.compile(r"^(\d{4})年$"),
+]
+
 def parse_date_str(s: str) -> Optional[datetime]:
     if not s:
         return None
-    s = s.strip()
+    s = normalize_text(s)
+    # 日本語表記（YYYY年MM月DD日 / YYYY年MM月 / YYYY年）
+    for pat in JP_DATE_PATTERNS:
+        m = pat.match(s)
+        if m:
+            y = int(m.group(1))
+            mth = int(m.group(2)) if len(m.groups()) >= 2 and m.group(2) else 1
+            day = int(m.group(3)) if len(m.groups()) >= 3 and m.group(3) else 1
+            try:
+                return datetime(y, mth, day)
+            except Exception:
+                return None
+    # 既存の西暦フォーマット
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y-%m", "%Y/%m", "%Y.%m", "%Y"):
         try:
             return datetime.strptime(s[:len(fmt)], fmt)
         except Exception:
             continue
+    # 先頭4桁だけの年
     m = re.match(r"^(\d{4})", s)
     if m:
         try:
@@ -169,7 +180,7 @@ def textify(x: Any) -> str:
     return str(x)
 
 def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
-    for k in ("date", "date_primary", "Date", "published_at"):
+    for k in ("date", "date_primary", "Date", "published_at", "published", "created_at"):
         d = rec.get(k)
         if d:
             dt = parse_date_str(textify(d))
@@ -190,13 +201,10 @@ def _expand_one_term(term: str) -> List[str]:
     kata = to_kata(hira)
     if kata != term:
         out.append(kata)
-    # 重複除去・空除去
     out = [normalize_text(t) for t in out if t]
-    out = list(dict.fromkeys(out))
-    return out
+    return list(dict.fromkeys(out))
 
 def _maybe_split_suffix(token: str) -> Tuple[Optional[str], Optional[str]]:
-    """末尾が一般語尾なら (base, suffix) を返す。そうでなければ (None, None)。"""
     for suf in sorted(SUFFIXES, key=len, reverse=True):
         if token.endswith(suf) and len(token) > len(suf):
             base = token[:len(token) - len(suf)]
@@ -207,13 +215,9 @@ def _maybe_split_suffix(token: str) -> Tuple[Optional[str], Optional[str]]:
 def parse_query(q: str) -> Tuple[List[List[str]], List[List[str]], List[str]]:
     """
     返り値:
-      - pos_groups: ANDの各グループ（各要素は OR リスト）
-      - neg_groups: 除外グループ（どれか当たれば除外）
-      - phrase_terms: 「base+suffix」等のフレーズ完全一致候補
-    仕様:
-      - 空白=AND, '|'=OR, '-語'=NOT, "..."=フレーズ（ANDの1項目として扱う）
-      - tokenが「base+suffix（一般語尾）」なら AND で2グループに分割し、フレーズ候補も追加
-      - 分かち書きで base と suffix が両方含まれていれば、それも自然に AND になる
+      pos_groups: ANDの各グループ（要素は OR リスト）
+      neg_groups: 除外グループ
+      phrase_terms: 「base+suffix」等のフレーズ完全一致候補
     """
     base = normalize_text(q)
     if not base:
@@ -235,17 +239,9 @@ def parse_query(q: str) -> Tuple[List[List[str]], List[List[str]], List[str]]:
             if not token:
                 continue
 
-        # OR分解
         parts = [t for t in token.split("|") if t]
 
-        # フレーズ（"..."）はそのまま1グループ
-        # TOKEN_REで "..." は m.group(1) に入り、上ですでに抽出済み
-
-        # 各パーツを処理
-        # - 一般語尾なら AND分割（base群 と suffix群）＋ フレーズ候補 base+suffix
-        # - それ以外は OR群としてまとめる
-        and_chunks: List[List[str]] = []  # ここに AND で積む
-
+        and_chunks: List[List[str]] = []
         for p in parts:
             base_s, suf = _maybe_split_suffix(p)
             if base_s and suf:
@@ -253,34 +249,32 @@ def parse_query(q: str) -> Tuple[List[List[str]], List[List[str]], List[str]]:
                 suf_group = _expand_one_term(suf)
                 and_chunks.append(base_group)
                 and_chunks.append(suf_group)
-                # フレーズ候補（ひら/カナ）
+                # フレーズ候補（ひら／カナ）
                 phrase_terms.append(normalize_text(base_s + suf))
                 phrase_terms.append(normalize_text(to_kata(base_s) + suf))
             else:
-                # 普通の語（OR群へ）
                 or_group = _expand_one_term(p)
                 and_chunks.append(or_group)
 
-        # and_chunks を AND として積む（各要素は ORの集合）
         if is_neg:
             neg_groups.extend(and_chunks)
         else:
             pos_groups.extend(and_chunks)
 
-    # フレーズ候補整形
     phrase_terms = [t for t in phrase_terms if t]
     phrase_terms = list(dict.fromkeys(phrase_terms))
     return pos_groups, neg_groups, phrase_terms
 
 # ===== スコアリング =====
 FIELD_WEIGHTS = {
-    "title": 12,
-    "text":  8,
-    "author": 5,
-    "issue":  3,
-    "date":   2,
+    "title":   12,
+    "text":     8,
+    "author":   5,
+    "issue":    3,
+    "date":     2,
     "category": 2,
 }
+
 PHRASE_BONUS_TITLE = 100
 PHRASE_BONUS_TEXT  = 60
 
@@ -291,15 +285,18 @@ def _get_field(rec: Dict[str, Any], keys: List[str]) -> str:
             return textify(v)
     return ""
 
+TITLE_KEYS = ["title", "Title", "name", "Name", "page_title", "source_title", "heading", "headline", "subject"]
+TEXT_KEYS  = ["text", "content", "body", "description", "summary", "note", "content_full", "excerpt"]
+
 def record_as_text(rec: Dict[str, Any], field: str) -> str:
     key_map = {
-        "title": ["title"],
-        "text": ["text", "content", "body"],
-        "author": ["author"],
-        "issue": ["issue"],
-        "date": ["date", "date_primary"],
-        "category": ["category"],
-        "url": ["url", "source"],
+        "title": TITLE_KEYS,
+        "text": TEXT_KEYS,
+        "author": ["author", "Author", "writer", "posted_by"],
+        "issue": ["issue", "Issue"],
+        "date": ["date", "date_primary", "Date", "published_at", "published", "created_at"],
+        "category": ["category", "Category", "tags", "Tags"],
+        "url": ["url", "source", "link", "permalink"],
     }
     raw = _get_field(rec, key_map.get(field, [field]))
     return fix_mojibake(raw)
@@ -312,14 +309,12 @@ def match_count(term: str, text: str) -> int:
     return a.count(b) + ah.count(bh)
 
 def group_hit_count(group: List[str], text: str) -> int:
-    """ORグループの中で何回ヒットしたか（累積）"""
     total = 0
     for t in group:
         total += match_count(t, text)
     return total
 
 def matches_group_any_field(rec: Dict[str, Any], group: List[str]) -> Tuple[bool, int]:
-    """ORグループがどこかのフィールドにヒットしたか／スコア寄与"""
     hit = False
     score_add = 0
     for field, w in FIELD_WEIGHTS.items():
@@ -346,13 +341,13 @@ def compute_score(rec: Dict[str, Any],
                   pos_groups: List[List[str]],
                   neg_groups: List[List[str]],
                   phrase_terms: List[str]) -> int:
-    # 1) NOT判定（どれか当たれば除外）
+    # 1) NOT：どれか当たれば除外
     for ng in neg_groups:
         ok, _ = matches_group_any_field(rec, ng)
         if ok:
             return -1
 
-    # 2) AND判定（全グループがヒット必須）＆スコア集計
+    # 2) AND：全グループがヒット必須
     total = 0
     for g in pos_groups:
         ok, add = matches_group_any_field(rec, g)
@@ -380,7 +375,6 @@ def highlight(text: str, terms: List[str]) -> str:
     if not text:
         return ""
     esc = html_escape(text)
-    # 長い語から順に
     for t in sorted(set(terms), key=len, reverse=True):
         et = html_escape(t)
         if et:
@@ -436,11 +430,9 @@ def version():
 @app.get("/diag")
 def diag():
     has_ui = os.path.exists(os.path.join("static", "ui.html"))
-    return {
-        "kb": {"path": KB_PATH, "lines": KB_LINES, "sha256": KB_HASH, "url": KB_URL},
-        "env": {"APP_VERSION": VERSION},
-        "ui": {"static_ui_html": has_ui},
-    }
+    return {"kb": {"path": KB_PATH, "lines": KB_LINES, "sha256": KB_HASH, "url": KB_URL},
+            "env": {"APP_VERSION": VERSION},
+            "ui": {"static_ui_html": has_ui}}
 
 @app.get("/ui")
 def ui():
@@ -486,7 +478,7 @@ def api_search(
     - 空白=AND, "|"=OR, "-語"=NOT, "..."=フレーズ一致
     - 語尾の一般ルール（結果/報告/案内/募集/要項/記録/予定/日程…）
     - relevance: スコア順（同点は新しい日付優先） / latest: 日付降順
-    - 1ページ目先頭=冒頭300字、以降=ヒット周辺160字
+    - 先頭=冒頭300字、以降=ヒット周辺160字
     - 例外時も200でJSON返却（UIを落とさない）
     """
     try:
@@ -509,15 +501,15 @@ def api_search(
         hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = []
 
         for rec in iter_records():
-            # 年フィルタ
+            # 年フィルタ：日付が読めたレコードだけ範囲でふるい、読めないものは残す
             if y_from or y_to:
                 d = record_date(rec)
-                if not d:
-                    continue
-                if y_from and d.year < y_from:
-                    continue
-                if y_to and d.year > y_to:
-                    continue
+                if d:
+                    if y_from and d.year < y_from:
+                        continue
+                    if y_to and d.year > y_to:
+                        continue
+                # d が無い場合は除外しない（柔軟化）
 
             score = compute_score(rec, pos_groups, neg_groups, phrase_terms)
             if score < 0:
@@ -532,7 +524,7 @@ def api_search(
             hits.sort(key=lambda x: (x[1] or datetime.min), reverse=True)
             order_used = "latest"
         else:
-            hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)  # 同点は新しい方
+            hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)
             order_used = "relevance"
 
         # ページング
@@ -542,7 +534,7 @@ def api_search(
         has_more = end < total_hits
         next_page = page + 1 if has_more else None
 
-        # ハイライト語（実際に使っている語＋フレーズ）
+        # ハイライト語（AND/OR/NOTで実際に使った語＋フレーズ）
         hl_terms: List[str] = sorted({t for g in pos_groups for t in g} | {t for g in neg_groups for t in g} | set(phrase_terms))
 
         items: List[Dict[str, Any]] = []
