@@ -16,22 +16,22 @@ import unicodedata
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 
-import fastapi
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
-    import requests  # Render では利用可
+    import requests  # Render では利用可（requirements.txt に requests が必要）
 except Exception:
     requests = None
 
-APP = FastAPI(title="mini-rose-search-jsonl (kb.jsonl)")
+# ===== FastAPI app（← uvicorn app:app が参照するのはこの変数） =====
+app = FastAPI(title="mini-rose-search-jsonl (kb.jsonl)")
 
-# CORS（同一オリジン前提。必要最小限）
-APP.add_middleware(
+# CORS（公開UI想定。必要最小限でOK）
+app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 管理者のみの想定だが、公開閲覧UIのため広めに
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET"],
     allow_headers=["*"],
@@ -55,7 +55,7 @@ def normalize_text(s: str) -> str:
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("\u3000", " ")
     s = re.sub(r"[\r\n\t]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+", " ", s).trim()
     return s
 
 # 同義語（必要に応じて拡張）
@@ -91,20 +91,16 @@ def expand_query_to_groups(q: str) -> List[List[str]]:
         m = COMPOUND_RESULT_RE.match(term)
         if m:
             left = m.group(1)
-            # 左辺の同義語群
-            left_group = [left]
-            left_group += SYNONYMS.get(left, [])
+            left_group = [left] + SYNONYMS.get(left, [])
             left_group = list(dict.fromkeys(left_group))
             groups.append(left_group)
-            # 「結果」グループ
             groups.append(["結果"])
             continue
 
-        group: List[str] = [term]
-        group += SYNONYMS.get(term, [])
-        # カタカナ対策：ひらがな←→カタカナの両方を入れておく
+        group: List[str] = [term] + SYNONYMS.get(term, [])
+        # ひらがな→カタカナも加える（双方向吸収）
         hira = term
-        kata = hira.translate({ord(c): chr(ord(c) + 0x60) for c in hira})  # ひら→カタ
+        kata = hira.translate({ord(c): chr(ord(c) + 0x60) for c in hira})
         if kata != term:
             group.append(kata)
         group = list(dict.fromkeys(group))
@@ -120,18 +116,15 @@ def ensure_kb() -> Tuple[int, str]:
     os.makedirs(os.path.dirname(KB_PATH), exist_ok=True)
     if KB_URL and KB_URL.startswith("http"):
         if requests is None:
-            raise RuntimeError("requests が利用できません")
+            raise RuntimeError("requests が利用できません（requirements.txt に requests を追加してください）")
         r = requests.get(KB_URL, timeout=30)
         r.raise_for_status()
         with open(KB_PATH, "wb") as f:
             f.write(r.content)
 
-    # ファイル存在チェック
     if not os.path.exists(KB_PATH):
-        # 事前配置されていればそのまま使う想定
         raise FileNotFoundError(f"KB not found: {KB_PATH}")
 
-    # 行数とハッシュ
     line_count = 0
     sha = hashlib.sha256()
     with open(KB_PATH, "rb") as f:
@@ -143,13 +136,12 @@ def ensure_kb() -> Tuple[int, str]:
 KB_LINES: int = 0
 KB_HASH: str = ""
 
-@APP.on_event("startup")
+@app.on_event("startup")
 def _startup():
     global KB_LINES, KB_HASH
     try:
         KB_LINES, KB_HASH = ensure_kb()
     except Exception:
-        # 失敗しても起動はする（/healthで確認できる）
         KB_LINES, KB_HASH = 0, ""
 
 # ======== ユーティリティ ========
@@ -157,13 +149,11 @@ def parse_date_str(s: str) -> Optional[datetime]:
     if not s:
         return None
     s = s.strip()
-    # ISO / YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD / YYYY
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y-%m", "%Y/%m", "%Y.%m", "%Y"):
         try:
             return datetime.strptime(s[:len(fmt)], fmt)
         except Exception:
             continue
-    # 数字だけ年
     m = re.match(r"^(\d{4})", s)
     if m:
         try:
@@ -234,12 +224,11 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
     return ""
 
 def match_term_in_text(t: str, s: str) -> int:
-    """単純出現回数（大文字小文字・全角半角をNFKCで吸収）"""
+    """単純出現回数（NFKC + ひらがな化で吸収）"""
     if not t or not s:
         return 0
     a = normalize_text(s)
     b = normalize_text(t)
-    # ひらがな検索も許容（本文もひらがな化版を作って試す）
     ah = to_hira(a)
     bh = to_hira(b)
     return a.count(b) + ah.count(bh)
@@ -254,10 +243,7 @@ def compute_score(rec: Dict[str, Any], groups: List[List[str]]) -> int:
         group_hit = False
         for term in group:
             for field, w in FIELD_WEIGHTS.items():
-                if field == "date":
-                    s = record_as_text(rec, "date")
-                else:
-                    s = record_as_text(rec, field)
+                s = record_as_text(rec, "date") if field == "date" else record_as_text(rec, field)
                 if not s:
                     continue
                 c = match_term_in_text(term, s)
@@ -279,15 +265,11 @@ def highlight(text: str, terms: List[str]) -> str:
     if not text:
         return ""
     esc = html_escape(text)
-    # 長い語から順に置換（前の置換を壊さないように）
     for t in sorted(set(terms), key=len, reverse=True):
         if not t:
             continue
         et = html_escape(t)
-        try:
-            esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
-        except Exception:
-            pass
+        esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
     return esc
 
 def make_snippet(body: str, terms_for_hit: List[str], max_chars: int, side: int = 80) -> str:
@@ -297,22 +279,16 @@ def make_snippet(body: str, terms_for_hit: List[str], max_chars: int, side: int 
     """
     if not body:
         return ""
-    # まずマーク済み全文を作る（エスケープ込み）
     marked = highlight(body, terms_for_hit)
     plain = TAG_RE.sub("", marked)
     if not plain:
         return ""
 
-    # 最初の<mark>の位置
     m = re.search(r"<mark>", marked)
     if not m:
-        # ヒットなし → 先頭から
         out = plain[:max_chars]
         return html_escape(out) + ("…" if len(plain) > max_chars else "")
 
-    # 近傍をテキスト長基準で切り出す
-    # いったん <mark> をテキストに換算して位置を見積もる簡易アプローチ
-    # → 近傍 side 前後＋… を付与
     pm = TAG_RE.sub("", marked[:m.start()])
     pos = len(pm)
     start = max(0, pos - side)
@@ -323,17 +299,14 @@ def make_snippet(body: str, terms_for_hit: List[str], max_chars: int, side: int 
     if end < len(plain):
         snippet_text = snippet_text + "…"
 
-    # snippet_text 内の語を再度ハイライト
     snippet_html = highlight(snippet_text, terms_for_hit)
-    # 上限（±40 まで許容）
     if len(TAG_RE.sub("", snippet_html)) > max_chars + 40:
-        # 生テキストで詰める
         t = TAG_RE.sub("", snippet_html)[:max_chars] + "…"
         snippet_html = html_escape(t)
     return snippet_html
 
 # ======== エンドポイント ========
-@APP.get("/health")
+@app.get("/health")
 def health():
     ok = os.path.exists(KB_PATH)
     return {
@@ -343,18 +316,18 @@ def health():
         "kb_fingerprint": KB_HASH,
     }
 
-@APP.get("/version")
+@app.get("/version")
 def version():
     return {"version": VERSION}
 
-@APP.get("/ui")
+@app.get("/ui")
 def ui():
     path = os.path.join("static", "ui.html")
     if os.path.exists(path):
         return FileResponse(path, media_type="text/html; charset=utf-8")
     return PlainTextResponse("static/ui.html not found", status_code=404)
 
-def iter_records() -> Any:
+def iter_records():
     """kb.jsonl を1行ずつ辞書で返す。"""
     with io.open(KB_PATH, "r", encoding="utf-8") as f:
         for line in f:
@@ -368,7 +341,7 @@ def iter_records() -> Any:
 
 def build_item(rec: Dict[str, Any], terms_for_hit: List[str], is_first_in_page: bool) -> Dict[str, Any]:
     body = record_as_text(rec, "text")
-    snippet_len = 300 if is_first_in_page else 160
+    snippet_len = 300 if is_first_in_page else 160  # ★ 先頭300字、以降160字
     snippet = make_snippet(body, terms_for_hit, max_chars=snippet_len, side=80)
     return {
         "title": record_as_text(rec, "title") or "(無題)",
@@ -378,12 +351,12 @@ def build_item(rec: Dict[str, Any], terms_for_hit: List[str], is_first_in_page: 
         "date": record_as_text(rec, "date"),
     }
 
-@APP.get("/api/search")
+@app.get("/api/search")
 def api_search(
     q: str = Query("", description="検索クエリ"),
     page: int = Query(1, ge=1),
     page_size: int = Query(5, ge=1, le=50),
-    order: str = Query("relevance", regex="^(relevance|latest)$"),
+    order: str = Query("relevance", pattern="^(relevance|latest)$"),
 ):
     """
     - AND（語群ごとに1語以上ヒット）
@@ -405,7 +378,6 @@ def api_search(
             headers={"Cache-Control": "no-store"},
         )
 
-    # 検索
     hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = []  # (score, date, rec)
     for rec in iter_records():
         # 年フィルタ
@@ -431,7 +403,6 @@ def api_search(
     if order == "latest":
         hits.sort(key=lambda x: (x[1] or datetime.min), reverse=True)
     else:
-        # relevance
         hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)
 
     # ページング
@@ -443,10 +414,9 @@ def api_search(
 
     # 結果組み立て（先頭だけ300字）
     items: List[Dict[str, Any]] = []
-    # ハイライト語（グループを単純化して配列化）
     terms_for_hit: List[str] = sorted({t for g in groups for t in g})
     for i, (_, _d, rec) in enumerate(page_hits):
-        is_first = (i == 0)  # ★ ページ内の先頭のみ 300字
+        is_first = (i == 0)
         item = build_item(rec, terms_for_hit, is_first_in_page=is_first)
         items.append(item)
 
@@ -471,4 +441,4 @@ def api_search(
 # ローカル開発用
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(APP, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
