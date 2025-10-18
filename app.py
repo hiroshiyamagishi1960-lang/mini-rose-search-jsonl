@@ -1,482 +1,474 @@
-# app.py — 正規化内蔵・安定版（MSM汎用ロジック）
-# 版: jsonl-2025-10-17-normalized-stable-v5
-# 主なポイント:
-#  - Notion直読み相当の構造に正規化（title/text/url/issue/date/author/header）
-#  - MSM(min_should_match)で語数に応じて「K語以上一致」を要求 + バックオフ
-#  - フレーズ/近接/フィールド重みでスコアリング（特殊ケース無し）
-#  - 抜粋≈500字、タイトル/本文ハイライトは最長語優先の一発置換（重複<mark>防止）
-#  - 日付は record.date が無ければ抽出年でフォールバック
-#  - /health に raw/norm/fingerprint、/ui は no-store で配信
+# app.py  ― ミニバラ盆栽愛好会 デジタル資料館（JSONL版）
+# FastAPI + Uvicorn（Render想定）
+# - /api/search : 検索API
+# - /health     : ヘルスチェック
+# - /version    : バージョン表示
+# - /ui         : static/ui.html を返す
+#
+# 先頭=約300字抜粋、2〜5件=ハイライト周辺。コンテスト結果の分割、苔/コケ/こけの同一視に対応。
 
-import os, re, json, unicodedata, datetime as dt, hashlib, math
+import os
+import io
+import re
+import json
+import hashlib
+import unicodedata
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
+
+import fastapi
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import requests
 
-# ====== 設定 ======
-KB_URL = os.getenv("KB_URL", "https://raw.githubusercontent.com/hiroshiyamagishi1960-lang/mini-rose-search-jsonl/main/kb.jsonl")
-JSON_HEADERS = {"content-type": "application/json; charset=utf-8"}
+try:
+    import requests  # Render では利用可
+except Exception:
+    requests = None
 
-app = FastAPI(title="Mini Rose Search API", version="jsonl-2025-10-17-normalized-stable-v5")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
+APP = FastAPI(title="mini-rose-search-jsonl (kb.jsonl)")
 
-# ====== UI（任意。同梱されていれば no-store で配信） ======
-if os.path.isdir("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+# CORS（同一オリジン前提。必要最小限）
+APP.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 管理者のみの想定だが、公開閲覧UIのため広めに
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
-@app.get("/ui", response_class=HTMLResponse)
-def ui():
-    path = "static/ui.html"
-    if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8") as f:
-            html = f.read()
-        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
-    return HTMLResponse("<h1>UI not found</h1>", headers={"Cache-Control": "no-store"})
+# ======== 設定 ========
+KB_URL = os.getenv("KB_URL", "").strip()
+KB_PATH = os.getenv("KB_PATH", "/data/kb.jsonl").strip() or "/data/kb.jsonl"
+VERSION = os.getenv("APP_VERSION", "jsonl-2025-10-17-normalized-stable-v6")
 
-# ====== 正規化ユーティリティ ======
-def _nfkc(s: Optional[str]) -> str:
-    return unicodedata.normalize("NFKC", s or "").strip()
+# ======== 文字種整形＆同義語 ========
+# カタカナ→ひらがな
+KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
 
-_SMALL_TO_BASE = str.maketrans({"ぁ":"あ","ぃ":"い","ぅ":"う","ぇ":"え","ぉ":"お","ゃ":"や","ゅ":"ゆ","ょ":"よ","ゎ":"わ","っ":"つ","ゕ":"か","ゖ":"け"})
-def _kana_to_hira(s:str)->str:
-    out=[]
-    for ch in s:
-        o=ord(ch)
-        if 0x30A1<=o<=0x30F6: out.append(chr(o-0x60))
-        elif ch in("ヵ","ヶ"): out.append({"ヵ":"か","ヶ":"け"}[ch])
-        else: out.append(ch)
-    return "".join(out)
-def _long_to_vowel(prev:str)->str:
-    A=set("あかさたなはまやらわがざだばぱぁゃゎっ"); I=set("いきしちにひみりぎじぢびぴぃ")
-    U=set("うくすつぬふむゆるぐずづぶぷぅゅっ"); E=set("えけせてねへめれげぜでべぺぇ")
-    O=set("おこそとのほもよろをごぞどぼぽぉょ")
-    if not prev: return ""
-    if prev in A: return "あ"
-    if prev in I: return "い"
-    if prev in U: return "う"
-    if prev in E: return "え"
-    if prev in O: return "お"
-    return ""
-def fold_kana(s:str)->str:
-    if not s: return ""
-    s=unicodedata.normalize("NFKC",s)
-    s=_kana_to_hira(s)
-    s=s.translate(_SMALL_TO_BASE)
-    buf=[]
-    for ch in s: buf.append(_long_to_vowel(buf[-1]) if ch=="ー" else ch)
-    d=unicodedata.normalize("NFD","".join(buf))
-    d="".join(c for c in d if ord(c)not in(0x3099,0x309A))
-    return unicodedata.normalize("NFC",d).lower().strip()
-def hira_to_kata(s:str)->str:
-    out=[]
-    for ch in s:
-        o=ord(ch)
-        if 0x3041<=o<=0x3096: out.append(chr(o+0x60))
-        elif ch in("ゕ","ゖ"): out.append({"ゕ":"ヵ","ゖ":"ヶ"}[ch])
-        else: out.append(ch)
-    return "".join(out)
+def to_hira(s: str) -> str:
+    return s.translate(KATA_TO_HIRA)
 
-TITLE_KEYS = ["title","見出し","タイトル","name","heading"]
-TEXT_KEYS  = ["content","text","body","本文","テキスト"]
-ISSUE_KEYS = ["issue","会報号","号","会報"]
-DATE_KEYS  = ["date","date_primary","発行日","開催日","日付"]
-AUTH_KEYS  = ["author","著者","執筆","作成者"]
-SECT_KEYS  = ["section","カテゴリ","category","セクション"]
-URL_KEYS   = ["url","source","リンク","参照","出典URL"]
+def normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u3000", " ")
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def _pick(rec:Dict[str,Any], keys:List[str])->str:
-    for k in keys:
-        if k in rec and _nfkc(rec[k]): return _nfkc(rec[k])
-    return ""
-def _first_nonempty_line(text:str)->str:
-    for ln in (text or "").splitlines():
-        t=_nfkc(ln)
-        if t:
-            m=re.split(r"[。．、,，/｜|／]", t, 1)
-            return (m[0] or t)[:80]
-    return ""
+# 同義語（必要に応じて拡張）
+SYNONYMS: Dict[str, List[str]] = {
+    "苔": ["コケ", "こけ"],
+    "コケ": ["苔", "こけ"],
+    "こけ": ["苔", "コケ"],
+    # 例： "剪定": ["せん定"], "施肥": ["肥料"], "薔薇": ["バラ"]
+}
 
-def _years_from_text(s:str)->List[int]:
-    return sorted({int(y) for y in re.findall(r"(19|20|21)\d{2}", _nfkc(s))})
-def _parse_issue(s:str)->str:
-    if not s: return ""
-    m=re.search(r"\d+", s)
-    return f"第{m.group(0)}号" if m else _nfkc(s)
+# 「○○結果」の連結語を「○○」「結果」に分割
+COMPOUND_RESULT_RE = re.compile(r"^(.+?)結果$")
 
-UI_TEST_PAT = re.compile(r"\s*[|｜]\s*UI-TEST-[0-9]{8}-[0-9]{4}\s*$", re.IGNORECASE)
-def _strip_ui_test_label(s:str)->str:
-    return UI_TEST_PAT.sub("", _nfkc(s))
+def expand_query_to_groups(q: str) -> List[List[str]]:
+    """
+    入力クエリqを正規化し、AND群（グループ）に展開する。
+    各グループは OR（いずれかがヒットすればよい）。
+    例：
+      "コンテスト結果 苔" →
+        [ ["コンテスト", "こんてすと"], ["結果"], ["苔","コケ","こけ"] ]
+    """
+    base = normalize_text(q)
+    if not base:
+        return []
 
-RAW_DATA: List[Dict[str,Any]] = []
-NORM_DATA: List[Dict[str,Any]] = []
+    # かな変換（検索判定用）
+    hira_base = to_hira(base)
+    raw_terms = [t for t in re.split(r"\s+", hira_base) if t]
 
-def _load_raw(url:str)->List[Dict[str,Any]]:
-    items=[]
+    groups: List[List[str]] = []
+    for term in raw_terms:
+        # 連結語（〜結果）なら二分割（AND になるよう二つのグループを追加）
+        m = COMPOUND_RESULT_RE.match(term)
+        if m:
+            left = m.group(1)
+            # 左辺の同義語群
+            left_group = [left]
+            left_group += SYNONYMS.get(left, [])
+            left_group = list(dict.fromkeys(left_group))
+            groups.append(left_group)
+            # 「結果」グループ
+            groups.append(["結果"])
+            continue
+
+        group: List[str] = [term]
+        group += SYNONYMS.get(term, [])
+        # カタカナ対策：ひらがな←→カタカナの両方を入れておく
+        hira = term
+        kata = hira.translate({ord(c): chr(ord(c) + 0x60) for c in hira})  # ひら→カタ
+        if kata != term:
+            group.append(kata)
+        group = list(dict.fromkeys(group))
+        groups.append(group)
+
+    return groups
+
+# ======== JSONL 読み込み ========
+def ensure_kb() -> Tuple[int, str]:
+    """
+    KB_URL から KB_PATH に kb.jsonl を確保。件数とSHA256を返す。
+    """
+    os.makedirs(os.path.dirname(KB_PATH), exist_ok=True)
+    if KB_URL and KB_URL.startswith("http"):
+        if requests is None:
+            raise RuntimeError("requests が利用できません")
+        r = requests.get(KB_URL, timeout=30)
+        r.raise_for_status()
+        with open(KB_PATH, "wb") as f:
+            f.write(r.content)
+
+    # ファイル存在チェック
+    if not os.path.exists(KB_PATH):
+        # 事前配置されていればそのまま使う想定
+        raise FileNotFoundError(f"KB not found: {KB_PATH}")
+
+    # 行数とハッシュ
+    line_count = 0
+    sha = hashlib.sha256()
+    with open(KB_PATH, "rb") as f:
+        for line in f:
+            sha.update(line)
+            line_count += 1
+    return line_count, sha.hexdigest()
+
+KB_LINES: int = 0
+KB_HASH: str = ""
+
+@APP.on_event("startup")
+def _startup():
+    global KB_LINES, KB_HASH
     try:
-        r=requests.get(url,timeout=20); r.raise_for_status()
-        for line in r.text.splitlines():
-            if line.strip():
-                try: items.append(json.loads(line))
-                except: pass
-    except Exception as e:
-        print("[WARN] KB load failed:",e)
-    return items
+        KB_LINES, KB_HASH = ensure_kb()
+    except Exception:
+        # 失敗しても起動はする（/healthで確認できる）
+        KB_LINES, KB_HASH = 0, ""
 
-def _normalize_record(rec:Dict[str,Any])->Dict[str,Any]:
-    title_raw = _pick(rec, TITLE_KEYS)
-    text      = _pick(rec, TEXT_KEYS)
-    issue     = _parse_issue(_pick(rec, ISSUE_KEYS))
-    date      = _pick(rec, DATE_KEYS)
-    author    = _pick(rec, AUTH_KEYS)
-    section   = _pick(rec, SECT_KEYS)
-    url       = _pick(rec, URL_KEYS)
+# ======== ユーティリティ ========
+def parse_date_str(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    s = s.strip()
+    # ISO / YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD / YYYY
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y-%m", "%Y/%m", "%Y.%m", "%Y"):
+        try:
+            return datetime.strptime(s[:len(fmt)], fmt)
+        except Exception:
+            continue
+    # 数字だけ年
+    m = re.match(r"^(\d{4})", s)
+    if m:
+        try:
+            return datetime(int(m.group(1)), 1, 1)
+        except Exception:
+            return None
+    return None
 
-    title_base = title_raw if title_raw and title_raw!="(無題)" else (_first_nonempty_line(text) or "(無題)")
-    title_base = _strip_ui_test_label(title_base)
+def extract_year_filter(q: str) -> Tuple[str, Optional[int], Optional[int]]:
+    """
+    クエリ末尾の年/年範囲を抽出。
+    例： '剪定 1999-2001' → ('剪定', 1999, 2001)
+         'コンテスト 2023' → ('コンテスト', 2023, 2023)
+    """
+    s = normalize_text(q)
+    m = re.search(r"(?:^|\s)(\d{4})-(\d{4})\s*$", s)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        s = s[:m.start()].strip()
+        return s, min(a, b), max(a, b)
+    m = re.search(r"(?:^|\s)(\d{4})\s*$", s)
+    if m:
+        y = int(m.group(1))
+        s = s[:m.start()].strip()
+        return s, y, y
+    return s, None, None
 
-    years = _years_from_text(date) or _years_from_text(text) or _years_from_text(title_base)
-    year_str = str(max(years)) if years else ""
-    header_parts = [p for p in [issue, year_str, title_base] if p]
-    header = _strip_ui_test_label(" | ".join(header_parts) if header_parts else title_base)
+def textify(x: Any) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    return str(x)
 
+def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
+    for k in ("date", "date_primary", "Date", "published_at"):
+        d = rec.get(k)
+        if d:
+            dt = parse_date_str(textify(d))
+            if dt:
+                return dt
+    return None
+
+# ======== スコアリング ========
+FIELD_WEIGHTS = {
+    "title": 12,
+    "text": 8,
+    "author": 5,
+    "issue": 3,
+    "date": 2,
+    "category": 2,
+}
+
+def record_as_text(rec: Dict[str, Any], field: str) -> str:
+    key_map = {
+        "title": ["title"],
+        "text": ["text", "content", "body"],
+        "author": ["author"],
+        "issue": ["issue"],
+        "date": ["date", "date_primary"],
+        "category": ["category"],
+        "url": ["url", "source"],
+    }
+    for k in key_map.get(field, [field]):
+        v = rec.get(k)
+        if v:
+            return textify(v)
+    return ""
+
+def match_term_in_text(t: str, s: str) -> int:
+    """単純出現回数（大文字小文字・全角半角をNFKCで吸収）"""
+    if not t or not s:
+        return 0
+    a = normalize_text(s)
+    b = normalize_text(t)
+    # ひらがな検索も許容（本文もひらがな化版を作って試す）
+    ah = to_hira(a)
+    bh = to_hira(b)
+    return a.count(b) + ah.count(bh)
+
+def compute_score(rec: Dict[str, Any], groups: List[List[str]]) -> int:
+    """
+    AND: 各グループから少なくとも1語ヒットしている必要あり。
+    スコアはヒット箇所×重みの合算。
+    """
+    total = 0
+    for group in groups:
+        group_hit = False
+        for term in group:
+            for field, w in FIELD_WEIGHTS.items():
+                if field == "date":
+                    s = record_as_text(rec, "date")
+                else:
+                    s = record_as_text(rec, field)
+                if not s:
+                    continue
+                c = match_term_in_text(term, s)
+                if c > 0:
+                    total += w * c
+                    group_hit = True
+        if not group_hit:
+            return -1  # このグループは未ヒット → 全体として不合格
+    return total
+
+# ======== 抜粋生成（HTML <mark> 付き） ========
+TAG_RE = re.compile(r"<[^>]+>")
+
+def html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def highlight(text: str, terms: List[str]) -> str:
+    """簡易ハイライト：terms を <mark> で囲む（HTMLエスケープ後）。"""
+    if not text:
+        return ""
+    esc = html_escape(text)
+    # 長い語から順に置換（前の置換を壊さないように）
+    for t in sorted(set(terms), key=len, reverse=True):
+        if not t:
+            continue
+        et = html_escape(t)
+        try:
+            esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
+        except Exception:
+            pass
+    return esc
+
+def make_snippet(body: str, terms_for_hit: List[str], max_chars: int, side: int = 80) -> str:
+    """
+    terms の最初のヒット周辺を抽出。無ければ先頭から max_chars。
+    戻りは HTML（<mark> 含む）。
+    """
+    if not body:
+        return ""
+    # まずマーク済み全文を作る（エスケープ込み）
+    marked = highlight(body, terms_for_hit)
+    plain = TAG_RE.sub("", marked)
+    if not plain:
+        return ""
+
+    # 最初の<mark>の位置
+    m = re.search(r"<mark>", marked)
+    if not m:
+        # ヒットなし → 先頭から
+        out = plain[:max_chars]
+        return html_escape(out) + ("…" if len(plain) > max_chars else "")
+
+    # 近傍をテキスト長基準で切り出す
+    # いったん <mark> をテキストに換算して位置を見積もる簡易アプローチ
+    # → 近傍 side 前後＋… を付与
+    pm = TAG_RE.sub("", marked[:m.start()])
+    pos = len(pm)
+    start = max(0, pos - side)
+    end = min(len(plain), pos + side)
+    snippet_text = plain[start:end]
+    if start > 0:
+        snippet_text = "…" + snippet_text
+    if end < len(plain):
+        snippet_text = snippet_text + "…"
+
+    # snippet_text 内の語を再度ハイライト
+    snippet_html = highlight(snippet_text, terms_for_hit)
+    # 上限（±40 まで許容）
+    if len(TAG_RE.sub("", snippet_html)) > max_chars + 40:
+        # 生テキストで詰める
+        t = TAG_RE.sub("", snippet_html)[:max_chars] + "…"
+        snippet_html = html_escape(t)
+    return snippet_html
+
+# ======== エンドポイント ========
+@APP.get("/health")
+def health():
+    ok = os.path.exists(KB_PATH)
     return {
-        "title": title_base,
-        "text": _nfkc(text),
-        "url": url,
-        "issue": issue,
-        "date": date,
-        "author": author,
-        "section": section,
-        "header": header or title_base
+        "ok": ok,
+        "kb_url": KB_URL,
+        "kb_size": KB_LINES,
+        "kb_fingerprint": KB_HASH,
     }
 
-def _normalize_all():
-    global RAW_DATA, NORM_DATA
-    RAW_DATA = _load_raw(KB_URL)
-    NORM_DATA = [_normalize_record(r) for r in RAW_DATA]
+@APP.get("/version")
+def version():
+    return {"version": VERSION}
 
-_normalize_all()
+@APP.get("/ui")
+def ui():
+    path = os.path.join("static", "ui.html")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="text/html; charset=utf-8")
+    return PlainTextResponse("static/ui.html not found", status_code=404)
 
-# ====== クエリ解析・ハイライト ======
-_JP_WORDS = re.compile(r"[一-龥ぁ-んァ-ンー]{2,}|[A-Za-z0-9]{2,}")
-SPLIT_TOKENS=("結果","発表","報告","案内","募集","開催","決定")
-
-def normalize_query(q:str)->str: return _nfkc(q or "")
-
-def split_compound(term:str)->List[str]:
-    outs=[term]
-    for key in SPLIT_TOKENS:
-        if key in term and term!=key:
-            parts=term.split(key); left=parts[0].strip()
-            if left: outs.append(left); outs.append(key)
-    return list(dict.fromkeys([t for t in outs if t]))
-
-def jp_terms(q:str)->List[str]:
-    if not q: return []
-    qn=normalize_query(q).replace("　"," ")
-    toks=[t for t in qn.split() if t]; toks+=_JP_WORDS.findall(qn)
-    if len([t for t in qn.split() if t])==1 and len(toks)<=3:
-        toks=list(dict.fromkeys(toks+split_compound(qn)))
-    uniq=[]; seen=set()
-    for t in sorted(set(toks), key=len, reverse=True):
-        if t not in seen: uniq.append(t); seen.add(t)
-        if len(uniq)>=8: break  # 少し広げる（MSMがあるため）
-    return uniq
-
-def expand_terms(terms:List[str])->List[str]:
-    out=set()
-    for t in terms:
-        if not t: continue
-        ft=fold_kana(t); out|={t, ft, hira_to_kata(ft)}
-    return sorted({s for s in out if s})
-
-def _record_text_all_norm(rec:Dict[str,Any])->str:
-    parts=[rec.get("header",""), rec.get("title",""), rec.get("section",""), rec.get("author",""),
-           rec.get("issue",""), rec.get("date",""), rec.get("text","")]
-    return "\n".join([_nfkc(p) for p in parts if _nfkc(p)])
-
-def _html_escape(s:str)->str: return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-def _build_hl_keys(terms:List[str])->List[str]:
-    hs=set()
-    for t in terms:
-        if not t: continue
-        hs.add(t); ft=fold_kana(t); hs.add(ft); hs.add(hira_to_kata(ft))
-    return sorted({h for h in hs if h}, key=len, reverse=True)
-
-def _find_first(text:str, keys:List[str])->Optional[int]:
-    best=None
-    for k in keys:
-        if not k: continue
-        m=re.search(re.escape(k), text or "", flags=re.IGNORECASE)
-        if m:
-            p=m.start()
-            if best is None or p<best: best=p
-    return best
-
-def _highlight_text(text:str, keys:List[str])->str:
-    esc=_html_escape(text or "")
-    uniq=[]
-    for k in _build_hl_keys(keys):
-        h=_html_escape(k)
-        if h and h not in uniq: uniq.append(h)
-    if not uniq: return esc
-    pat=re.compile("("+"|".join(map(re.escape, uniq))+")", re.IGNORECASE)
-    return pat.sub(r"<mark>\1</mark>", esc)
-
-def _make_snippet_and_highlight(text:str, keys:List[str], ctx:int=120, maxlen:int=500)->Tuple[str,bool]:
-    if not text: return ("", False)
-    pos=_find_first(text, keys)
-    if pos is None:
-        raw=text[:maxlen]; return (_html_escape(raw), False)
-    start=max(0,pos-ctx); end=min(len(text), pos+ctx)
-    raw=text[start:end]; esc=_highlight_text(raw, keys)
-    prefix="…" if start>0 else ""; suffix="…" if end<len(text) else ""
-    snip=prefix+esc+suffix
-    return (snip if len(snip)<=maxlen+40 else snip[:maxlen]+"…", True)
-
-# ====== MSM（汎用ロジック） ======
-def _atomic_terms(terms:List[str])->List[str]:
-    """MSMの母集合。互いに包含関係がある場合は短い語（原子語）を残す。"""
-    ts=sorted({t for t in terms if t}, key=len)  # 短い順
-    atomic=[]
-    for t in ts:
-        if not any((t2!=t and t in t2) for t2 in ts):  # t が他の語の部分列なら残す（superstringは捨てる）
-            atomic.append(t)
-    # もし全てがsuperstring判定で消えた場合の保険
-    return atomic or ts[:2]
-
-def _msm_k(n:int)->int:
-    if n<=0: return 0
-    if n<=3: return n      # 2語なら2/2（両語必須）
-    if n<=6: return n-1    # 少し緩める
-    return math.ceil(0.7*n)
-
-def _contains(text:str, term:str)->bool:
-    if not term: return False
-    t=_nfkc(text or "")
-    return (term.lower() in t.lower()) or (fold_kana(term) in fold_kana(t))
-
-def _quoted_phrases(q:str)->List[str]:
-    ph=[]
-    # "..." / 『…』 / 「…」 / “ … ”
-    for pat in [r'"([^"]+)"', r'「([^」]+)」', r'『([^』]+)』', r'“([^”]+)”']:
-        ph += re.findall(pat, _nfkc(q))
-    return [p for p in ph if p.strip()]
-
-# ====== スコアリング（フィールド重み＋フレーズ/近接） ======
-W_HEAD, W_TITLE, W_SECT, W_TEXT = 2.6, 2.2, 1.2, 1.1
-PHRASE_HEAD_BONUS, PHRASE_TITLE_BONUS, PHRASE_TEXT_BONUS = 4.6, 4.2, 2.2
-COOCCUR_WINDOW = 30
-COOCCUR_HEAD_BONUS, COOCCUR_TEXT_BONUS = 1.7, 1.2
-
-def _near_cooccur(text:str, terms_base:List[str], w:int)->bool:
-    if not text: return False
-    base=[x for x in terms_base if x]
-    for i in range(len(base)):
-        for j in range(i+1,len(base)):
-            a,b=base[i], base[j]
-            pat=re.compile(re.escape(a)+r".{0,%d}"%w+re.escape(b)+"|"+re.escape(b)+r".{0,%d}"%w+re.escape(a))
-            if pat.search(text): return True
-    return False
-
-def _phrase_candidates(q_raw:str, base_terms:List[str])->List[str]:
-    c=set()
-    qn=_nfkc(q_raw).strip()
-    if qn: c.add(qn)
-    if len(base_terms)>=2:
-        for i in range(len(base_terms)):
-            for j in range(i+1,len(base_terms)):
-                c.add(base_terms[i]+base_terms[j]); c.add(base_terms[j]+base_terms[i])
-    return sorted({x for x in c if len(x)>=2}, key=len, reverse=True)
-
-def _best_date(rec:Dict[str,Any])->dt.date:
-    yset=set(_years_from_text(rec.get("date",""))+
-             _years_from_text(rec.get("text",""))+
-             _years_from_text(rec.get("title",""))+
-             _years_from_text(rec.get("header","")))
-    return dt.date(max(yset),1,1) if yset else dt.date(1970,1,1)
-
-def _score(rec:Dict[str,Any], terms_all:List[str], base_terms:List[str], q_raw:str)->Tuple[float, dt.date]:
-    head=_nfkc(rec.get("header","")); title=_nfkc(rec.get("title","")); sect=_nfkc(rec.get("section","")); text=_nfkc(rec.get("text",""))
-    low=lambda s:(s or "").lower(); fk=lambda s:fold_kana(s or "")
-    h_low,t_low,s_low,x_low = low(head),low(title),low(sect),low(text)
-    h_f,  t_f,  s_f,  x_f   = fk(head), fk(title), fk(sect), fk(text)
-    sc=0.0; matched=False
-    for t in terms_all:
-        tl=t.lower(); tf=fold_kana(t)
-        if tl in h_low or tf in h_f: sc+=W_HEAD;  matched=True
-        if tl in t_low or tf in t_f: sc+=W_TITLE; matched=True
-        if tl in s_low or tf in s_f: sc+=W_SECT;  matched=True
-        if tl in x_low or tf in x_f: sc+=W_TEXT;  matched=True
-    # フレーズ一致
-    for ph in _phrase_candidates(q_raw, base_terms) + _quoted_phrases(q_raw):
-        ph_f=fold_kana(ph)
-        if ph.lower() in h_low or ph_f in h_f: sc+=PHRASE_HEAD_BONUS;  matched=True
-        if ph.lower() in t_low or ph_f in t_f: sc+=PHRASE_TITLE_BONUS; matched=True
-        if ph.lower() in x_low or ph_f in x_f: sc+=PHRASE_TEXT_BONUS;  matched=True
-    # 近接
-    if _near_cooccur(head, base_terms, COOCCUR_WINDOW): sc+=COOCCUR_HEAD_BONUS; matched=True
-    if _near_cooccur(text, base_terms, COOCCUR_WINDOW): sc+=COOCCUR_TEXT_BONUS; matched=True
-    return (sc if matched else 0.0, _best_date(rec))
-
-# ====== 検索本体（MSM + バックオフ） ======
-def parse_year_from_query(q:str)->Tuple[str,Optional[int],Optional[Tuple[int,int]]]:
-    qn=_nfkc(q).replace("　"," ").strip()
-    if not qn: return "", None, None
-    parts=qn.split(); last=parts[-1]
-    m1=re.fullmatch(r"(19|20|21)\d{2}", last)
-    if m1: return (" ".join(parts[:-1]).strip(), int(last), None)
-    m2=re.fullmatch(rf"((?:19|20|21)\d{{2}})\s*(?:-|–|—|~|〜|～|\.\.)\s*((?:19|20|21)\d{{2}})", last)
-    if m2:
-        y1,y2=int(m2.group(1)), int(m2.group(2))
-        if y1>y2: y1,y2=y2,y1
-        return (" ".join(parts[:-1]).strip(), None, (y1,y2))
-    return (qn, None, None)
-
-def _years_of_norm(rec:Dict[str,Any])->List[int]:
-    return _years_from_text(_record_text_all_norm(rec))
-
-def _match_candidate(alltxt:str, atomic_terms:List[str], K:int, must_phrases:List[str])->bool:
-    # フレーズ必須（引用）はすべて含む
-    for ph in must_phrases:
-        if not _contains(alltxt, ph):
-            return False
-    # MSM: K語以上一致
-    hit=sum(1 for t in atomic_terms if _contains(alltxt, t))
-    return hit >= K
-
-def search_scored(q:str, year=None, year_from=None, year_to=None)->Tuple[List[Tuple[float,dt.date,Dict[str,Any]]], List[str]]:
-    if not NORM_DATA: return [], []
-    base_terms=jp_terms(q)                # 表示/スコア用
-    terms_all=expand_terms(base_terms)    # ハイライト/スコア用
-    if not base_terms: return [], []
-
-    atoms=_atomic_terms(base_terms)       # MSM の母集合（原子語）
-    K0=_msm_k(len(atoms))
-    must_phrases=_quoted_phrases(q)       # "..." で囲まれたフレーズは必須
-
-    # バックオフしながら候補抽出 → スコアリング
-    for K in list(range(K0, 0, -1)):
-        scored=[]
-        for rec in NORM_DATA:
-            alltxt=_record_text_all_norm(rec)
-
-            # MSM + フレーズ必須
-            if not _match_candidate(alltxt, atoms, K, must_phrases):
+def iter_records() -> Any:
+    """kb.jsonl を1行ずつ辞書で返す。"""
+    with io.open(KB_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
                 continue
 
-            # 年フィルタ
-            if year or year_from or year_to:
-                ys=_years_of_norm(rec)
-                if not ys: continue
-                lo=year_from if year_from is not None else -10**9
-                hi=year_to   if year_to   is not None else  10**9
-                if year is not None and year not in ys: continue
-                if year is None and not any(lo<=y<=hi for y in ys): continue
+def build_item(rec: Dict[str, Any], terms_for_hit: List[str], is_first_in_page: bool) -> Dict[str, Any]:
+    body = record_as_text(rec, "text")
+    snippet_len = 300 if is_first_in_page else 160
+    snippet = make_snippet(body, terms_for_hit, max_chars=snippet_len, side=80)
+    return {
+        "title": record_as_text(rec, "title") or "(無題)",
+        "content": snippet,
+        "url": record_as_text(rec, "url"),
+        "rank": None,  # 後で付与
+        "date": record_as_text(rec, "date"),
+    }
 
-            sc, d = _score(rec, terms_all, base_terms, q)
-            if sc<=0: continue
-            scored.append((sc, d, rec))
-        if scored:
-            return scored, base_terms
-    return [], base_terms
-
-# ====== API ======
-@app.get("/health")
-def health():
-    sha=hashlib.sha256()
-    for rec in NORM_DATA:
-        sha.update((_nfkc(rec.get("title","")) + _nfkc(rec.get("url",""))).encode("utf-8"))
-    return JSONResponse({
-        "ok": True,
-        "kb_url": KB_URL,
-        "kb_size_raw": len(RAW_DATA),
-        "kb_size_norm": len(NORM_DATA),
-        "kb_fingerprint": sha.hexdigest()
-    }, headers=JSON_HEADERS)
-
-@app.get("/version")
-def version():
-    return JSONResponse({"version": app.version}, headers=JSON_HEADERS)
-
-@app.get("/api/search")
+@APP.get("/api/search")
 def api_search(
-    q:str=Query("", description="検索語（末尾に年/年範囲も可。引用\"...\"は必須フレーズ扱い）"),
-    page:int=1,
-    page_size:int=5,
-    order:str=Query("relevance", description="relevance（関連順: 既定） | latest（最新順）")
+    q: str = Query("", description="検索クエリ"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(5, ge=1, le=50),
+    order: str = Query("relevance", regex="^(relevance|latest)$"),
 ):
-    try:
-        q_raw=(q or "").strip()
-        if not q_raw:
-            return JSONResponse({"items":[],"total_hits":0,"page":1,"page_size":page_size,"has_more":False,"next_page":None,"error":None,"order_used":order}, headers=JSON_HEADERS)
+    """
+    - AND（語群ごとに1語以上ヒット）
+    - relevance: スコア順、latest: 発行日降順
+    - 1ページ目の先頭だけ約300字、残りは約160字
+    """
+    if not os.path.exists(KB_PATH):
+        return JSONResponse(
+            {"items": [], "total_hits": 0, "page": page, "page_size": page_size, "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order},
+            headers={"Cache-Control": "no-store"},
+        )
 
-        base_q, y, yr = parse_year_from_query(q_raw)
-        y_from=y_to=None
-        if isinstance(yr,tuple): y_from,y_to=yr
+    # 年フィルタを抽出
+    q_wo_year, y_from, y_to = extract_year_filter(q)
+    groups = expand_query_to_groups(q_wo_year)
+    if not groups:
+        return JSONResponse(
+            {"items": [], "total_hits": 0, "page": page, "page_size": page_size, "has_more": False, "next_page": None, "error": None, "order_used": order},
+            headers={"Cache-Control": "no-store"},
+        )
 
-        scored, base_terms = search_scored(base_q, year=y, year_from=y_from, year_to=y_to)
-        total=len(scored)
-        if total==0:
-            return JSONResponse({"items":[],"total_hits":0,"page":1,"page_size":page_size,"has_more":False,"next_page":None,"error":None,"order_used":order}, headers=JSON_HEADERS)
+    # 検索
+    hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = []  # (score, date, rec)
+    for rec in iter_records():
+        # 年フィルタ
+        if y_from or y_to:
+            d = record_date(rec)
+            if not d:
+                continue
+            if y_from and d.year < y_from:
+                continue
+            if y_to and d.year > y_to:
+                continue
 
-        # 並び
-        if order.lower()=="latest":
-            scored.sort(key=lambda t:(t[1], t[0]), reverse=True)   # date→score
-        else:
-            scored.sort(key=lambda t:(t[0], t[1]), reverse=True)   # score→date
-            order="relevance"
+        score = compute_score(rec, groups)
+        if score < 0:
+            continue
+        d = record_date(rec)
+        hits.append((score, d, rec))
 
-        # ページング
-        if page<1: page=1
-        if page_size<1: page_size=5
-        start=(page-1)*page_size; end=start+page_size
-        slice_=scored[start:end]
+    total_hits = len(hits)
 
-        # ハイライトキー
-        hl_terms = expand_terms(base_terms)
+    # 並び順
+    order_used = order
+    if order == "latest":
+        hits.sort(key=lambda x: (x[1] or datetime.min), reverse=True)
+    else:
+        # relevance
+        hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)
 
-        items=[]
-        for i,(score, d, r) in enumerate(slice_):
-            head  = _strip_ui_test_label(_nfkc(r.get("header","")))
-            title = _strip_ui_test_label(_nfkc(r.get("title","")))
-            text  = _nfkc(r.get("text",""))
-            date_field = _nfkc(r.get("date",""))
+    # ページング
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_hits = hits[start:end]
+    has_more = end < total_hits
+    next_page = page + 1 if has_more else None
 
-            display_title_source = head or title or "(無題)"
-            title_highlighted = _highlight_text(display_title_source, hl_terms)
+    # 結果組み立て（先頭だけ300字）
+    items: List[Dict[str, Any]] = []
+    # ハイライト語（グループを単純化して配列化）
+    terms_for_hit: List[str] = sorted({t for g in groups for t in g})
+    for i, (_, _d, rec) in enumerate(page_hits):
+        is_first = (i == 0)  # ★ ページ内の先頭のみ 300字
+        item = build_item(rec, terms_for_hit, is_first_in_page=is_first)
+        items.append(item)
 
-            snippet,_ = _make_snippet_and_highlight(text, hl_terms, ctx=120, maxlen=500)
+    # rank（全体順位）を付ける
+    for idx, _ in enumerate(hits, start=1):
+        if start < idx <= end:
+            items[idx - start - 1]["rank"] = idx
 
-            bd = _best_date(r)
-            date_out = date_field or (str(bd.year) if bd.year > 1970 else "")
+    resp = {
+        "items": items,
+        "total_hits": total_hits,
+        "page": page,
+        "page_size": page_size,
+        "has_more": has_more,
+        "next_page": next_page,
+        "error": None,
+        "order_used": order_used,
+    }
+    return JSONResponse(resp, headers={"Cache-Control": "no-store"})
 
-            items.append({
-                "title": title_highlighted,
-                "content": snippet,
-                "url": _nfkc(r.get("url","")),
-                "rank": start+i+1,
-                "date": date_out
-            })
 
-        return JSONResponse({
-            "items": items,
-            "total_hits": total,
-            "page": page,
-            "page_size": page_size,
-            "has_more": end<total,
-            "next_page": (page+1) if end<total else None,
-            "error": None,
-            "order_used": order
-        }, headers=JSON_HEADERS)
-
-    except Exception as e:
-        return JSONResponse({"items":[],"total_hits":0,"page":1,"page_size":page_size,"has_more":False,"next_page":None,"error":str(e),"order_used":order}, headers=JSON_HEADERS)
-
-@app.get("/")
-def root():
-    return PlainTextResponse("Mini Rose Search JSONL API running.\n", headers={"content-type":"text/plain; charset=utf-8", "Cache-Control":"no-store"})
+# ローカル開発用
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(APP, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
