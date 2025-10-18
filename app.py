@@ -1,6 +1,6 @@
 # app.py  ― ミニバラ盆栽愛好会 デジタル資料館（JSONL版）
-# FastAPI + Uvicorn（Render想定）
-# - /api/search : 検索API
+# FastAPI + Uvicorn（Render 想定）
+# - /api/search : 検索API（例外時も200でJSON返却：UIが落ちない）
 # - /health     : ヘルスチェック
 # - /version    : バージョン表示
 # - /ui         : static/ui.html を返す
@@ -25,10 +25,10 @@ try:
 except Exception:
     requests = None
 
-# ===== FastAPI app（← uvicorn app:app が参照するのはこの変数） =====
+# ===== FastAPI app =====
 app = FastAPI(title="mini-rose-search-jsonl (kb.jsonl)")
 
-# CORS（公開UI想定。必要最小限でOK）
+# CORS（公開UI想定）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,22 +40,28 @@ app.add_middleware(
 # ======== 設定 ========
 KB_URL = os.getenv("KB_URL", "").strip()
 KB_PATH = os.getenv("KB_PATH", "/data/kb.jsonl").strip() or "/data/kb.jsonl"
-VERSION = os.getenv("APP_VERSION", "jsonl-2025-10-17-normalized-stable-v6")
+VERSION = os.getenv("APP_VERSION", "jsonl-2025-10-18-hotfix-v1")
 
 # ======== 文字種整形＆同義語 ========
 # カタカナ→ひらがな
 KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
+# ひらがな→カタカナ（安全：ひらがなの範囲のみ）
+HIRA_TO_KATA = str.maketrans({chr(h): chr(h + 0x60) for h in range(ord("ぁ"), ord("ん") + 1)})
 
 def to_hira(s: str) -> str:
     return s.translate(KATA_TO_HIRA)
 
+def to_kata(s: str) -> str:
+    return s.translate(HIRA_TO_KATA)
+
 def normalize_text(s: str) -> str:
+    """NFKC正規化＋空白正規化（※ .trim() バグを .strip() に修正）"""
     if not s:
         return ""
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("\u3000", " ")
     s = re.sub(r"[\r\n\t]+", " ", s)
-    s = re.sub(r"\s+", " ", s).trim()
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 # 同義語（必要に応じて拡張）
@@ -63,7 +69,6 @@ SYNONYMS: Dict[str, List[str]] = {
     "苔": ["コケ", "こけ"],
     "コケ": ["苔", "こけ"],
     "こけ": ["苔", "コケ"],
-    # 例： "剪定": ["せん定"], "施肥": ["肥料"], "薔薇": ["バラ"]
 }
 
 # 「○○結果」の連結語を「○○」「結果」に分割
@@ -75,13 +80,11 @@ def expand_query_to_groups(q: str) -> List[List[str]]:
     各グループは OR（いずれかがヒットすればよい）。
     例：
       "コンテスト結果 苔" →
-        [ ["コンテスト", "こんてすと"], ["結果"], ["苔","コケ","こけ"] ]
+        [ ["こんてすと","コンテスト"], ["結果"], ["苔","コケ","こけ"] ]
     """
     base = normalize_text(q)
     if not base:
         return []
-
-    # かな変換（検索判定用）
     hira_base = to_hira(base)
     raw_terms = [t for t in re.split(r"\s+", hira_base) if t]
 
@@ -98,9 +101,8 @@ def expand_query_to_groups(q: str) -> List[List[str]]:
             continue
 
         group: List[str] = [term] + SYNONYMS.get(term, [])
-        # ひらがな→カタカナも加える（双方向吸収）
-        hira = term
-        kata = hira.translate({ord(c): chr(ord(c) + 0x60) for c in hira})
+        # ひらがな↔カタカナの両方を吸収（安全なマッピングで）
+        kata = to_kata(term)
         if kata != term:
             group.append(kata)
         group = list(dict.fromkeys(group))
@@ -110,9 +112,7 @@ def expand_query_to_groups(q: str) -> List[List[str]]:
 
 # ======== JSONL 読み込み ========
 def ensure_kb() -> Tuple[int, str]:
-    """
-    KB_URL から KB_PATH に kb.jsonl を確保。件数とSHA256を返す。
-    """
+    """KB_URL から KB_PATH に kb.jsonl を確保。件数とSHA256を返す。"""
     os.makedirs(os.path.dirname(KB_PATH), exist_ok=True)
     if KB_URL and KB_URL.startswith("http"):
         if requests is None:
@@ -163,11 +163,7 @@ def parse_date_str(s: str) -> Optional[datetime]:
     return None
 
 def extract_year_filter(q: str) -> Tuple[str, Optional[int], Optional[int]]:
-    """
-    クエリ末尾の年/年範囲を抽出。
-    例： '剪定 1999-2001' → ('剪定', 1999, 2001)
-         'コンテスト 2023' → ('コンテスト', 2023, 2023)
-    """
+    """クエリ末尾の年/年範囲を抽出。例：'剪定 1999-2001' → ('剪定',1999,2001)"""
     s = normalize_text(q)
     m = re.search(r"(?:^|\s)(\d{4})-(\d{4})\s*$", s)
     if m:
@@ -273,10 +269,7 @@ def highlight(text: str, terms: List[str]) -> str:
     return esc
 
 def make_snippet(body: str, terms_for_hit: List[str], max_chars: int, side: int = 80) -> str:
-    """
-    terms の最初のヒット周辺を抽出。無ければ先頭から max_chars。
-    戻りは HTML（<mark> 含む）。
-    """
+    """terms の最初のヒット周辺を抽出。無ければ先頭から max_chars。戻りは HTML。"""
     if not body:
         return ""
     marked = highlight(body, terms_for_hit)
@@ -309,12 +302,7 @@ def make_snippet(body: str, terms_for_hit: List[str], max_chars: int, side: int 
 @app.get("/health")
 def health():
     ok = os.path.exists(KB_PATH)
-    return {
-        "ok": ok,
-        "kb_url": KB_URL,
-        "kb_size": KB_LINES,
-        "kb_fingerprint": KB_HASH,
-    }
+    return {"ok": ok, "kb_url": KB_URL, "kb_size": KB_LINES, "kb_fingerprint": KB_HASH}
 
 @app.get("/version")
 def version():
@@ -341,7 +329,7 @@ def iter_records():
 
 def build_item(rec: Dict[str, Any], terms_for_hit: List[str], is_first_in_page: bool) -> Dict[str, Any]:
     body = record_as_text(rec, "text")
-    snippet_len = 300 if is_first_in_page else 160  # ★ 先頭300字、以降160字
+    snippet_len = 300 if is_first_in_page else 160  # 先頭300字、以降160字
     snippet = make_snippet(body, terms_for_hit, max_chars=snippet_len, side=80)
     return {
         "title": record_as_text(rec, "title") or "(無題)",
@@ -362,80 +350,92 @@ def api_search(
     - AND（語群ごとに1語以上ヒット）
     - relevance: スコア順、latest: 発行日降順
     - 1ページ目の先頭だけ約300字、残りは約160字
+    - 例外が起きても 200 で JSON を返す（UIが「500で崩れる」を回避）
     """
-    if not os.path.exists(KB_PATH):
-        return JSONResponse(
-            {"items": [], "total_hits": 0, "page": page, "page_size": page_size, "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order},
-            headers={"Cache-Control": "no-store"},
-        )
+    try:
+        if not os.path.exists(KB_PATH):
+            return JSONResponse(
+                {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                 "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order},
+                headers={"Cache-Control": "no-store"},
+            )
 
-    # 年フィルタを抽出
-    q_wo_year, y_from, y_to = extract_year_filter(q)
-    groups = expand_query_to_groups(q_wo_year)
-    if not groups:
-        return JSONResponse(
-            {"items": [], "total_hits": 0, "page": page, "page_size": page_size, "has_more": False, "next_page": None, "error": None, "order_used": order},
-            headers={"Cache-Control": "no-store"},
-        )
+        # 年フィルタを抽出
+        q_wo_year, y_from, y_to = extract_year_filter(q)
+        groups = expand_query_to_groups(q_wo_year)
+        if not groups:
+            return JSONResponse(
+                {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                 "has_more": False, "next_page": None, "error": None, "order_used": order},
+                headers={"Cache-Control": "no-store"},
+            )
 
-    hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = []  # (score, date, rec)
-    for rec in iter_records():
-        # 年フィルタ
-        if y_from or y_to:
+        hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = []  # (score, date, rec)
+        for rec in iter_records():
+            # 年フィルタ
+            if y_from or y_to:
+                d = record_date(rec)
+                if not d:
+                    continue
+                if y_from and d.year < y_from:
+                    continue
+                if y_to and d.year > y_to:
+                    continue
+
+            score = compute_score(rec, groups)
+            if score < 0:
+                continue
             d = record_date(rec)
-            if not d:
-                continue
-            if y_from and d.year < y_from:
-                continue
-            if y_to and d.year > y_to:
-                continue
+            hits.append((score, d, rec))
 
-        score = compute_score(rec, groups)
-        if score < 0:
-            continue
-        d = record_date(rec)
-        hits.append((score, d, rec))
+        total_hits = len(hits)
 
-    total_hits = len(hits)
+        # 並び順
+        order_used = order
+        if order == "latest":
+            hits.sort(key=lambda x: (x[1] or datetime.min), reverse=True)
+        else:
+            hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)
 
-    # 並び順
-    order_used = order
-    if order == "latest":
-        hits.sort(key=lambda x: (x[1] or datetime.min), reverse=True)
-    else:
-        hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)
+        # ページング
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_hits = hits[start:end]
+        has_more = end < total_hits
+        next_page = page + 1 if has_more else None
 
-    # ページング
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_hits = hits[start:end]
-    has_more = end < total_hits
-    next_page = page + 1 if has_more else None
+        # 結果組み立て（先頭だけ300字）
+        items: List[Dict[str, Any]] = []
+        terms_for_hit: List[str] = sorted({t for g in groups for t in g})
+        for i, (_, _d, rec) in enumerate(page_hits):
+            is_first = (i == 0)
+            item = build_item(rec, terms_for_hit, is_first_in_page=is_first)
+            items.append(item)
 
-    # 結果組み立て（先頭だけ300字）
-    items: List[Dict[str, Any]] = []
-    terms_for_hit: List[str] = sorted({t for g in groups for t in g})
-    for i, (_, _d, rec) in enumerate(page_hits):
-        is_first = (i == 0)
-        item = build_item(rec, terms_for_hit, is_first_in_page=is_first)
-        items.append(item)
+        # rank（全体順位）を付ける
+        for idx, _ in enumerate(hits, start=1):
+            if start < idx <= end:
+                items[idx - start - 1]["rank"] = idx
 
-    # rank（全体順位）を付ける
-    for idx, _ in enumerate(hits, start=1):
-        if start < idx <= end:
-            items[idx - start - 1]["rank"] = idx
+        resp = {
+            "items": items,
+            "total_hits": total_hits,
+            "page": page,
+            "page_size": page_size,
+            "has_more": has_more,
+            "next_page": next_page,
+            "error": None,
+            "order_used": order_used,
+        }
+        return JSONResponse(resp, headers={"Cache-Control": "no-store"})
 
-    resp = {
-        "items": items,
-        "total_hits": total_hits,
-        "page": page,
-        "page_size": page_size,
-        "has_more": has_more,
-        "next_page": next_page,
-        "error": None,
-        "order_used": order_used,
-    }
-    return JSONResponse(resp, headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        # ここで 500 にせず、UI が扱える JSON を返す
+        return JSONResponse(
+            {"items": [], "total_hits": 0, "page": 1, "page_size": page_size,
+             "has_more": False, "next_page": None, "error": "exception", "message": textify(e)},
+            headers={"Cache-Control": "no-store"},
+        )
 
 
 # ローカル開発用
