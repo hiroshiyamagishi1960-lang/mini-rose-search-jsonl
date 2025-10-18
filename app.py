@@ -1,11 +1,16 @@
 # app.py  ― ミニバラ盆栽愛好会 デジタル資料館（JSONL版）
-# FastAPI + Uvicorn（Render 想定）
-# - /api/search : 検索API（例外時も200でJSON返却：UIが落ちない）
+# FastAPI + Uvicorn（Render想定）
+# - /api/search : 検索API
 # - /health     : ヘルスチェック
 # - /version    : バージョン表示
+# - /diag       : 自己診断（KB/環境の確認）
 # - /ui         : static/ui.html を返す
 #
-# 先頭=約300字抜粋、2〜5件=ハイライト周辺。コンテスト結果の分割、苔/コケ/こけの同一視に対応。
+# 仕様反映:
+#  1) 1ページ目の先頭カードは常に「冒頭～約300字」
+#  2) 「結果」は停用語として検索/ハイライトから除外（誤ヒットと見かけ対策）
+#  3) 文字化け（縺…/邨… など）を可能な範囲で自動補正してからマッチ＆表示
+#  4) 例外時も 200 + JSON を返す（UIが500で落ちない）
 
 import os
 import io
@@ -21,14 +26,12 @@ from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
-    import requests  # Render では利用可（requirements.txt に requests が必要）
+    import requests  # requirements.txt に requests が必要
 except Exception:
     requests = None
 
-# ===== FastAPI app =====
 app = FastAPI(title="mini-rose-search-jsonl (kb.jsonl)")
 
-# CORS（公開UI想定）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,12 +43,10 @@ app.add_middleware(
 # ======== 設定 ========
 KB_URL = os.getenv("KB_URL", "").strip()
 KB_PATH = os.getenv("KB_PATH", "/data/kb.jsonl").strip() or "/data/kb.jsonl"
-VERSION = os.getenv("APP_VERSION", "jsonl-2025-10-18-hotfix-v1")
+VERSION = os.getenv("APP_VERSION", "jsonl-2025-10-18-hotfix-v2")
 
-# ======== 文字種整形＆同義語 ========
-# カタカナ→ひらがな
+# ======== 文字整形・停用語 ========
 KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
-# ひらがな→カタカナ（安全：ひらがなの範囲のみ）
 HIRA_TO_KATA = str.maketrans({chr(h): chr(h + 0x60) for h in range(ord("ぁ"), ord("ん") + 1)})
 
 def to_hira(s: str) -> str:
@@ -55,32 +56,52 @@ def to_kata(s: str) -> str:
     return s.translate(HIRA_TO_KATA)
 
 def normalize_text(s: str) -> str:
-    """NFKC正規化＋空白正規化（※ .trim() バグを .strip() に修正）"""
     if not s:
         return ""
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("\u3000", " ")
     s = re.sub(r"[\r\n\t]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()  # ← .trim() バグ修正
     return s
 
-# 同義語（必要に応じて拡張）
+# 文字化けの簡易補正（UTF-8↔CP932 誤変換の痕跡を見たら試す）
+MOJI_PAT = re.compile(r"[縺蜑荳邨鬘蛻譛繧蝨髱]")
+def fix_mojibake(s: str) -> str:
+    if not s:
+        return s
+    if not MOJI_PAT.search(s):
+        return s
+    # よくある誤変換を2通りほど試す（失敗時は元のまま）
+    try:
+        t = s.encode("cp932", errors="ignore").decode("utf-8", errors="ignore")
+        if t and t != s:
+            return t
+    except Exception:
+        pass
+    try:
+        t = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+        if t and t != s:
+            return t
+    except Exception:
+        pass
+    return s
+
+# 同義語
 SYNONYMS: Dict[str, List[str]] = {
     "苔": ["コケ", "こけ"],
     "コケ": ["苔", "こけ"],
     "こけ": ["苔", "コケ"],
 }
 
-# 「○○結果」の連結語を「○○」「結果」に分割
+STOP_TERMS = {"結果"}  # 汎用語は検索にもハイライトにも使わない
+
 COMPOUND_RESULT_RE = re.compile(r"^(.+?)結果$")
 
 def expand_query_to_groups(q: str) -> List[List[str]]:
     """
-    入力クエリqを正規化し、AND群（グループ）に展開する。
-    各グループは OR（いずれかがヒットすればよい）。
-    例：
-      "コンテスト結果 苔" →
-        [ ["こんてすと","コンテスト"], ["結果"], ["苔","コケ","こけ"] ]
+    入力qを正規化→ANDグループ列に展開。
+    - 「◯◯結果」は「◯◯」のみを使い、「結果」は停用（ANDに含めない）
+    - 停用語は完全に除外
     """
     base = normalize_text(q)
     if not base:
@@ -90,18 +111,23 @@ def expand_query_to_groups(q: str) -> List[List[str]]:
 
     groups: List[List[str]] = []
     for term in raw_terms:
-        # 連結語（〜結果）なら二分割（AND になるよう二つのグループを追加）
         m = COMPOUND_RESULT_RE.match(term)
         if m:
             left = m.group(1)
-            left_group = [left] + SYNONYMS.get(left, [])
-            left_group = list(dict.fromkeys(left_group))
-            groups.append(left_group)
-            groups.append(["結果"])
+            if left and left not in STOP_TERMS:
+                left_group = [left] + SYNONYMS.get(left, [])
+                left_group = list(dict.fromkeys(left_group))
+                # かな→カナも足す
+                kata = to_kata(left)
+                if kata != left:
+                    left_group.append(kata)
+                groups.append(left_group)
+            continue
+
+        if term in STOP_TERMS:
             continue
 
         group: List[str] = [term] + SYNONYMS.get(term, [])
-        # ひらがな↔カタカナの両方を吸収（安全なマッピングで）
         kata = to_kata(term)
         if kata != term:
             group.append(kata)
@@ -112,7 +138,6 @@ def expand_query_to_groups(q: str) -> List[List[str]]:
 
 # ======== JSONL 読み込み ========
 def ensure_kb() -> Tuple[int, str]:
-    """KB_URL から KB_PATH に kb.jsonl を確保。件数とSHA256を返す。"""
     os.makedirs(os.path.dirname(KB_PATH), exist_ok=True)
     if KB_URL and KB_URL.startswith("http"):
         if requests is None:
@@ -163,7 +188,6 @@ def parse_date_str(s: str) -> Optional[datetime]:
     return None
 
 def extract_year_filter(q: str) -> Tuple[str, Optional[int], Optional[int]]:
-    """クエリ末尾の年/年範囲を抽出。例：'剪定 1999-2001' → ('剪定',1999,2001)"""
     s = normalize_text(q)
     m = re.search(r"(?:^|\s)(\d{4})-(\d{4})\s*$", s)
     if m:
@@ -203,6 +227,13 @@ FIELD_WEIGHTS = {
     "category": 2,
 }
 
+def _get_field(rec: Dict[str, Any], keys: List[str]) -> str:
+    for k in keys:
+        v = rec.get(k)
+        if v:
+            return textify(v)
+    return ""
+
 def record_as_text(rec: Dict[str, Any], field: str) -> str:
     key_map = {
         "title": ["title"],
@@ -213,14 +244,10 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
         "category": ["category"],
         "url": ["url", "source"],
     }
-    for k in key_map.get(field, [field]):
-        v = rec.get(k)
-        if v:
-            return textify(v)
-    return ""
+    raw = _get_field(rec, key_map.get(field, [field]))
+    return fix_mojibake(raw)
 
 def match_term_in_text(t: str, s: str) -> int:
-    """単純出現回数（NFKC + ひらがな化で吸収）"""
     if not t or not s:
         return 0
     a = normalize_text(s)
@@ -230,10 +257,6 @@ def match_term_in_text(t: str, s: str) -> int:
     return a.count(b) + ah.count(bh)
 
 def compute_score(rec: Dict[str, Any], groups: List[List[str]]) -> int:
-    """
-    AND: 各グループから少なくとも1語ヒットしている必要あり。
-    スコアはヒット箇所×重みの合算。
-    """
     total = 0
     for group in groups:
         group_hit = False
@@ -247,41 +270,48 @@ def compute_score(rec: Dict[str, Any], groups: List[List[str]]) -> int:
                     total += w * c
                     group_hit = True
         if not group_hit:
-            return -1  # このグループは未ヒット → 全体として不合格
+            return -1
     return total
 
-# ======== 抜粋生成（HTML <mark> 付き） ========
+# ======== スニペット生成 ========
 TAG_RE = re.compile(r"<[^>]+>")
 
 def html_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def highlight(text: str, terms: List[str]) -> str:
-    """簡易ハイライト：terms を <mark> で囲む（HTMLエスケープ後）。"""
     if not text:
         return ""
     esc = html_escape(text)
-    for t in sorted(set(terms), key=len, reverse=True):
-        if not t:
-            continue
+    for t in sorted({t for t in terms if t not in STOP_TERMS}, key=len, reverse=True):
         et = html_escape(t)
-        esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
+        if et:
+            esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
     return esc
 
-def make_snippet(body: str, terms_for_hit: List[str], max_chars: int, side: int = 80) -> str:
-    """terms の最初のヒット周辺を抽出。無ければ先頭から max_chars。戻りは HTML。"""
+def make_head_snippet(body: str, terms: List[str], max_chars: int) -> str:
+    """本文冒頭から max_chars、必要なら…を付ける。"""
     if not body:
         return ""
-    marked = highlight(body, terms_for_hit)
+    b = fix_mojibake(body)
+    head = b[:max_chars]
+    out = highlight(head, terms)
+    if len(b) > max_chars:
+        out += "…"
+    return out
+
+def make_hit_snippet(body: str, terms: List[str], max_chars: int, side: int = 80) -> str:
+    """最初のヒット周辺を抜粋。ヒットが無ければ冒頭にフォールバック。"""
+    if not body:
+        return ""
+    b = fix_mojibake(body)
+    marked = highlight(b, terms)
     plain = TAG_RE.sub("", marked)
     if not plain:
         return ""
-
     m = re.search(r"<mark>", marked)
     if not m:
-        out = plain[:max_chars]
-        return html_escape(out) + ("…" if len(plain) > max_chars else "")
-
+        return make_head_snippet(b, terms, max_chars)
     pm = TAG_RE.sub("", marked[:m.start()])
     pos = len(pm)
     start = max(0, pos - side)
@@ -291,8 +321,7 @@ def make_snippet(body: str, terms_for_hit: List[str], max_chars: int, side: int 
         snippet_text = "…" + snippet_text
     if end < len(plain):
         snippet_text = snippet_text + "…"
-
-    snippet_html = highlight(snippet_text, terms_for_hit)
+    snippet_html = highlight(snippet_text, terms)
     if len(TAG_RE.sub("", snippet_html)) > max_chars + 40:
         t = TAG_RE.sub("", snippet_html)[:max_chars] + "…"
         snippet_html = html_escape(t)
@@ -308,6 +337,15 @@ def health():
 def version():
     return {"version": VERSION}
 
+@app.get("/diag")
+def diag():
+    has_ui = os.path.exists(os.path.join("static", "ui.html"))
+    return {
+        "kb": {"path": KB_PATH, "lines": KB_LINES, "sha256": KB_HASH, "url": KB_URL},
+        "env": {"APP_VERSION": VERSION},
+        "ui": {"static_ui_html": has_ui},
+    }
+
 @app.get("/ui")
 def ui():
     path = os.path.join("static", "ui.html")
@@ -316,7 +354,6 @@ def ui():
     return PlainTextResponse("static/ui.html not found", status_code=404)
 
 def iter_records():
-    """kb.jsonl を1行ずつ辞書で返す。"""
     with io.open(KB_PATH, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -329,13 +366,15 @@ def iter_records():
 
 def build_item(rec: Dict[str, Any], terms_for_hit: List[str], is_first_in_page: bool) -> Dict[str, Any]:
     body = record_as_text(rec, "text")
-    snippet_len = 300 if is_first_in_page else 160  # 先頭300字、以降160字
-    snippet = make_snippet(body, terms_for_hit, max_chars=snippet_len, side=80)
+    if is_first_in_page:
+        snippet = make_head_snippet(body, terms_for_hit, max_chars=300)  # ★ 先頭300字固定
+    else:
+        snippet = make_hit_snippet(body, terms_for_hit, max_chars=160, side=80)
     return {
         "title": record_as_text(rec, "title") or "(無題)",
         "content": snippet,
         "url": record_as_text(rec, "url"),
-        "rank": None,  # 後で付与
+        "rank": None,
         "date": record_as_text(rec, "date"),
     }
 
@@ -348,9 +387,9 @@ def api_search(
 ):
     """
     - AND（語群ごとに1語以上ヒット）
-    - relevance: スコア順、latest: 発行日降順
-    - 1ページ目の先頭だけ約300字、残りは約160字
-    - 例外が起きても 200 で JSON を返す（UIが「500で崩れる」を回避）
+    - relevance: スコア順 / latest: 発行日降順
+    - 1ページ目の先頭カードは冒頭300字、以降はヒット周辺160字
+    - 例外時も 200 + JSON を返す（UIを落とさない）
     """
     try:
         if not os.path.exists(KB_PATH):
@@ -360,7 +399,6 @@ def api_search(
                 headers={"Cache-Control": "no-store"},
             )
 
-        # 年フィルタを抽出
         q_wo_year, y_from, y_to = extract_year_filter(q)
         groups = expand_query_to_groups(q_wo_year)
         if not groups:
@@ -370,9 +408,8 @@ def api_search(
                 headers={"Cache-Control": "no-store"},
             )
 
-        hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = []  # (score, date, rec)
+        hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = []
         for rec in iter_records():
-            # 年フィルタ
             if y_from or y_to:
                 d = record_date(rec)
                 if not d:
@@ -390,29 +427,25 @@ def api_search(
 
         total_hits = len(hits)
 
-        # 並び順
         order_used = order
         if order == "latest":
             hits.sort(key=lambda x: (x[1] or datetime.min), reverse=True)
         else:
             hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)
 
-        # ページング
         start = (page - 1) * page_size
         end = start + page_size
         page_hits = hits[start:end]
         has_more = end < total_hits
         next_page = page + 1 if has_more else None
 
-        # 結果組み立て（先頭だけ300字）
         items: List[Dict[str, Any]] = []
-        terms_for_hit: List[str] = sorted({t for g in groups for t in g})
+        # ハイライト対象語から停用語を除外
+        terms_for_hit: List[str] = sorted({t for g in groups for t in g if t not in STOP_TERMS})
         for i, (_, _d, rec) in enumerate(page_hits):
-            is_first = (i == 0)
-            item = build_item(rec, terms_for_hit, is_first_in_page=is_first)
+            item = build_item(rec, terms_for_hit, is_first_in_page=(i == 0))
             items.append(item)
 
-        # rank（全体順位）を付ける
         for idx, _ in enumerate(hits, start=1):
             if start < idx <= end:
                 items[idx - start - 1]["rank"] = idx
@@ -430,15 +463,13 @@ def api_search(
         return JSONResponse(resp, headers={"Cache-Control": "no-store"})
 
     except Exception as e:
-        # ここで 500 にせず、UI が扱える JSON を返す
         return JSONResponse(
             {"items": [], "total_hits": 0, "page": 1, "page_size": page_size,
              "has_more": False, "next_page": None, "error": "exception", "message": textify(e)},
             headers={"Cache-Control": "no-store"},
         )
 
-
-# ローカル開発用
+# ローカル実行
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
