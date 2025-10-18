@@ -1,7 +1,7 @@
 # app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版）
 # 一般検索：空白=AND / '|'=OR / '-語'=NOT / "..."=フレーズ（単語は自動分割しない）
 # 1件目=冒頭~300字、2件目以降=ヒット周辺~160字、苔=コケ=こけ 同一視
-# 例外時もHTTP200+JSONで返却、/diagで自己診断
+# 例外時もHTTP200+JSONで返却、/diagで自己診断（直近のエラー露出）
 # VERSION: jsonl-2025-10-18-general-v5
 
 import os, io, re, json, hashlib, unicodedata
@@ -29,12 +29,19 @@ app.add_middleware(
 )
 
 # ==================== 設定 ====================
-KB_URL = os.getenv("KB_URL", "").strip()
-_cfg_path = os.getenv("KB_PATH", "/data/kb.jsonl").strip() or "/data/kb.jsonl"
-KB_PATH = _cfg_path if os.path.isabs(_cfg_path) else "/data/kb.jsonl"  # 相対は不安定→絶対へ
-VERSION = os.getenv("APP_VERSION", "jsonl-2025-10-18-general-v5")
+KB_URL   = (os.getenv("KB_URL", "") or "").strip()
+_cfg     = (os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip()
+# 相対は相対のまま許可（以前の“/data固定”を廃止）。絶対ならそのまま。
+KB_PATH  = os.path.normpath(_cfg if os.path.isabs(_cfg) else os.path.join(os.getcwd(), _cfg))
+VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-18-general-v5")
 
-# ==================== 正規化 ====================
+# ==================== 診断用グローバル ====================
+KB_LINES: int = 0
+KB_HASH:  str = ""
+LAST_ERROR: str = ""
+LAST_EVENT: str = ""  # 例: "fetched", "kept_local", "converted_json_array_to_jsonl", "no_file"
+
+# ==================== 正規化・ユーティリティ ====================
 KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
 HIRA_TO_KATA = str.maketrans({chr(h): chr(h + 0x60) for h in range(ord("ぁ"), ord("ん") + 1)})
 
@@ -56,7 +63,10 @@ def normalize_text(s: str) -> str:
 def textify(x: Any) -> str:
     if x is None: return ""
     if isinstance(x, str): return x
-    return str(x)
+    try:
+        return json.dumps(x, ensure_ascii=False)
+    except Exception:
+        return str(x)
 
 # ==================== 同義語（必要最低限） ====================
 SYNONYMS: Dict[str, List[str]] = {
@@ -65,44 +75,125 @@ SYNONYMS: Dict[str, List[str]] = {
     "こけ": ["苔", "コケ"],
 }
 
-# ==================== KBの取得/検証 ====================
-def ensure_kb() -> Tuple[int, str]:
-    os.makedirs(os.path.dirname(KB_PATH), exist_ok=True)
-    if KB_URL and KB_URL.startswith("http"):
-        if requests is None:
-            raise RuntimeError("requests が利用できません（requirements.txt に requests を追加）")
+# ==================== KB取得・保存（JSONL保証） ====================
+def _bytes_to_jsonl(blob: bytes) -> bytes:
+    """
+    もし全体が JSON 配列なら JSONL に変換。
+    既にJSONL（各行が独立のJSON）ならそのまま返す。
+    """
+    if not blob:
+        return b""
+    s = blob.decode("utf-8", errors="replace").strip()
+    if not s:
+        return b""
+    # JSON配列 → JSONL
+    if s.startswith("["):
         try:
-            r = requests.get(KB_URL, timeout=30)
-            r.raise_for_status()
-            with open(KB_PATH, "wb") as f:
-                f.write(r.content)
-        except Exception as e:
-            if not os.path.exists(KB_PATH):
-                raise e
+            data = json.loads(s)
+            if isinstance(data, list):
+                lines = [
+                    json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+                    for obj in data
+                ]
+                out = ("\n".join(lines) + "\n").encode("utf-8")
+                return out
+        except Exception:
+            # 解析に失敗したらそのまま戻す（後段でエラー計上）
+            return blob
+    return blob
 
-    if not os.path.exists(KB_PATH):
-        raise FileNotFoundError(f"KB not found: {KB_PATH}")
-
-    line_count = 0
+def _compute_lines_and_hash(path: str) -> Tuple[int, str]:
+    cnt = 0
     sha = hashlib.sha256()
-    with open(KB_PATH, "rb") as f:
+    with open(path, "rb") as f:
         for line in f:
             sha.update(line)
-            line_count += 1
-    return line_count, sha.hexdigest()
+            if line.strip():
+                cnt += 1
+    return cnt, sha.hexdigest()
 
-KB_LINES: int = 0
-KB_HASH: str = ""
+def ensure_kb() -> Tuple[int, str]:
+    """
+    1) KB_URL があれば取得 → JSONL保証 → 一時ファイルに保存 → os.replace でアトミック置換
+    2) ローカルKBが JSON 配列形式なら JSONL に変換
+    3) 行数・指紋を計算
+    """
+    global LAST_ERROR, LAST_EVENT
+    LAST_ERROR = ""
+    LAST_EVENT = ""
 
+    # 1) 取得して保存
+    if KB_URL:
+        if requests is None:
+            LAST_ERROR = "requests が利用できません（requirements.txt に requests を追加）"
+        else:
+            try:
+                r = requests.get(KB_URL, timeout=30)
+                r.raise_for_status()
+                blob = r.content
+                blob = _bytes_to_jsonl(blob)
+                # 一時保存→置換（途中失敗でも旧ファイルは保持）
+                tmp_path = KB_PATH + ".tmp"
+                os.makedirs(os.path.dirname(KB_PATH), exist_ok=True) if os.path.dirname(KB_PATH) else None
+                with open(tmp_path, "wb") as wf:
+                    wf.write(blob)
+                os.replace(tmp_path, KB_PATH)
+                LAST_EVENT = "fetched"
+            except Exception as e:
+                LAST_ERROR = f"fetch_or_save_failed: {type(e).__name__}: {e}"
+
+    # 2) ローカルで JSON 配列を検出したら JSONL に変換
+    if os.path.exists(KB_PATH):
+        try:
+            with open(KB_PATH, "rb") as rf:
+                head = rf.read(1)
+            if head == b"[":
+                try:
+                    with open(KB_PATH, "rb") as rf:
+                        blob = rf.read()
+                    blob2 = _bytes_to_jsonl(blob)
+                    if blob2 and blob2 != blob:
+                        tmp_path = KB_PATH + ".tmp"
+                        with open(tmp_path, "wb") as wf:
+                            wf.write(blob2)
+                        os.replace(tmp_path, KB_PATH)
+                        LAST_EVENT = (LAST_EVENT + "+converted_json_array_to_jsonl").strip("+")
+                except Exception as e:
+                    LAST_ERROR = f"convert_json_array_failed: {type(e).__name__}: {e}"
+        except Exception as e:
+            LAST_ERROR = f"read_head_failed: {type(e).__name__}: {e}"
+
+    # 3) 行数・指紋
+    if os.path.exists(KB_PATH):
+        try:
+            lines, sha = _compute_lines_and_hash(KB_PATH)
+            if lines <= 0:
+                # ファイルはあるが実質空
+                LAST_EVENT = LAST_EVENT or "empty_file"
+            return lines, sha
+        except Exception as e:
+            LAST_ERROR = f"hash_failed: {type(e).__name__}: {e}"
+            return 0, ""
+    else:
+        LAST_EVENT = LAST_EVENT or "no_file"
+        return 0, ""
+
+# ==================== 起動時にKB確認 ====================
 @app.on_event("startup")
 def _startup():
     global KB_LINES, KB_HASH
     try:
         KB_LINES, KB_HASH = ensure_kb()
-    except Exception:
+    except Exception as e:
+        # ここには通常来ないが、最終防御
         KB_LINES, KB_HASH = 0, ""
+        try:
+            from traceback import format_exc
+            globals()["LAST_ERROR"] = f"startup_failed: {type(e).__name__}: {e}\n{format_exc()}"
+        except Exception:
+            globals()["LAST_ERROR"] = f"startup_failed: {type(e).__name__}: {e}"
 
-# ==================== 日付パース（ソート用・日本語も対応） ====================
+# ==================== 日付パース ====================
 JP_DATE_PATTERNS = [
     re.compile(r"^(\d{4})年(\d{1,2})月(\d{1,2})日?$"),
     re.compile(r"^(\d{4})年(\d{1,2})月$"),
@@ -407,8 +498,13 @@ def build_item(rec: Dict[str, Any], hl_terms: List[str], is_first_in_page: bool)
 # ==================== エンドポイント ====================
 @app.get("/health")
 def health():
-    ok = os.path.exists(KB_PATH)
-    return {"ok": ok, "kb_url": KB_URL, "kb_size": KB_LINES, "kb_fingerprint": KB_HASH}
+    ok = os.path.exists(KB_PATH) and KB_LINES > 0
+    return {
+        "ok": ok,
+        "kb_url": KB_URL,
+        "kb_size": KB_LINES,
+        "kb_fingerprint": KB_HASH,
+    }
 
 @app.get("/version")
 def version():
@@ -416,10 +512,18 @@ def version():
 
 @app.get("/diag")
 def diag():
-    has_ui = os.path.exists(os.path.join("static", "ui.html"))
-    return {"kb": {"path": KB_PATH, "lines": KB_LINES, "sha256": KB_HASH, "url": KB_URL},
-            "env": {"APP_VERSION": VERSION},
-            "ui": {"static_ui_html": has_ui}}
+    return {
+        "kb": {
+            "path": KB_PATH,
+            "exists": os.path.exists(KB_PATH),
+            "lines": KB_LINES,
+            "sha256": KB_HASH,
+            "url": KB_URL,
+        },
+        "env": {"APP_VERSION": VERSION, "cwd": os.getcwd()},
+        "last": {"event": LAST_EVENT, "error": LAST_ERROR},
+        "ui": {"static_ui_html": os.path.exists(os.path.join("static", "ui.html"))},
+    }
 
 @app.get("/ui")
 def ui():
@@ -429,6 +533,8 @@ def ui():
     return PlainTextResponse("static/ui.html not found", status_code=404)
 
 def iter_records():
+    if not os.path.exists(KB_PATH):
+        return
     with io.open(KB_PATH, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -437,6 +543,7 @@ def iter_records():
             try:
                 yield json.loads(line)
             except Exception:
+                # 不正行はスキップ（将来 /diag に統計する場合はここでカウント）
                 continue
 
 @app.get("/api/search")
@@ -454,7 +561,7 @@ def api_search(
     - 例外時もHTTP200で JSON を返す
     """
     try:
-        if not os.path.exists(KB_PATH):
+        if not os.path.exists(KB_PATH) or KB_LINES <= 0:
             return JSONResponse(
                 {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
                  "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order},
