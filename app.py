@@ -1,32 +1,22 @@
-# app.py  ― ミニバラ盆栽愛好会 デジタル資料館（JSONL版）
-# FastAPI + Uvicorn（Render想定）
-# - /api/search : 検索API
-# - /health     : ヘルスチェック
-# - /version    : バージョン表示
-# - /diag       : 自己診断（KB/環境の確認）
-# - /ui         : static/ui.html を返す
-#
-# 仕様反映:
-#  1) 1ページ目の先頭カードは常に「冒頭～約300字」
-#  2) 「結果」は停用語として検索/ハイライトから除外（誤ヒットと見かけ対策）
-#  3) 文字化け（縺…/邨… など）を可能な範囲で自動補正してからマッチ＆表示
-#  4) 例外時も 200 + JSON を返す（UIが500で落ちない）
+# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版）
+# 一般化された多語検索対応:
+#  - 空白=AND, "|"=OR, "-語"=NOT, "..."=フレーズ一致
+#  - 語尾の一般ルール（結果/報告/案内/募集/要項/記録/予定/日程…）
+#  - こけ/コケ/苔 の同一視（かな折り＋同義語）
+#  - 先頭カード=本文冒頭~300字固定、以降=ヒット周辺~160字
+#  - 例外でもHTTP200でJSONを返しUIが落ちない
+#  - /diag でKB自己診断
+# 2025-10-18 general-v1
 
-import os
-import io
-import re
-import json
-import hashlib
-import unicodedata
+import os, io, re, json, hashlib, unicodedata
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
-
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
-    import requests  # requirements.txt に requests が必要
+    import requests
 except Exception:
     requests = None
 
@@ -40,12 +30,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ======== 設定 ========
+# ===== 設定 =====
 KB_URL = os.getenv("KB_URL", "").strip()
 KB_PATH = os.getenv("KB_PATH", "/data/kb.jsonl").strip() or "/data/kb.jsonl"
-VERSION = os.getenv("APP_VERSION", "jsonl-2025-10-18-hotfix-v2")
+VERSION = os.getenv("APP_VERSION", "jsonl-2025-10-18-general-v1")
 
-# ======== 文字整形・停用語 ========
+# ===== 文字整形 =====
 KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
 HIRA_TO_KATA = str.maketrans({chr(h): chr(h + 0x60) for h in range(ord("ぁ"), ord("ん") + 1)})
 
@@ -61,17 +51,14 @@ def normalize_text(s: str) -> str:
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("\u3000", " ")
     s = re.sub(r"[\r\n\t]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()  # ← .trim() バグ修正
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
-# 文字化けの簡易補正（UTF-8↔CP932 誤変換の痕跡を見たら試す）
+# 文字化けの簡易補正（効けば採用）
 MOJI_PAT = re.compile(r"[縺蜑荳邨鬘蛻譛繧蝨髱]")
 def fix_mojibake(s: str) -> str:
-    if not s:
+    if not s or not MOJI_PAT.search(s):
         return s
-    if not MOJI_PAT.search(s):
-        return s
-    # よくある誤変換を2通りほど試す（失敗時は元のまま）
     try:
         t = s.encode("cp932", errors="ignore").decode("utf-8", errors="ignore")
         if t and t != s:
@@ -86,57 +73,30 @@ def fix_mojibake(s: str) -> str:
         pass
     return s
 
-# 同義語
+# ===== 同義語・語尾 =====
 SYNONYMS: Dict[str, List[str]] = {
+    # 代表例：苔
     "苔": ["コケ", "こけ"],
     "コケ": ["苔", "こけ"],
     "こけ": ["苔", "コケ"],
+    # よく使う一般語尾（ひら・カナも吸収）
+    "結果": ["けっか", "ケッカ"],
+    "報告": ["ほうこく", "ホウコク", "レポート"],
+    "案内": ["あんない", "アンナイ", "ご案内"],
+    "募集": ["ぼしゅう", "ボシュウ"],
+    "要項": ["ようこう", "ヨウコウ"],
+    "記録": ["きろく", "キロク"],
+    "予定": ["よてい", "ヨテイ"],
+    "日程": ["にってい", "ニッテイ"],
+    "要領": ["ようりょう", "ヨウリョウ"],
+    "一覧": ["いちらん", "イチラン"],
+    "まとめ": ["マトメ"],
 }
+SUFFIXES = set([
+    "結果","報告","案内","募集","要項","記録","予定","日程","要領","一覧","まとめ"
+])
 
-STOP_TERMS = {"結果"}  # 汎用語は検索にもハイライトにも使わない
-
-COMPOUND_RESULT_RE = re.compile(r"^(.+?)結果$")
-
-def expand_query_to_groups(q: str) -> List[List[str]]:
-    """
-    入力qを正規化→ANDグループ列に展開。
-    - 「◯◯結果」は「◯◯」のみを使い、「結果」は停用（ANDに含めない）
-    - 停用語は完全に除外
-    """
-    base = normalize_text(q)
-    if not base:
-        return []
-    hira_base = to_hira(base)
-    raw_terms = [t for t in re.split(r"\s+", hira_base) if t]
-
-    groups: List[List[str]] = []
-    for term in raw_terms:
-        m = COMPOUND_RESULT_RE.match(term)
-        if m:
-            left = m.group(1)
-            if left and left not in STOP_TERMS:
-                left_group = [left] + SYNONYMS.get(left, [])
-                left_group = list(dict.fromkeys(left_group))
-                # かな→カナも足す
-                kata = to_kata(left)
-                if kata != left:
-                    left_group.append(kata)
-                groups.append(left_group)
-            continue
-
-        if term in STOP_TERMS:
-            continue
-
-        group: List[str] = [term] + SYNONYMS.get(term, [])
-        kata = to_kata(term)
-        if kata != term:
-            group.append(kata)
-        group = list(dict.fromkeys(group))
-        groups.append(group)
-
-    return groups
-
-# ======== JSONL 読み込み ========
+# ===== KB 確保 =====
 def ensure_kb() -> Tuple[int, str]:
     os.makedirs(os.path.dirname(KB_PATH), exist_ok=True)
     if KB_URL and KB_URL.startswith("http"):
@@ -169,7 +129,7 @@ def _startup():
     except Exception:
         KB_LINES, KB_HASH = 0, ""
 
-# ======== ユーティリティ ========
+# ===== ユーティリティ =====
 def parse_date_str(s: str) -> Optional[datetime]:
     if not s:
         return None
@@ -217,15 +177,112 @@ def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
                 return dt
     return None
 
-# ======== スコアリング ========
+# ===== トークナイズ（AND / OR / NOT / フレーズ） =====
+TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')  # "..." または 非空白塊
+
+def _expand_one_term(term: str) -> List[str]:
+    """単語1つを同義語＆かな両対応に展開"""
+    term = normalize_text(term)
+    hira = to_hira(term)
+    out = [hira]
+    out += SYNONYMS.get(term, [])
+    out += SYNONYMS.get(hira, [])
+    kata = to_kata(hira)
+    if kata != term:
+        out.append(kata)
+    # 重複除去・空除去
+    out = [normalize_text(t) for t in out if t]
+    out = list(dict.fromkeys(out))
+    return out
+
+def _maybe_split_suffix(token: str) -> Tuple[Optional[str], Optional[str]]:
+    """末尾が一般語尾なら (base, suffix) を返す。そうでなければ (None, None)。"""
+    for suf in sorted(SUFFIXES, key=len, reverse=True):
+        if token.endswith(suf) and len(token) > len(suf):
+            base = token[:len(token) - len(suf)]
+            if base:
+                return base, suf
+    return None, None
+
+def parse_query(q: str) -> Tuple[List[List[str]], List[List[str]], List[str]]:
+    """
+    返り値:
+      - pos_groups: ANDの各グループ（各要素は OR リスト）
+      - neg_groups: 除外グループ（どれか当たれば除外）
+      - phrase_terms: 「base+suffix」等のフレーズ完全一致候補
+    仕様:
+      - 空白=AND, '|'=OR, '-語'=NOT, "..."=フレーズ（ANDの1項目として扱う）
+      - tokenが「base+suffix（一般語尾）」なら AND で2グループに分割し、フレーズ候補も追加
+      - 分かち書きで base と suffix が両方含まれていれば、それも自然に AND になる
+    """
+    base = normalize_text(q)
+    if not base:
+        return [], [], []
+    hira_base = to_hira(base)
+
+    pos_groups: List[List[str]] = []
+    neg_groups: List[List[str]] = []
+    phrase_terms: List[str] = []
+
+    for m in TOKEN_RE.finditer(hira_base):
+        token = m.group(1) if m.group(1) is not None else m.group(2)
+        if not token:
+            continue
+
+        is_neg = token.startswith("-")
+        if is_neg:
+            token = token[1:].strip()
+            if not token:
+                continue
+
+        # OR分解
+        parts = [t for t in token.split("|") if t]
+
+        # フレーズ（"..."）はそのまま1グループ
+        # TOKEN_REで "..." は m.group(1) に入り、上ですでに抽出済み
+
+        # 各パーツを処理
+        # - 一般語尾なら AND分割（base群 と suffix群）＋ フレーズ候補 base+suffix
+        # - それ以外は OR群としてまとめる
+        and_chunks: List[List[str]] = []  # ここに AND で積む
+
+        for p in parts:
+            base_s, suf = _maybe_split_suffix(p)
+            if base_s and suf:
+                base_group = _expand_one_term(base_s)
+                suf_group = _expand_one_term(suf)
+                and_chunks.append(base_group)
+                and_chunks.append(suf_group)
+                # フレーズ候補（ひら/カナ）
+                phrase_terms.append(normalize_text(base_s + suf))
+                phrase_terms.append(normalize_text(to_kata(base_s) + suf))
+            else:
+                # 普通の語（OR群へ）
+                or_group = _expand_one_term(p)
+                and_chunks.append(or_group)
+
+        # and_chunks を AND として積む（各要素は ORの集合）
+        if is_neg:
+            neg_groups.extend(and_chunks)
+        else:
+            pos_groups.extend(and_chunks)
+
+    # フレーズ候補整形
+    phrase_terms = [t for t in phrase_terms if t]
+    phrase_terms = list(dict.fromkeys(phrase_terms))
+    return pos_groups, neg_groups, phrase_terms
+
+# ===== スコアリング =====
 FIELD_WEIGHTS = {
     "title": 12,
-    "text": 8,
+    "text":  8,
     "author": 5,
-    "issue": 3,
-    "date": 2,
+    "issue":  3,
+    "date":   2,
     "category": 2,
 }
+PHRASE_BONUS_TITLE = 100
+PHRASE_BONUS_TEXT  = 60
 
 def _get_field(rec: Dict[str, Any], keys: List[str]) -> str:
     for k in keys:
@@ -247,33 +304,73 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
     raw = _get_field(rec, key_map.get(field, [field]))
     return fix_mojibake(raw)
 
-def match_term_in_text(t: str, s: str) -> int:
-    if not t or not s:
+def match_count(term: str, text: str) -> int:
+    if not term or not text:
         return 0
-    a = normalize_text(s)
-    b = normalize_text(t)
-    ah = to_hira(a)
-    bh = to_hira(b)
+    a = normalize_text(text); b = normalize_text(term)
+    ah = to_hira(a);         bh = to_hira(b)
     return a.count(b) + ah.count(bh)
 
-def compute_score(rec: Dict[str, Any], groups: List[List[str]]) -> int:
+def group_hit_count(group: List[str], text: str) -> int:
+    """ORグループの中で何回ヒットしたか（累積）"""
     total = 0
-    for group in groups:
-        group_hit = False
-        for term in group:
-            for field, w in FIELD_WEIGHTS.items():
-                s = record_as_text(rec, "date") if field == "date" else record_as_text(rec, field)
-                if not s:
-                    continue
-                c = match_term_in_text(term, s)
-                if c > 0:
-                    total += w * c
-                    group_hit = True
-        if not group_hit:
-            return -1
+    for t in group:
+        total += match_count(t, text)
     return total
 
-# ======== スニペット生成 ========
+def matches_group_any_field(rec: Dict[str, Any], group: List[str]) -> Tuple[bool, int]:
+    """ORグループがどこかのフィールドにヒットしたか／スコア寄与"""
+    hit = False
+    score_add = 0
+    for field, w in FIELD_WEIGHTS.items():
+        s = record_as_text(rec, "date") if field == "date" else record_as_text(rec, field)
+        if not s:
+            continue
+        c = group_hit_count(group, s)
+        if c > 0:
+            hit = True
+            score_add += w * c
+    return hit, score_add
+
+def contains_phrase(s: str, phrases: List[str]) -> bool:
+    if not s or not phrases:
+        return False
+    ns = normalize_text(s); nh = to_hira(ns)
+    for p in phrases:
+        np = normalize_text(p)
+        if np in ns or to_hira(np) in nh:
+            return True
+    return False
+
+def compute_score(rec: Dict[str, Any],
+                  pos_groups: List[List[str]],
+                  neg_groups: List[List[str]],
+                  phrase_terms: List[str]) -> int:
+    # 1) NOT判定（どれか当たれば除外）
+    for ng in neg_groups:
+        ok, _ = matches_group_any_field(rec, ng)
+        if ok:
+            return -1
+
+    # 2) AND判定（全グループがヒット必須）＆スコア集計
+    total = 0
+    for g in pos_groups:
+        ok, add = matches_group_any_field(rec, g)
+        if not ok:
+            return -1
+        total += add
+
+    # 3) フレーズ完全一致ボーナス
+    title = record_as_text(rec, "title")
+    text  = record_as_text(rec, "text")
+    if contains_phrase(title, phrase_terms):
+        total += PHRASE_BONUS_TITLE
+    if contains_phrase(text,  phrase_terms):
+        total += PHRASE_BONUS_TEXT
+
+    return total
+
+# ===== 抜粋・ハイライト =====
 TAG_RE = re.compile(r"<[^>]+>")
 
 def html_escape(s: str) -> str:
@@ -283,14 +380,14 @@ def highlight(text: str, terms: List[str]) -> str:
     if not text:
         return ""
     esc = html_escape(text)
-    for t in sorted({t for t in terms if t not in STOP_TERMS}, key=len, reverse=True):
+    # 長い語から順に
+    for t in sorted(set(terms), key=len, reverse=True):
         et = html_escape(t)
         if et:
             esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
     return esc
 
 def make_head_snippet(body: str, terms: List[str], max_chars: int) -> str:
-    """本文冒頭から max_chars、必要なら…を付ける。"""
     if not body:
         return ""
     b = fix_mojibake(body)
@@ -301,7 +398,6 @@ def make_head_snippet(body: str, terms: List[str], max_chars: int) -> str:
     return out
 
 def make_hit_snippet(body: str, terms: List[str], max_chars: int, side: int = 80) -> str:
-    """最初のヒット周辺を抜粋。ヒットが無ければ冒頭にフォールバック。"""
     if not body:
         return ""
     b = fix_mojibake(body)
@@ -327,7 +423,7 @@ def make_hit_snippet(body: str, terms: List[str], max_chars: int, side: int = 80
         snippet_html = html_escape(t)
     return snippet_html
 
-# ======== エンドポイント ========
+# ===== エンドポイント =====
 @app.get("/health")
 def health():
     ok = os.path.exists(KB_PATH)
@@ -364,12 +460,13 @@ def iter_records():
             except Exception:
                 continue
 
-def build_item(rec: Dict[str, Any], terms_for_hit: List[str], is_first_in_page: bool) -> Dict[str, Any]:
+def build_item(rec: Dict[str, Any], hl_terms: List[str], is_first_in_page: bool) -> Dict[str, Any]:
     body = record_as_text(rec, "text")
-    if is_first_in_page:
-        snippet = make_head_snippet(body, terms_for_hit, max_chars=300)  # ★ 先頭300字固定
-    else:
-        snippet = make_hit_snippet(body, terms_for_hit, max_chars=160, side=80)
+    snippet = (
+        make_head_snippet(body, hl_terms, max_chars=300)
+        if is_first_in_page else
+        make_hit_snippet(body, hl_terms, max_chars=160, side=80)
+    )
     return {
         "title": record_as_text(rec, "title") or "(無題)",
         "content": snippet,
@@ -386,10 +483,11 @@ def api_search(
     order: str = Query("relevance", pattern="^(relevance|latest)$"),
 ):
     """
-    - AND（語群ごとに1語以上ヒット）
-    - relevance: スコア順 / latest: 発行日降順
-    - 1ページ目の先頭カードは冒頭300字、以降はヒット周辺160字
-    - 例外時も 200 + JSON を返す（UIを落とさない）
+    - 空白=AND, "|"=OR, "-語"=NOT, "..."=フレーズ一致
+    - 語尾の一般ルール（結果/報告/案内/募集/要項/記録/予定/日程…）
+    - relevance: スコア順（同点は新しい日付優先） / latest: 日付降順
+    - 1ページ目先頭=冒頭300字、以降=ヒット周辺160字
+    - 例外時も200でJSON返却（UIを落とさない）
     """
     try:
         if not os.path.exists(KB_PATH):
@@ -400,8 +498,8 @@ def api_search(
             )
 
         q_wo_year, y_from, y_to = extract_year_filter(q)
-        groups = expand_query_to_groups(q_wo_year)
-        if not groups:
+        pos_groups, neg_groups, phrase_terms = parse_query(q_wo_year)
+        if not pos_groups and not neg_groups:
             return JSONResponse(
                 {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
                  "has_more": False, "next_page": None, "error": None, "order_used": order},
@@ -409,7 +507,9 @@ def api_search(
             )
 
         hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = []
+
         for rec in iter_records():
+            # 年フィルタ
             if y_from or y_to:
                 d = record_date(rec)
                 if not d:
@@ -419,7 +519,7 @@ def api_search(
                 if y_to and d.year > y_to:
                     continue
 
-            score = compute_score(rec, groups)
+            score = compute_score(rec, pos_groups, neg_groups, phrase_terms)
             if score < 0:
                 continue
             d = record_date(rec)
@@ -427,40 +527,38 @@ def api_search(
 
         total_hits = len(hits)
 
-        order_used = order
+        # 並び替え
         if order == "latest":
             hits.sort(key=lambda x: (x[1] or datetime.min), reverse=True)
+            order_used = "latest"
         else:
-            hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)
+            hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)  # 同点は新しい方
+            order_used = "relevance"
 
+        # ページング
         start = (page - 1) * page_size
         end = start + page_size
         page_hits = hits[start:end]
         has_more = end < total_hits
         next_page = page + 1 if has_more else None
 
-        items: List[Dict[str, Any]] = []
-        # ハイライト対象語から停用語を除外
-        terms_for_hit: List[str] = sorted({t for g in groups for t in g if t not in STOP_TERMS})
-        for i, (_, _d, rec) in enumerate(page_hits):
-            item = build_item(rec, terms_for_hit, is_first_in_page=(i == 0))
-            items.append(item)
+        # ハイライト語（実際に使っている語＋フレーズ）
+        hl_terms: List[str] = sorted({t for g in pos_groups for t in g} | {t for g in neg_groups for t in g} | set(phrase_terms))
 
+        items: List[Dict[str, Any]] = []
+        for i, (_, _d, rec) in enumerate(page_hits):
+            items.append(build_item(rec, hl_terms, is_first_in_page=(i == 0)))
+
+        # rank 付与
         for idx, _ in enumerate(hits, start=1):
             if start < idx <= end:
                 items[idx - start - 1]["rank"] = idx
 
-        resp = {
-            "items": items,
-            "total_hits": total_hits,
-            "page": page,
-            "page_size": page_size,
-            "has_more": has_more,
-            "next_page": next_page,
-            "error": None,
-            "order_used": order_used,
-        }
-        return JSONResponse(resp, headers={"Cache-Control": "no-store"})
+        return JSONResponse(
+            {"items": items, "total_hits": total_hits, "page": page, "page_size": page_size,
+             "has_more": has_more, "next_page": next_page, "error": None, "order_used": order_used},
+            headers={"Cache-Control": "no-store"},
+        )
 
     except Exception as e:
         return JSONResponse(
