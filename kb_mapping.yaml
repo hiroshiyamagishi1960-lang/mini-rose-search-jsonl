@@ -27,4 +27,3 @@ validate:
   title_contains:
     - needle: "コンテスト結果"
       min: 6
-
