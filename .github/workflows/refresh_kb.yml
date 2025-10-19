@@ -1,10 +1,13 @@
-# refresh_kb.py — Notion → kb.jsonl 変換（自動タイトル検出対応）
-# version: 2025-10-20-auto-title
+# refresh_kb.py — Notion → kb.jsonl 変換（自動タイトル検出＋DBID両対応）
+# version: 2025-10-20-failsafe
 
 import os, json, requests, datetime as dt
 
-NOTION_TOKEN       = os.getenv("NOTION_TOKEN", "")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
+# ==== Notion 認証 ====
+NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
+# まず既存仕様 NOTION_DB_ID を優先し、無ければ NOTION_DATABASE_ID をフォールバック
+NOTION_DATABASE_ID = os.getenv("NOTION_DB_ID", "") or os.getenv("NOTION_DATABASE_ID", "")
+
 FIELD_TITLE        = os.getenv("FIELD_TITLE", "").strip()
 FIELD_AUTHOR       = os.getenv("FIELD_AUTHOR", "講師/著者")
 FIELD_URL          = os.getenv("FIELD_URL", "出典URL")
@@ -99,7 +102,12 @@ def save_jsonl(records):
 
 if __name__ == "__main__":
     if not NOTION_TOKEN or not NOTION_DATABASE_ID:
-        raise SystemExit("❌ NOTION_TOKEN / NOTION_DATABASE_ID が設定されていません。")
+        dbid_len = len(os.getenv("NOTION_DB_ID", ""))
+        dbid2_len = len(os.getenv("NOTION_DATABASE_ID", ""))
+        raise SystemExit(
+            f"❌ Notion認証不足: NOTION_TOKEN={bool(NOTION_TOKEN)} "
+            f"/ NOTION_DB_ID.len={dbid_len} / NOTION_DATABASE_ID.len={dbid2_len}"
+        )
     print("[INFO] building KB…")
     recs = build_kb()
     save_jsonl(recs)
