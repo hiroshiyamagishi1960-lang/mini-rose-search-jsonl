@@ -34,11 +34,41 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pyyaml
 
+      # --- ここが診断＆整形 ---
+      - name: Diagnose and normalize NOTION_DB_ID
+        id: diag
+        shell: bash
+        run: |
+          echo "[DIAG] token prefix: ${NOTION_TOKEN:0:4}***"
+          if [ -z "${NOTION_DB_ID}" ]; then
+            echo "::error::NOTION_DB_ID is empty. Set it in GitHub Secrets."
+            exit 1
+          fi
+
+          RAW="${NOTION_DB_ID}"
+          # 英数字以外を除去して32桁なら UUID 形式へ整形（8-4-4-4-12）
+          HEXONLY="$(echo "$RAW" | tr -d '-' | tr -cd '[:xdigit:]')"
+          if [ "${#HEXONLY}" -eq 32 ]; then
+            NORM="${HEXONLY:0:8}-${HEXONLY:8:4}-${HEXONLY:12:4}-${HEXONLY:16:4}-${HEXONLY:20:12}"
+          else
+            NORM="$RAW"
+          fi
+
+          echo "[DIAG] db_id_raw:   ${RAW:0:8}********"
+          echo "[DIAG] db_id_norm:  ${NORM:0:8}********"
+          echo "[DIAG] db_id_len:   ${#NORM}"
+          # ざっくり UUID っぽいか確認（ハイフン4本）
+          if [[ "$(grep -o '-' <<<"$NORM" | wc -l)" -lt 4 ]]; then
+            echo "::error::NOTION_DB_ID looks invalid (hyphens missing). Expected UUID like xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+            exit 1
+          fi
+          echo "DB_ID_NORM=$NORM" >> "$GITHUB_OUTPUT"
+
       - name: Build kb.jsonl from Notion
         run: |
           echo "[INFO] start build_kb.py"
           python scripts/build_kb.py \
-            --db-id "$NOTION_DB_ID" \
+            --db-id "${{ steps.diag.outputs.DB_ID_NORM }}" \
             --token "$NOTION_TOKEN" \
             --mapping "kb_mapping.yaml" \
             --out "kb.jsonl" \
