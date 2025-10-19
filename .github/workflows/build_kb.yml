@@ -1,62 +1,50 @@
 name: Build KB (Notion → JSONL)
 
 on:
-  schedule:
-    # 03:00 JST = 18:00 UTC
-    - cron: "0 18 * * *"
-  workflow_dispatch: {}
-
-permissions:
-  contents: write   # kb.jsonl をコミットするため
-
-env:
-  PYTHONUNBUFFERED: "1"
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "scripts/**"
+      - "kb_mapping.yaml"
+      - ".github/workflows/build_kb.yml"
 
 jobs:
-  build-kb:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests pyyaml
 
-      - name: Build kb.jsonl from Notion
+      - name: Generate kb.jsonl
         run: |
-          python scripts/build_kb.py \
-            --db-id "${{ secrets.NOTION_DB_ID }}" \
-            --token "${{ secrets.NOTION_TOKEN }}" \
-            --mapping "kb_mapping.yaml" \
-            --out "kb.jsonl" \
-            --validate-title-contains "コンテスト結果>=6"
+          echo "🧩 Running build_kb.py"
+          python scripts/build_kb.py
 
-      - name: Show summary
+      - name: Commit and push changes
         run: |
-          echo "---- kb head ----"; head -n 3 kb.jsonl || true
-          echo "---- stats ----";  wc -l kb.jsonl || true
-          sha256sum kb.jsonl || true
-
-      - name: Commit & push if changed
-        run: |
-          git config user.name  "actions-user"
-          git config user.email "actions@users.noreply.github.com"
+          git config user.name "actions-user"
+          git config user.email "actions@github.com"
           git add kb.jsonl
-          if ! git diff --cached --quiet; then
-            git commit -m "Auto update KB ${{ github.run_id }}"
-            git push
-          else
-            echo "No changes in kb.jsonl"
-          fi
+          git commit -m "Auto update KB $(date +'%Y%m%d%H%M%S')" || echo "No changes to commit"
+          git push
 
-      - name: Trigger Render deploy (optional)
-        if: ${{ secrets.RENDER_DEPLOY_HOOK != '' }}
+      - name: (Optional) Trigger Render Deploy
+        if: env.RENDER_DEPLOY_HOOK != ''
         run: |
-          curl -fsSL -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}" || true
+          curl -X POST "$RENDER_DEPLOY_HOOK"
+
+env:
+  NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+  NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+  RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
