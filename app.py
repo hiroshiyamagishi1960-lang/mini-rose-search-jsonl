@@ -1,18 +1,15 @@
-# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版・検索仕様アップデートv2）
-# 変更点（v2）:
-# - タイトルのフォールバック抽出を実装：
-#   title が空/未設定の場合、text 先頭から「見出し候補」を拾ってタイトル化
-#   ・行ごとに評価し、非空/非記号/長さ(6〜80)を満たす最初の有力行を採用
-#   ・クエリ語（hl_terms）を含む行は優先
-#   ・必要に応じて80文字で省略記号（…）付与
-# - 既存の仕様は維持：
+# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版・検索仕様アップデート v3）
+# 変更点（v3）:
+# - （無題）対策：日本語キーを追加（タイトル/本文/URL/日付/著者/区分/号）
+# - compute_score を実装（0件化の主因を解消）
+# - 既存仕様の維持：
 #   ・連結語はそのまま一致（例：コンテスト結果）
 #   ・空白ありは AND（例：コンテスト 結果）
-#   ・年フィルタは末尾のみ発動（コンテスト2024 / コンテスト 2024 等）
-#   ・同義語は苔/コケ/こけのみ
-#   ・文字化け簡易修復はON
+#   ・年フィルタは末尾のみ発動（例：コンテスト2024 / コンテスト 2023-2025）
+#   ・同義語は 苔/コケ/こけ
+#   ・簡易文字化け修復＋ハイライト
 #
-# バージョン: jsonl-2025-10-19-search-spec-v2
+# バージョン: jsonl-2025-10-19-search-spec-v3
 
 import os, io, re, json, hashlib, unicodedata
 from datetime import datetime
@@ -42,7 +39,7 @@ app.add_middleware(
 KB_URL   = (os.getenv("KB_URL", "") or "").strip()
 _cfg     = (os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip()
 KB_PATH  = os.path.normpath(_cfg if os.path.isabs(_cfg) else os.path.join(os.getcwd(), _cfg))
-VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-19-search-spec-v2")
+VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-19-search-spec-v3")
 
 MOJIBAKE_REPAIR = (os.getenv("MOJIBAKE_REPAIR", "1") != "0")  # 既定 ON
 
@@ -215,7 +212,11 @@ def parse_date_str(s: str) -> Optional[datetime]:
     return None
 
 def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
-    for k in ("date", "date_primary", "Date", "published_at", "published", "created_at"):
+    for k in (
+        "date","date_primary","Date","published_at","published","created_at",
+        # 日本語キーを追加
+        "開催日/発行日","開催日","発行日","日付","作成日","更新日"
+    ):
         d = rec.get(k)
         if d:
             dt_ = parse_date_str(textify(d))
@@ -291,8 +292,16 @@ def _matches_year(rec: Dict[str, Any], year: Optional[int], yr: Optional[Tuple[i
     return any(lo <= y <= hi for y in ys)
 
 # ==================== フィールド抽出 ====================
-TITLE_KEYS = ["title", "Title", "name", "Name", "page_title", "source_title", "heading", "headline", "subject"]
-TEXT_KEYS  = ["text", "content", "body", "description", "summary", "note", "content_full", "excerpt"]
+TITLE_KEYS = [
+    "title","Title","name","Name","page_title","source_title","heading","headline","subject",
+    # 日本語キーを追加
+    "タイトル","題名","見出し","名前","表題"
+]
+TEXT_KEYS  = [
+    "text","content","body","description","summary","note","content_full","excerpt",
+    # 日本語キーを追加（Notionの項目に合わせる）
+    "本文","内容","記事","テキスト","講習会等内容","講習会内容","資料本文","本文テキスト"
+]
 
 def _get_field(rec: Dict[str, Any], keys: List[str]) -> str:
     for k in keys:
@@ -305,21 +314,20 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
     key_map = {
         "title": TITLE_KEYS,
         "text":  TEXT_KEYS,
-        "author": ["author", "Author", "writer", "posted_by"],
-        "issue":  ["issue", "Issue"],
-        "date":   ["date", "date_primary", "Date", "published_at", "published", "created_at"],
-        "category": ["category", "Category", "tags", "Tags"],
-        "url":    ["url", "source", "link", "permalink"],
+        "author": ["author","Author","writer","posted_by","講師","著者","講師/著者"],
+        "issue":  ["issue","Issue","会報号"],
+        "date":   ["date","date_primary","Date","published_at","published","created_at","開催日/発行日","開催日","発行日","日付","作成日","更新日"],
+        "category": ["category","Category","tags","Tags","資料区分","区分","カテゴリ","カテゴリー","タグ"],
+        "url":    ["url","source","link","permalink","出典URL","URL","リンク","出典","公開URL"],
     }
     return _get_field(rec, key_map.get(field, [field]))
 
 # ==================== クエリ解析 ====================
 TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')  # "..." or non-space token
 
-# 以前の「空白なし⇔あり」同義化は仕様上OFFにするため、_space_variants は使わない
 def _expand_term_forms(term: str) -> List[str]:
     """
-    仕様に基づき、単語の自動分割・空白バリアントは生成しない。
+    自動空白バリアントは生成しない（仕様）。
     行うのは：
       - NFKC 正規化
       - かな/カナ相互
@@ -356,7 +364,7 @@ def parse_query(q: str) -> Tuple[List[List[str]], List[List[str]], List[str], Li
         if m.group(1) is not None:
             phrase = normalize_text(token)
             phrases.append(phrase)
-            # ハイライト用にはフレーズ内の語を分割吸収（表示の見やすさ向上目的）
+            # ハイライト用にはフレーズ内の語も吸収（表示の見やすさ）
             for t in re.split(r"\s+", phrase.strip()):
                 if t:
                     for f in _expand_term_forms(t):
@@ -440,7 +448,6 @@ def _group_hit_in_any_field(rec: Dict[str, Any], group: List[str]) -> Tuple[bool
     return hit, score_add
 
 def _phrase_match_any_field(rec: Dict[str, Any], phrase: str) -> Tuple[bool, int]:
-    # フレーズは従来どおり
     base = normalize_text(phrase)
     variants = [base]
     if " " in base:
@@ -465,26 +472,54 @@ def _phrase_match_any_field(rec: Dict[str, Any], phrase: str) -> Tuple[bool, int
             else:                  add += PHRASE_BONUS_OTHER
     return ok, add
 
+def compute_score(rec: Dict[str, Any],
+                  pos_groups: List[List[str]],
+                  neg_groups: List[List[str]],
+                  phrases: List[str]) -> int:
+    """
+    スコア計算：
+      - neg_groups：どれか1つでもヒット → 不合格（-1）
+      - pos_groups：全部のグループがヒット → 合格（加点）。1つでも未ヒット → 不合格（-1）
+      - phrases   ：ヒット箇所に応じてボーナス加点
+    """
+    # NG（除外）判定
+    for ng in neg_groups:
+        ng_hit, _ = _group_hit_in_any_field(rec, ng)
+        if ng_hit:
+            return -1
+
+    # 必須（AND）判定＋加点
+    total = 0
+    for pg in pos_groups:
+        pg_hit, add = _group_hit_in_any_field(rec, pg)
+        if not pg_hit:
+            return -1
+        total += add
+
+    # フレーズ・ボーナス
+    for ph in phrases:
+        ok, bonus = _phrase_match_any_field(rec, ph)
+        if ok:
+            total += bonus
+
+    return total
+
 # ==================== タイトル・フォールバック抽出 ====================
-# 記号だけの行を弾く（日本語/英数字を一切含まない）
 _RE_HAS_LETTER = re.compile(r"[A-Za-z0-9\u3040-\u30FF\u4E00-\u9FFF]")
 
 def _is_meaningful_line(s: str) -> bool:
     if not s: return False
     t = _nfkc(s).strip()
     if not t: return False
-    if not _RE_HAS_LETTER.search(t):  # 文字を含まない（飾り線・記号のみ）
+    if not _RE_HAS_LETTER.search(t):  # 記号のみは除外
         return False
     return True
 
 def _score_title_candidate(line: str, hl_terms: List[str]) -> int:
-    """スコアリング：クエリ語を含むほど加点。行頭記号などの軽微な装飾は無視。"""
     t = _nfkc(line).strip()
     if not t: return -1
     if len(t) < 6: return -1
-    # 長さペナルティ（長すぎる行は軽く減点）
     score = max(0, 120 - min(len(t), 120))
-    # クエリ語ブースト
     for term in hl_terms:
         if not term: continue
         a, ah = _norm_pair(t)
@@ -502,29 +537,23 @@ def _shorten_title(s: str, limit: int = 80) -> str:
 def _extract_title_fallback(body: str, hl_terms: List[str]) -> Optional[str]:
     if not body:
         return None
-    # そのままの原文を使う（normalize_textは改行を潰すため使わない）
     lines = body.splitlines()
     best = None
     best_score = -1
-    # 1周目：条件に合う中からベスト（hl_terms含有を優先）
     for raw in lines:
         if not _is_meaningful_line(raw): 
             continue
         t = _nfkc(raw).strip()
-        # 許容長
         if len(t) < 6:
             continue
-        # 候補のスコア算出
         sc = _score_title_candidate(t, hl_terms)
         if sc > best_score:
             best = t
             best_score = sc
-        # 十分良い行が見つかったら早期確定（ヒューリスティック）
         if sc >= 100:
             break
     if best:
         return _shorten_title(best, 80)
-    # 2周目：とにかく最初の非空行をヘッダとして短縮
     for raw in lines:
         t = _nfkc(raw).strip()
         if t:
