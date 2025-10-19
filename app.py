@@ -1,10 +1,16 @@
-# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版・文字化け対策）
-# 変更点（本パッチ）:
-# - すべてのJSON応答に charset=utf-8 を明示（誤デコード防止）
-# - 表示用フィールド（title / snippet）に限定してモジバケ自動修復（環境変数 MOJIBAKE_REPAIR=0 で無効化）
-# - /diag に修復件数を表示
+# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版・検索仕様アップデート）
+# 変更点（本版）:
+# - 単語連結（例: 「コンテスト結果」「大会日程」）を分割せず“そのまま”検索
+#   ※ 以前の「空白なし⇔あり」の自動同義化は無効化
+# - 空白あり入力（例: 「コンテスト 結果」）は AND として従来通り検索
+# - 年フィルタは末尾のみ発動：
+#     OK: 「コンテスト2024」「コンテスト 2024」「コンテスト　２０２４」
+#     NG: 「2024コンテスト」「２０２４コンテスト」→ リテラル検索（フィルタ不発）
+# - 文字化け対策（前版の修復ロジックと charset 明示）を維持
 #
-# 検索仕様は従前のまま（AND/OR/NOT, フレーズ, 年末尾フィルタ等）。仕様変更は別途パッチとします。
+# 備考:
+# - フレーズ（"..."）の挙動は従来通り（仕様要望は通常検索に対するもののため）
+# - 同義語（苔/コケ/こけ）は従来通り
 
 import os, io, re, json, hashlib, unicodedata
 from datetime import datetime
@@ -34,7 +40,7 @@ app.add_middleware(
 KB_URL   = (os.getenv("KB_URL", "") or "").strip()
 _cfg     = (os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip()
 KB_PATH  = os.path.normpath(_cfg if os.path.isabs(_cfg) else os.path.join(os.getcwd(), _cfg))
-VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-19-mojibake-fix1")
+VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-19-search-spec-v1")
 
 MOJIBAKE_REPAIR = (os.getenv("MOJIBAKE_REPAIR", "1") != "0")  # 既定 ON
 
@@ -44,7 +50,6 @@ KB_HASH:  str = ""
 LAST_ERROR: str = ""
 LAST_EVENT: str = ""
 
-# 修復診断カウンタ
 _REPAIR_STATS = {
     "title_repaired": 0,
     "snippet_repaired": 0,
@@ -94,7 +99,6 @@ SYNONYMS: Dict[str, List[str]] = {
 
 # ==================== KB 取得・常駐 ====================
 def _bytes_to_jsonl(blob: bytes) -> bytes:
-    """配列JSONでも来たら JSONL に変換して保存"""
     if not blob: return b""
     s = blob.decode("utf-8", errors="replace").strip()
     if not s: return b""
@@ -132,10 +136,8 @@ def _load_rows_into_memory(path: str) -> List[Dict[str, Any]]:
     return rows
 
 def ensure_kb() -> Tuple[int, str]:
-    """KBを取得→保存→行数/ハッシュ計算→メモリ常駐。戻り値=(lines, sha256)。"""
     global LAST_ERROR, LAST_EVENT, _KB_ROWS
     LAST_ERROR = ""; LAST_EVENT = ""
-    # 取得（任意）
     if KB_URL:
         if requests is None:
             LAST_ERROR = "requests unavailable"
@@ -152,13 +154,11 @@ def ensure_kb() -> Tuple[int, str]:
                 LAST_EVENT = "fetched"
             except Exception as e:
                 LAST_ERROR = f"fetch_or_save_failed: {type(e).__name__}: {e}"
-    # 行数/ハッシュ
     if os.path.exists(KB_PATH):
         try:
             lines, sha = _compute_lines_and_hash(KB_PATH)
             if lines <= 0:
                 LAST_EVENT = LAST_EVENT or "empty_file"
-            # メモリ常駐
             _KB_ROWS = _load_rows_into_memory(KB_PATH)
             return lines, sha
         except Exception as e:
@@ -171,7 +171,6 @@ def ensure_kb() -> Tuple[int, str]:
         return 0, ""
 
 def _refresh_kb_globals():
-    """ensure_kb の結果をグローバル診断値に反映"""
     global KB_LINES, KB_HASH
     lines, sha = ensure_kb()
     KB_LINES, KB_HASH = lines, sha
@@ -186,7 +185,7 @@ def _startup():
         KB_LINES, KB_HASH = 0, ""
         LAST_ERROR = f"startup_failed: {type(e).__name__}: {e}"
 
-# ==================== 日付/年 抽出（従前どおり） ====================
+# ==================== 日付/年 抽出 ====================
 JP_DATE_PATTERNS = [
     re.compile(r"^(\d{4})年(\d{1,2})月(\d{1,2})日?$"),
     re.compile(r"^(\d{4})年(\d{1,2})月$"),
@@ -243,18 +242,42 @@ def _record_years(rec: Dict[str, Any]) -> List[int]:
 RANGE_SEP = r"(?:-|–|—|~|〜|～|\.{2})"
 
 def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tuple[int,int]]]:
-    """末尾に 2024 / 2023-2025 などがあれば切り出す（従前通り。今は仕様変更せず）"""
+    """
+    末尾に年 or 年範囲があるときだけ年フィルタを発動。
+    さらに「末尾連結の年」（例: 'コンテスト2024'）も年フィルタとして解釈。
+    先頭年（例: '2024コンテスト'）はフィルタ不発（リテラル検索）。
+    """
     q = _nfkc(q_raw).strip()
     if not q: return "", None, None
+
     parts = q.replace("　"," ").split()
-    last = parts[-1] if parts else ""
+    if not parts:
+        return "", None, None
+
+    last = parts[-1]
+
+    # 1) 末尾が「YYYY」だけのトークン
     if re.fullmatch(r"(19|20|21)\d{2}", last):
-        return (" ".join(parts[:-1]).strip(), int(last), None)
-    m = re.fullmatch(rf"((?:19|20|21)\d{{2}})\s*{RANGE_SEP}\s*((?:19|20|21)\d{{2}})", last)
-    if m:
-        y1, y2 = int(m.group(1)), int(m.group(2))
+        base = " ".join(parts[:-1]).strip()
+        return (base, int(last), None)
+
+    # 2) 末尾が「YYYY-YYYY」等のトークン
+    m_rng = re.fullmatch(rf"((?:19|20|21)\d{{2}})\s*{RANGE_SEP}\s*((?:19|20|21)\d{{2}})", last)
+    if m_rng:
+        y1, y2 = int(m_rng.group(1)), int(m_rng.group(2))
         if y1 > y2: y1, y2 = y2, y1
-        return (" ".join(parts[:-1]).strip(), None, (y1, y2))
+        base = " ".join(parts[:-1]).strip()
+        return (base, None, (y1, y2))
+
+    # 3) 末尾連結（例: 'コンテスト2024' → 最後のトークン内部の末尾が年）
+    m_suf = re.fullmatch(rf"^(.*?)(?:((?:19|20|21)\d{{2}}))$", last)
+    if m_suf:
+        prefix, ystr = m_suf.group(1), m_suf.group(2)
+        if prefix:  # prefix が空なら「YYYY」単独なので(1)で拾われる
+            base = " ".join(parts[:-1] + [prefix]).strip()
+            return (base, int(ystr), None)
+
+    # それ以外：年フィルタ不発（リテラル検索）
     return (q, None, None)
 
 def _matches_year(rec: Dict[str, Any], year: Optional[int], yr: Optional[Tuple[int,int]]) -> bool:
@@ -288,31 +311,18 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
     }
     return _get_field(rec, key_map.get(field, [field]))
 
-# ==================== クエリ解析（従前どおり） ====================
+# ==================== クエリ解析 ====================
 TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')  # "..." or non-space token
-SUFFIX_SPLIT = ("結果","一覧","発表","報告","ギャラリー")
 
-def _space_variants(term: str) -> List[str]:
-    """例: 'コンテスト結果'→'コンテスト 結果' / 'コンテスト2024'→'コンテスト 2024'（従前仕様）"""
-    t = _nfkc(term)
-    outs: List[str] = []
-    m = re.match(r"^(.*?)(\d{2,})$", t)
-    if m and m.group(1) and m.group(2):
-        outs.append((m.group(1).strip() + " " + m.group(2)).strip())
-    m2 = re.match(r"^([ァ-ンヴーぁ-んー]+)([一-龥]+)$", t)
-    if m2:
-        outs.append(m2.group(1) + " " + m2.group(2))
-    m3 = re.match(r"^([一-龥]+)([ァ-ンヴーぁ-んー]+)$", t)
-    if m3:
-        outs.append(m3.group(1) + " " + m3.group(2))
-    for suf in SUFFIX_SPLIT:
-        if t.endswith(suf) and len(t) > len(suf):
-            outs.append(t[:-len(suf)].strip() + " " + suf)
-            break
-    return [o for o in outs if o and o != t]
-
+# 以前の「空白なし⇔あり」同義化は仕様上OFFにするため、_space_variants は使わない
 def _expand_term_forms(term: str) -> List[str]:
-    """表記ゆれ（かな/カナ/同義）＋ 空白あり/なしのバリアント（従前仕様）"""
+    """
+    仕様に基づき、単語の自動分割・空白バリアントは生成しない。
+    行うのは：
+      - NFKC 正規化
+      - かな/カナ相互
+      - 登録同義語（苔/コケ/こけ）
+    """
     term = normalize_text(term)
     forms = [term]
     h = to_hira(term); k = to_kata(h)
@@ -325,51 +335,55 @@ def _expand_term_forms(term: str) -> List[str]:
             ah = to_hira(alt_n); ak = to_kata(ah)
             for x in (ah, ak):
                 if x and x not in forms: forms.append(x)
-    more: List[str] = []
-    for f in list(forms):
-        more += _space_variants(f)
-    for m in more:
-        if m not in forms: forms.append(m)
     return forms
 
 def parse_query(q: str) -> Tuple[List[List[str]], List[List[str]], List[str], List[str]]:
     base = normalize_text(q)
     if not base:
         return [], [], [], []
+
     pos_groups: List[List[str]] = []
     neg_groups: List[List[str]] = []
     phrases: List[str] = []
     hl_terms: List[str] = []
+
     for m in TOKEN_RE.finditer(base):
         token = m.group(1) if m.group(1) is not None else m.group(2)
         if not token: continue
+
         if m.group(1) is not None:
             phrase = normalize_text(token)
             phrases.append(phrase)
+            # ハイライト用にはフレーズ内の語を分割吸収（表示の見やすさ向上目的）
             for t in re.split(r"\s+", phrase.strip()):
                 if t:
                     for f in _expand_term_forms(t):
                         if f not in hl_terms: hl_terms.append(f)
             continue
+
         is_neg = token.startswith("-")
         if is_neg:
             token = token[1:].strip()
             if not token: continue
+
         or_parts = [p for p in token.split("|") if p]
         group: List[str] = []
         for p in or_parts:
             for f in _expand_term_forms(p):
                 if f not in group: group.append(f)
+
         if not group: continue
+
         if is_neg:
             neg_groups.append(group)
         else:
             pos_groups.append(group)
             for f in group:
                 if f not in hl_terms: hl_terms.append(f)
+
     return pos_groups, neg_groups, phrases, hl_terms
 
-# ==================== マッチ＆スコア（従前どおり） ====================
+# ==================== マッチ＆スコア ====================
 FIELD_WEIGHTS = {"title":12,"text":8,"author":5,"issue":3,"date":2,"category":2,"url":1}
 PHRASE_BONUS_TITLE = 100
 PHRASE_BONUS_TEXT  = 60
@@ -390,6 +404,11 @@ def _contains_all_terms(hay: str, terms: List[str]) -> bool:
     return True
 
 def _count_occurrences(needle: str, hay: str) -> int:
+    """
+    - 単語（空白なし）の場合: 連結語そのものの部分一致回数
+    - 空白が含まれる場合: 各部分がすべて含まれるなら 1（AND）
+    - かな正規化も併用
+    """
     if not needle or not hay: return 0
     if " " in needle.strip():
         parts = [p for p in needle.split(" ") if p]
@@ -419,6 +438,7 @@ def _group_hit_in_any_field(rec: Dict[str, Any], group: List[str]) -> Tuple[bool
     return hit, score_add
 
 def _phrase_match_any_field(rec: Dict[str, Any], phrase: str) -> Tuple[bool, int]:
+    # 従前どおり（フレーズの仕様は今回対象外）
     base = normalize_text(phrase)
     variants = [base]
     if " " in base:
@@ -477,13 +497,8 @@ def highlight_html(text: str, terms: List[str]) -> str:
         esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
     return esc
 
-# --- モジバケ検知・修復（表示専用） ---
 _SUSPICIOUS_SET = set("縺繧譁蜷螟雉邱驕鬮豌菴遘遞逕譬荳辟鬘譟")
-_JP_RANGE = [
-    (0x3040, 0x309F),  # ひらがな
-    (0x30A0, 0x30FF),  # カタカナ
-    (0x4E00, 0x9FFF),  # CJK
-]
+_JP_RANGE = [(0x3040,0x309F),(0x30A0,0x30FF),(0x4E00,0x9FFF)]
 
 def _ratio_suspicious(s: str) -> float:
     if not s: return 0.0
@@ -499,17 +514,12 @@ def _ratio_japanese(s: str) -> float:
     return n / max(1, len(s))
 
 def _try_repairs(s: str) -> str:
-    """
-    代表的なモジバケからの復元を2通り試す。
-    成功判定: 日本語比率の改善、および文字列の変化。
-    """
     cands = []
     try:
         cands.append((s.encode("cp932", errors="ignore").decode("utf-8", errors="ignore"), "cp932->utf8"))
     except Exception:
         pass
     try:
-        # latin1 バイト経由で cp932 デコード（環境により有効な場合あり）
         b = s.encode("latin1", errors="ignore")
         cands.append((b.decode("cp932", errors="ignore"), "latin1->cp932"))
     except Exception:
@@ -525,16 +535,11 @@ def _try_repairs(s: str) -> str:
     return best
 
 def maybe_repair_for_display(s: str, kind: str) -> str:
-    """
-    表示専用の自動修復。元文字列は保持。
-    kind: "title" or "snippet"（統計用）
-    """
     if not MOJIBAKE_REPAIR or not s:
         return s
     suspicious = _ratio_suspicious(s)
-    if suspicious < 0.12:  # しきい値（経験則）
+    if suspicious < 0.12:
         return s
-    # 診断カウント（疑い）
     if kind == "title":
         _REPAIR_STATS["title_suspected"] += 1
     else:
@@ -579,7 +584,6 @@ def make_hit_snippet(body: str, terms: List[str], max_chars: int, side: int = 80
 def build_item(rec: Dict[str, Any], hl_terms: List[str], is_first_in_page: bool) -> Dict[str, Any]:
     title = record_as_text(rec, "title") or "(無題)"
     body  = record_as_text(rec, "text")
-    # 表示前にモジバケ修復 → ハイライト
     title_disp = maybe_repair_for_display(title, "title")
     title_h = highlight_html(title_disp, hl_terms)
     snippet = (
@@ -632,7 +636,7 @@ def version():
     return json_utf8({"version": VERSION})
 
 @app.get("/diag")
-def diag(q: str = Query("", description="クエリ（年尾解析の確認用）")):
+def diag(q: str = Query("", description="クエリ解析＆年尾解釈の確認用")):
     base_q, y, yr = _parse_year_from_query(q)
     return json_utf8({
         "kb": {"path": KB_PATH, "exists": os.path.exists(KB_PATH), "lines": KB_LINES, "sha256": KB_HASH, "url": KB_URL},
@@ -661,7 +665,7 @@ def admin_refresh():
 
 @app.get("/api/search")
 def api_search(
-    q: str = Query("", description="検索クエリ（末尾に年/年範囲も可：例『コンテスト 2024』『剪定 1999〜2001』）"),
+    q: str = Query("", description="検索クエリ（末尾年/年範囲でフィルタ可：例『コンテスト2024』『剪定 1999〜2001』）"),
     page: int = Query(1, ge=1),
     page_size: int = Query(5, ge=1, le=50),
     order: str = Query("relevance", pattern="^(relevance|latest)$"),
@@ -675,7 +679,7 @@ def api_search(
             return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
                               "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order})
 
-        # 末尾の年/範囲（従前仕様）
+        # 末尾の年/範囲のみ年フィルタ
         base_q, year_tail, yr_tail = _parse_year_from_query(q)
         q_used = base_q
 
