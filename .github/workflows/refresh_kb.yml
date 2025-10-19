@@ -1,114 +1,55 @@
-# refresh_kb.py — Notion → kb.jsonl 変換（自動タイトル検出＋DBID両対応）
-# version: 2025-10-20-failsafe
+name: Refresh KB Daily
 
-import os, json, requests, datetime as dt
+on:
+  workflow_dispatch:
+  schedule:
+    # 毎日 03:00 JST（= 18:00 UTC）
+    - cron: "0 18 * * *"
 
-# ==== Notion 認証 ====
-NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
-# まず既存仕様 NOTION_DB_ID を優先し、無ければ NOTION_DATABASE_ID をフォールバック
-NOTION_DATABASE_ID = os.getenv("NOTION_DB_ID", "") or os.getenv("NOTION_DATABASE_ID", "")
+jobs:
+  build:
+    runs-on: ubuntu-latest
 
-FIELD_TITLE        = os.getenv("FIELD_TITLE", "").strip()
-FIELD_AUTHOR       = os.getenv("FIELD_AUTHOR", "講師/著者")
-FIELD_URL          = os.getenv("FIELD_URL", "出典URL")
-FIELD_TEXT         = os.getenv("FIELD_TEXT", "講習会等内容")
-FIELD_ISSUE        = os.getenv("FIELD_ISSUE", "会報号")
-FIELD_DATE         = os.getenv("FIELD_DATE", "開催日/発行日")
+    # ← ここがポイント：既存の NOTION_DB_ID を正として維持しつつ両対応
+    env:
+      NOTION_TOKEN:        ${{ secrets.NOTION_TOKEN }}
+      NOTION_DB_ID:        ${{ secrets.NOTION_DB_ID }}                      # 既存仕様（これが空だと今回のエラー）
+      NOTION_DATABASE_ID:  ${{ secrets.NOTION_DATABASE_ID || secrets.NOTION_DB_ID }}  # どちらでも可にする
+      # 列名はスクリプトが自動検出するので必須ではありません（必要なら指定してください）
+      # FIELD_TITLE: "Name"
+      FIELD_AUTHOR: "講師/著者"
+      FIELD_URL:    "出典URL"
+      FIELD_TEXT:   "講習会等内容"
+      FIELD_ISSUE:  "会報号"
+      FIELD_DATE:   "開催日/発行日"
 
-HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json",
-}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-def pick_title_property(props: dict) -> str:
-    """FIELD_TITLE が無い・不一致でも自動で title 型を探す"""
-    if FIELD_TITLE and FIELD_TITLE in props and props[FIELD_TITLE].get("type") == "title":
-        return FIELD_TITLE
-    for k, v in props.items():
-        if v.get("type") == "title":
-            return k
-    return ""
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
 
-def get_plain_text(prop: dict, key: str, kind: str = "text") -> str:
-    """Notion プロパティのテキスト抽出（text/rich_text/title 対応）"""
-    val = prop.get(key, [])
-    if not isinstance(val, list):
-        return str(val)
-    return "".join([t.get("plain_text", "") for t in val]).strip()
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-def extract_value(page: dict, field: str, default="") -> str:
-    props = page.get("properties", {})
-    if field not in props:
-        return default
-    p = props[field]
-    t = p.get("type")
-    if t in ("title", "rich_text"):
-        return get_plain_text(p, t)
-    elif t == "date":
-        date = p["date"]
-        return date.get("start") if date else default
-    elif t == "multi_select":
-        return ",".join([x["name"] for x in p["multi_select"]])
-    elif t == "url":
-        return p.get("url") or default
-    elif t == "people":
-        return ",".join([x.get("name", "") for x in p["people"]])
-    elif t == "number":
-        return str(p.get("number", default))
-    elif t == "select":
-        s = p.get("select")
-        return s.get("name") if s else default
-    else:
-        return str(p.get(t, default))
+      # 互換のため、どちら名でも子プロセスに確実に渡す（保険）
+      - name: Export env (compat)
+        run: |
+          echo "NOTION_DB_ID=${NOTION_DB_ID}" >> $GITHUB_ENV
+          echo "NOTION_DATABASE_ID=${NOTION_DATABASE_ID}" >> $GITHUB_ENV
 
-def fetch_pages():
-    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    data = {"page_size": 100}
-    all_pages = []
-    while True:
-        res = requests.post(url, headers=HEADERS, json=data)
-        res.raise_for_status()
-        js = res.json()
-        all_pages += js.get("results", [])
-        if not js.get("has_more"):
-            break
-        data["start_cursor"] = js["next_cursor"]
-    return all_pages
+      - name: Build kb.jsonl from Notion
+        run: python refresh_kb.py
 
-def build_kb():
-    pages = fetch_pages()
-    records = []
-    for page in pages:
-        props = page.get("properties", {})
-        title_key = pick_title_property(props)
-        title_val = extract_value(page, title_key, default="(無題)")
-        records.append({
-            "issue": extract_value(page, FIELD_ISSUE),
-            "date_primary": extract_value(page, FIELD_DATE),
-            "author": extract_value(page, FIELD_AUTHOR),
-            "title": title_val,
-            "text": extract_value(page, FIELD_TEXT),
-            "url": extract_value(page, FIELD_URL),
-        })
-    return records
-
-def save_jsonl(records):
-    out = "kb.jsonl"
-    with open(out, "w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"[OK] wrote {len(records)} records to {out}")
-
-if __name__ == "__main__":
-    if not NOTION_TOKEN or not NOTION_DATABASE_ID:
-        dbid_len = len(os.getenv("NOTION_DB_ID", ""))
-        dbid2_len = len(os.getenv("NOTION_DATABASE_ID", ""))
-        raise SystemExit(
-            f"❌ Notion認証不足: NOTION_TOKEN={bool(NOTION_TOKEN)} "
-            f"/ NOTION_DB_ID.len={dbid_len} / NOTION_DATABASE_ID.len={dbid2_len}"
-        )
-    print("[INFO] building KB…")
-    recs = build_kb()
-    save_jsonl(recs)
-    print("[DONE] kb.jsonl updated at", dt.datetime.now().isoformat())
+      - name: Commit & Push
+        run: |
+          git config user.name  "actions-user"
+          git config user.email "actions@github"
+          git add -A
+          git commit -m "Auto update KB $(date +%s)" || echo "no changes"
+          git push
