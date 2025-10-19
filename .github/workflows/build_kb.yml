@@ -1,0 +1,62 @@
+name: Build KB (Notion → JSONL)
+
+on:
+  schedule:
+    # 03:00 JST = 18:00 UTC
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # kb.jsonl をコミットするため
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  build-kb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyyaml
+
+      - name: Build kb.jsonl from Notion
+        run: |
+          python scripts/build_kb.py \
+            --db-id "${{ secrets.NOTION_DB_ID }}" \
+            --token "${{ secrets.NOTION_TOKEN }}" \
+            --mapping "kb_mapping.yaml" \
+            --out "kb.jsonl" \
+            --validate-title-contains "コンテスト結果>=6"
+
+      - name: Show summary
+        run: |
+          echo "---- kb head ----"; head -n 3 kb.jsonl || true
+          echo "---- stats ----";  wc -l kb.jsonl || true
+          sha256sum kb.jsonl || true
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name  "actions-user"
+          git config user.email "actions@users.noreply.github.com"
+          git add kb.jsonl
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto update KB ${{ github.run_id }}"
+            git push
+          else
+            echo "No changes in kb.jsonl"
+          fi
+
+      - name: Trigger Render deploy (optional)
+        if: ${{ secrets.RENDER_DEPLOY_HOOK != '' }}
+        run: |
+          curl -fsSL -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}" || true
