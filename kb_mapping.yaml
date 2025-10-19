@@ -1,0 +1,29 @@
+# Notion→JSONLのフィールド対応と優先順位
+fields:
+  title: auto_title_property   # ←「型」が title のプロパティを自動検出（名前に依存しない）
+  text:
+    prefer: ["講習会等内容", "本文", "内容", "記事", "テキスト"]
+    fallback: page_blocks      # 上記が無い時は本文ブロックを連結
+  url:
+    prefer: ["出典URL", "URL", "リンク"]
+    fallback: notion_page_url  # 無ければ Notion のページURLを生成
+  date:
+    prefer: ["開催日/発行日", "開催日", "発行日", "日付"]
+    fallback: ""               # 使わない場合は空のまま
+  author:
+    prefer: ["講師/著者", "講師", "著者"]
+  category:
+    prefer: ["資料区分", "区分", "カテゴリ", "カテゴリー", "タグ"]
+  issue:
+    prefer: ["会報号", "号", "No"]
+
+normalize:
+  keep_newlines: true          # text は改行保持（抽出見出しにも使うため）
+  nfkc: true                   # 全角/半角の正規化ON
+  collapse_blanklines: true
+
+validate:
+  no_empty_title: true
+  title_contains:
+    - needle: "コンテスト結果"
+      min: 6
