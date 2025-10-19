@@ -2,11 +2,9 @@ name: Refresh KB Daily
 
 on:
   schedule:
-    - cron: '0 18 * * *'   # JST 03:00（UTC 18:00）
-  workflow_dispatch: {}
-
-permissions:
-  contents: write
+    # 毎日 午前3時（日本時間 JST = UTC+9）
+    - cron: "0 18 * * *"  # UTC18時 = JST3時
+  workflow_dispatch:  # 手動実行も残す
 
 jobs:
   refresh_kb:
