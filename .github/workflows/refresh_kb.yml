@@ -16,7 +16,7 @@ jobs:
       NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
 
       # ---- 列名マッピング（実DBと一致させる）----
-      FIELD_TITLE: "Miniature Rose Digital Archivタイトル／テーマ"
+      FIELD_TITLE: "Name"
       FIELD_AUTHOR: "講師/著者"
       FIELD_URL: "出典URL"
       FIELD_TEXT: "講習会等内容"
