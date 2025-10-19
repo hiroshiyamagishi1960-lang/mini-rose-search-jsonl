@@ -1,377 +1,642 @@
-# app.py — Mini Rose Search API（Notion直読みロールバック版）
-# 版: notion-direct-rollback-2025-10-19
-# 方針:
-# - データ源を Notion DB へ切り戻し（kb.jsonl は参照しない）
-# - 起動後は Notion をキャッシュ（メモリ常駐）。TTL内は再読込しない（高速化）
-# - 検索対象は title + body（タイトルだけ一致も必ず拾う）
-# - 表記ゆれ吸収: NFKC（全角/半角・記号・スペース）、苔/コケ/こけ、年+語の連結/分割
-# - ハイライトは title/本文の両方に <mark>…</mark>
-# - フレーズ(strict_phrase) と 分割一致（語単位）を両立。re は事前コンパイル
-# - API: /version /health /diag /api/search /ui（既存UIをそのまま配信）
+# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版）
+# 追加: 年尾/年範囲の自動解釈＆フィルタ / 「空白なし⇔空白あり」同義化 / "フレーズ"を全フィールド対象に
+# 既存機能: JSONL取得（配列→JSONL自動変換）/ 健康診断 / かな正規化 / 同義語（苔=コケ=こけ など）
 
-import os, re, json, unicodedata, time, datetime as dt
-from typing import List, Dict, Any, Optional, Tuple
+import os, io, re, json, hashlib, unicodedata
+from datetime import datetime, date
+from typing import List, Dict, Any, Tuple, Optional
+
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import requests
 
-APP_VERSION = "notion-direct-rollback-2025-10-19"
+try:
+    import requests
+except Exception:
+    requests = None
 
-# ==== 環境変数 ====
-NOTION_TOKEN       = os.getenv("NOTION_TOKEN", "")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
-FIELD_URL          = os.getenv("FIELD_URL", "出典URL")
-CACHE_TTL_SECONDS  = int(os.getenv("CACHE_TTL_SECONDS", "600"))  # 10分
+# ==================== 初期化 ====================
+app = FastAPI(title="mini-rose-search-jsonl (kb.jsonl)")
 
-# ==== FastAPI 基本 ====
-app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
 )
 
-# UI 配信（既存の static をそのまま）
-if os.path.isdir("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+# ==================== 設定 ====================
+KB_URL   = (os.getenv("KB_URL", "") or "").strip()
+_cfg     = (os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip()
+KB_PATH  = os.path.normpath(_cfg if os.path.isabs(_cfg) else os.path.join(os.getcwd(), _cfg))
+VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-18-general-v5")
 
-# ==== 内部キャッシュ ====
-_CACHE: Dict[str, Any] = {
-    "source": "notion",
-    "rows": [],          # List[Dict]: {"id","title","body","url","date"}
-    "last_sync": 0.0,    # epoch sec
-    "last_count": 0,
-}
+# ==================== 診断用 ====================
+KB_LINES: int = 0
+KB_HASH:  str = ""
+LAST_ERROR: str = ""
+LAST_EVENT: str = ""
 
-# ==== 正規表現 / 正規化 ====
-_WS_RE = re.compile(r"\s+")
-# ひら/カタ/漢字の境界を厳密に取れない日本語の都合上、単純含有ベースで安全運用
+def _nfkc(s: Optional[str]) -> str:
+    return unicodedata.normalize("NFKC", s or "")
+
+# ==================== かな正規化 ====================
+KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
+HIRA_TO_KATA = str.maketrans({chr(h): chr(h + 0x60) for h in range(ord("ぁ"), ord("ん") + 1)})
+
+def to_hira(s: str) -> str:
+    return (s or "").translate(KATA_TO_HIRA)
+
+def to_kata(s: str) -> str:
+    return (s or "").translate(HIRA_TO_KATA)
+
 def normalize_text(s: str) -> str:
     if not s:
         return ""
     s = unicodedata.normalize("NFKC", s)
-    # 制御文字系や過剰空白を整理
-    s = s.replace("\u200b", "")
-    s = _WS_RE.sub(" ", s).strip()
+    s = s.replace("\u3000", " ")
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def expand_query_terms(q: str) -> Tuple[str, List[str]]:
-    """
-    入力クエリを NFKC 正規化し、
-    ・フレーズ判定（ダブルクオート囲み） → phrase
-    ・語単位（スペース区切り） → terms
-    ・苔/コケ/こけ の表記ゆれ展開
-    ・数値＋語の連結/分割（例: 2024コンテスト結果 / 2024 コンテスト結果）
-    """
-    q_raw = q or ""
-    q_n = normalize_text(q_raw)
+def textify(x: Any) -> str:
+    if x is None: return ""
+    if isinstance(x, str): return x
+    try:
+        return json.dumps(x, ensure_ascii=False)
+    except Exception:
+        return str(x)
 
-    phrase = ""
-    # "..." フレーズ抽出（最初の "" ペアのみを扱う）
-    if len(q_n) >= 2 and q_n[0] == '"' and q_n[-1] == '"':
-        phrase = q_n.strip('"')
-    # 語単位
-    terms = [t for t in q_n.strip('"').split(" ") if t]
-
-    # 表記ゆれ（苔）
-    alt_map = {"苔": ["苔", "コケ", "こけ"], "コケ": ["苔", "コケ", "こけ"], "こけ": ["苔", "コケ", "こけ"]}
-    expanded: List[str] = []
-    for t in terms:
-        if t in alt_map:
-            expanded.extend(alt_map[t])
-        else:
-            expanded.append(t)
-
-    # 数字＋語の連結/分割 同値扱い（例: "2024コンテスト結果" → ["2024 コンテスト結果", ...] も試す）
-    # ここではシンプルに: 連続数字+非空白を1箇所だけ分割生成
-    add_terms: List[str] = []
-    for t in list(expanded):
-        m = re.match(r"^(\d{4,})(.+)$", t)
-        if m:
-            add_terms.append(f"{m.group(1)} {m.group(2)}")
-    expanded.extend(add_terms)
-
-    # 重複削除
-    seen = set()
-    uniq = []
-    for t in expanded:
-        if t not in seen:
-            uniq.append(t)
-            seen.add(t)
-
-    return phrase, uniq
-
-def compile_patterns(phrase: str, terms: List[str]) -> Tuple[Optional[re.Pattern], List[re.Pattern]]:
-    # フレーズ用
-    phrase_re = re.compile(re.escape(phrase)) if phrase else None
-    # 語単位（日本語なので単純含有）
-    term_res = [re.compile(re.escape(t)) for t in terms if t]
-    return phrase_re, term_res
-
-def highlight_text(text: str, phrase_re: Optional[re.Pattern], term_res: List[re.Pattern]) -> str:
-    if not text:
-        return ""
-    s = text
-    # まずフレーズ（長いもの優先）
-    if phrase_re:
-        s = phrase_re.sub(lambda m: f"<mark>{m.group(0)}</mark>", s)
-    # 次に語単位
-    for r in term_res:
-        s = r.sub(lambda m: f"<mark>{m.group(0)}</mark>", s)
-    return s
-
-# ==== Notion API ====
-_NOTION_BASE = "https://api.notion.com/v1"
-_NOTION_HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json",
+# ==================== 同義語（最小） ====================
+SYNONYMS: Dict[str, List[str]] = {
+    "苔": ["コケ", "こけ"],
+    "コケ": ["苔", "こけ"],
+    "こけ": ["苔", "コケ"],
+    # 競合語の軽い言い換え（例示）
+    "コンテスト": ["大会", "コンクール", "品評会"],
 }
 
-def _notion_ok() -> bool:
-    return bool(NOTION_TOKEN and NOTION_DATABASE_ID)
+# ==================== KB 取得（配列→JSONL 化） ====================
+def _bytes_to_jsonl(blob: bytes) -> bytes:
+    if not blob: return b""
+    s = blob.decode("utf-8", errors="replace").strip()
+    if not s: return b""
+    if s.startswith("["):
+        try:
+            data = json.loads(s)
+            if isinstance(data, list):
+                lines = [json.dumps(obj, ensure_ascii=False, separators=(",", ":")) for obj in data]
+                return ("\n".join(lines) + "\n").encode("utf-8")
+        except Exception:
+            return blob
+    return blob
 
-def _extract_rich_text(prop: Dict[str, Any]) -> str:
-    """title / rich_text の文字列を結合"""
-    if not prop:
-        return ""
-    buf: List[str] = []
-    if prop.get("type") == "title":
-        for t in prop.get("title", []):
-            buf.append(t.get("plain_text", ""))
-    elif prop.get("type") == "rich_text":
-        for t in prop.get("rich_text", []):
-            buf.append(t.get("plain_text", ""))
+def _compute_lines_and_hash(path: str) -> Tuple[int, str]:
+    cnt = 0
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for line in f:
+            sha.update(line)
+            if line.strip():
+                cnt += 1
+    return cnt, sha.hexdigest()
+
+def ensure_kb() -> Tuple[int, str]:
+    global LAST_ERROR, LAST_EVENT
+    LAST_ERROR = ""; LAST_EVENT = ""
+    if KB_URL:
+        if requests is None:
+            LAST_ERROR = "requests unavailable"
+        else:
+            try:
+                r = requests.get(KB_URL, timeout=30)
+                r.raise_for_status()
+                blob = _bytes_to_jsonl(r.content)
+                tmp = KB_PATH + ".tmp"
+                os.makedirs(os.path.dirname(KB_PATH), exist_ok=True) if os.path.dirname(KB_PATH) else None
+                with open(tmp, "wb") as wf:
+                    wf.write(blob)
+                os.replace(tmp, KB_PATH)
+                LAST_EVENT = "fetched"
+            except Exception as e:
+                LAST_ERROR = f"fetch_or_save_failed: {type(e).__name__}: {e}"
+    if os.path.exists(KB_PATH):
+        try:
+            lines, sha = _compute_lines_and_hash(KB_PATH)
+            if lines <= 0:
+                LAST_EVENT = LAST_EVENT or "empty_file"
+            return lines, sha
+        except Exception as e:
+            LAST_ERROR = f"hash_failed: {type(e).__name__}: {e}"
+            return 0, ""
     else:
-        # その他タイプ（multi_select / number / date / select / url 等）は簡易に文字化
-        typ = prop.get("type")
-        if typ == "multi_select":
-            vals = [x.get("name", "") for x in prop.get("multi_select", [])]
-            buf.append(" ".join(vals))
-        elif typ == "select":
-            v = prop.get("select") or {}
-            buf.append(v.get("name", ""))
-        elif typ == "date":
-            v = prop.get("date") or {}
-            buf.append(v.get("start","") or "")
-        elif typ == "url":
-            buf.append(prop.get("url") or "")
-        elif typ in ("number","checkbox","email","phone_number","people","files"):
-            # 必要になれば拡張
-            pass
-    return normalize_text("".join(buf))
+        LAST_EVENT = LAST_EVENT or "no_file"
+        return 0, ""
 
-def _page_to_row(page: Dict[str, Any]) -> Dict[str, Any]:
-    pid = page.get("id","")
-    props = page.get("properties", {}) or {}
-    title = ""
-    body_parts: List[str] = []
-    url = ""
-    date_str = ""
+@app.on_event("startup")
+def _startup():
+    global KB_LINES, KB_HASH
+    try:
+        KB_LINES, KB_HASH = ensure_kb()
+    except Exception as e:
+        KB_LINES, KB_HASH = 0, ""
+        LAST_ERROR = f"startup_failed: {type(e).__name__}: {e}"
 
-    # 1) title プロパティを特定（type=title の最初）
-    for name, p in props.items():
-        if isinstance(p, dict) and p.get("type") == "title":
-            title = _extract_rich_text(p)
+# ==================== 日付/年 抽出 ====================
+JP_DATE_PATTERNS = [
+    re.compile(r"^(\d{4})年(\d{1,2})月(\d{1,2})日?$"),
+    re.compile(r"^(\d{4})年(\d{1,2})月$"),
+    re.compile(r"^(\d{4})年$"),
+]
+
+def parse_date_str(s: str) -> Optional[datetime]:
+    if not s: return None
+    s = normalize_text(s)
+    for pat in JP_DATE_PATTERNS:
+        m = pat.match(s)
+        if m:
+            y = int(m.group(1))
+            mth = int(m.group(2)) if len(m.groups()) >= 2 and m.group(2) else 1
+            day = int(m.group(3)) if len(m.groups()) >= 3 and m.group(3) else 1
+            try: return datetime(y, mth, day)
+            except Exception: return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y-%m", "%Y/%m", "%Y.%m", "%Y"):
+        try: return datetime.strptime(s[:len(fmt)], fmt)
+        except Exception: continue
+    m = re.match(r"^(\d{4})", s)
+    if m:
+        try: return datetime(int(m.group(1)), 1, 1)
+        except Exception: return None
+    return None
+
+def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
+    for k in ("date", "date_primary", "Date", "published_at", "published", "created_at"):
+        d = rec.get(k)
+        if d:
+            dt = parse_date_str(textify(d))
+            if dt: return dt
+    return None
+
+YEAR_RE = re.compile(r"(19\d{2}|20\d{2}|21\d{2})")
+
+def _years_from_text(s: str) -> List[int]:
+    if not s: return []
+    s = _nfkc(textify(s))
+    ys = [int(y) for y in YEAR_RE.findall(s)]
+    return sorted(set(ys))
+
+def _record_years(rec: Dict[str, Any]) -> List[int]:
+    ys = set()
+    d = record_date(rec)
+    if d: ys.add(d.year)
+    for field in ("issue","title","text","url","category","author"):
+        v = rec.get(field) if field in rec else None
+        if v:
+            for y in _years_from_text(v):
+                ys.add(y)
+    return sorted(ys)
+
+RANGE_SEP = r"(?:-|–|—|~|〜|～|\.{2})"
+
+def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tuple[int,int]]]:
+    """末尾に 2024 / 2023-2025 などがあれば切り出す（全角可）"""
+    q = _nfkc(q_raw).strip()
+    if not q: return "", None, None
+    parts = q.replace("　"," ").split()
+    last = parts[-1] if parts else ""
+    if re.fullmatch(r"(19|20|21)\d{2}", last):
+        return (" ".join(parts[:-1]).strip(), int(last), None)
+    m = re.fullmatch(rf"((?:19|20|21)\d{{2}})\s*{RANGE_SEP}\s*((?:19|20|21)\d{{2}})", last)
+    if m:
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        if y1 > y2: y1, y2 = y2, y1
+        return (" ".join(parts[:-1]).strip(), None, (y1, y2))
+    return (q, None, None)
+
+def _matches_year(rec: Dict[str, Any], year: Optional[int], yr: Optional[Tuple[int,int]]) -> bool:
+    if year is None and yr is None: return True
+    ys = _record_years(rec)
+    if not ys: return False
+    if year is not None: return year in ys
+    lo, hi = yr[0], yr[1]
+    return any(lo <= y <= hi for y in ys)
+
+# ==================== フィールド抽出 ====================
+TITLE_KEYS = ["title", "Title", "name", "Name", "page_title", "source_title", "heading", "headline", "subject"]
+TEXT_KEYS  = ["text", "content", "body", "description", "summary", "note", "content_full", "excerpt"]
+
+def _get_field(rec: Dict[str, Any], keys: List[str]) -> str:
+    for k in keys:
+        v = rec.get(k)
+        if v:
+            return textify(v)
+    return ""
+
+def record_as_text(rec: Dict[str, Any], field: str) -> str:
+    key_map = {
+        "title": TITLE_KEYS,
+        "text":  TEXT_KEYS,
+        "author": ["author", "Author", "writer", "posted_by"],
+        "issue":  ["issue", "Issue"],
+        "date":   ["date", "date_primary", "Date", "published_at", "published", "created_at"],
+        "category": ["category", "Category", "tags", "Tags"],
+        "url":    ["url", "source", "link", "permalink"],
+    }
+    return _get_field(rec, key_map.get(field, [field]))
+
+# ==================== クエリ解析 ====================
+TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')  # "..." or non-space token
+
+# --- 空白あり/なし 同義化のためのスペース入りバリアントを作る ---
+SUFFIX_SPLIT = ("結果","一覧","発表","報告","ギャラリー")
+
+def _space_variants(term: str) -> List[str]:
+    """例: 'コンテスト結果'→'コンテスト 結果' / 'コンテスト2024'→'コンテスト 2024'"""
+    t = _nfkc(term)
+    outs = []
+    # 数字ブロックを末尾から切る
+    m = re.match(r"^(.*?)(\d{2,})$", t)
+    if m and m.group(1) and m.group(2):
+        outs.append((m.group(1).strip() + " " + m.group(2)).strip())
+
+    # カナ → 漢字／漢字 → カナ の境界で分割（例: コンテスト|結果）
+    m2 = re.match(r"^([ァ-ンヴーぁ-んー]+)([一-龥]+)$", t)
+    if m2:
+        outs.append(m2.group(1) + " " + m2.group(2))
+    m3 = re.match(r"^([一-龥]+)([ァ-ンヴーぁ-んー]+)$", t)
+    if m3:
+        outs.append(m3.group(1) + " " + m3.group(2))
+
+    # よくある接尾語で分割
+    for suf in SUFFIX_SPLIT:
+        if t.endswith(suf) and len(t) > len(suf):
+            outs.append(t[:-len(suf)].strip() + " " + suf)
             break
+    return [o for o in outs if o and o != t]
 
-    # 2) body 候補（rich_text / その他文字化）をまとめて body に
-    for name, p in props.items():
-        if not isinstance(p, dict):
+def _expand_term_forms(term: str) -> List[str]:
+    """表記ゆれ（かな/カナ/同義）＋ 空白あり/なしのバリアント"""
+    term = normalize_text(term)
+    forms = [term]
+
+    # かな・カナ相互
+    h = to_hira(term); k = to_kata(h)
+    for x in (h, k):
+        if x and x not in forms: forms.append(x)
+
+    # 同義語
+    for key in [term, h, k]:
+        for alt in SYNONYMS.get(key, []):
+            alt_n = normalize_text(alt)
+            if alt_n and alt_n not in forms: forms.append(alt_n)
+            ah = to_hira(alt_n); ak = to_kata(ah)
+            for x in (ah, ak):
+                if x and x not in forms: forms.append(x)
+
+    # 空白あり/なしの相互バリアント
+    more = []
+    for f in list(forms):
+        more += _space_variants(f)
+    for m in more:
+        if m not in forms: forms.append(m)
+
+    return forms
+
+def parse_query(q: str) -> Tuple[List[List[str]], List[List[str]], List[str], List[str]]:
+    """
+    戻り値:
+      pos_groups: ANDの各グループ（要素は OR のリスト）
+      neg_groups: NOT の各グループ
+      phrases:    ダブルクォートのフレーズ（必須条件）
+      hl_terms:   ハイライト用語
+    """
+    base = normalize_text(q)
+    if not base:
+        return [], [], [], []
+
+    pos_groups: List[List[str]] = []
+    neg_groups: List[List[str]] = []
+    phrases: List[str] = []
+    hl_terms: List[str] = []
+
+    for m in TOKEN_RE.finditer(base):
+        token = m.group(1) if m.group(1) is not None else m.group(2)
+        if not token: continue
+
+        if m.group(1) is not None:
+            # フレーズ（"..."）は必須条件に。※後段で全フィールド対象でチェック
+            phrases.append(normalize_text(token))
+            for t in re.split(r"\s+", token.strip()):
+                if t:
+                    for f in _expand_term_forms(t):
+                        if f not in hl_terms: hl_terms.append(f)
             continue
-        txt = _extract_rich_text(p)
-        if txt:
-            body_parts.append(f"{name}: {txt}")
-        # URL 候補
-        if name == FIELD_URL and p.get("type") == "url":
-            url = p.get("url") or url
-        # date 候補（最初の date）
-        if not date_str and p.get("type") == "date":
-            v = p.get("date") or {}
-            date_str = v.get("start","") or ""
 
-    body = normalize_text("\n".join(body_parts))
+        is_neg = token.startswith("-")
+        if is_neg:
+            token = token[1:].strip()
+            if not token: continue
 
-    # URL フォールバック（Notion固有URL：共有設定がPublicでないと外部は見えない点に注意）
-    if not url:
-        # ハイフン除去IDで notion.so 直
-        url = f"https://www.notion.so/{pid.replace('-','')}"
+        or_parts = [p for p in token.split("|") if p]
+        group: List[str] = []
+        for p in or_parts:
+            for f in _expand_term_forms(p):
+                if f not in group: group.append(f)
 
-    # date 正規化（YYYY-MM-DD に揃える／無ければ空）
-    if date_str:
-        try:
-            d = dt.datetime.fromisoformat(date_str.replace("Z","").split("T")[0])
-            date_str = d.strftime("%Y-%m-%d")
-        except Exception:
-            pass
+        if not group: continue
 
-    return {"id": pid, "title": title or "(無題)", "body": body, "url": url, "date": date_str}
+        if is_neg:
+            neg_groups.append(group)
+        else:
+            pos_groups.append(group)
+            for f in group:
+                if f not in hl_terms: hl_terms.append(f)
 
-def fetch_notion_all_rows() -> List[Dict[str, Any]]:
-    """Notion DB を全件取得 → rows へ変換（必要最小限の1パス）。"""
-    if not _notion_ok():
-        return []
-    rows: List[Dict[str, Any]] = []
-    payload = {"page_size": 100}
-    next_cursor = None
-    for _ in range(100):  # safety
-        if next_cursor:
-            payload["start_cursor"] = next_cursor
-        resp = requests.post(f"{_NOTION_BASE}/databases/{NOTION_DATABASE_ID}/query",
-                             headers=_NOTION_HEADERS, data=json.dumps(payload), timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", [])
-        for page in results:
-            rows.append(_page_to_row(page))
-        next_cursor = data.get("next_cursor")
-        if not next_cursor:
-            break
-    return rows
+    return pos_groups, neg_groups, phrases, hl_terms
 
-def ensure_cache(force: bool=False) -> None:
-    now = time.time()
-    if force or (now - _CACHE["last_sync"] > CACHE_TTL_SECONDS) or not _CACHE["rows"]:
-        rows = fetch_notion_all_rows()
-        _CACHE["rows"] = rows
-        _CACHE["last_sync"] = now
-        _CACHE["last_count"] = len(rows)
+# ==================== マッチ＆スコア ====================
+FIELD_WEIGHTS = {
+    "title":   12,
+    "text":     8,
+    "author":   5,
+    "issue":    3,
+    "date":     2,
+    "category": 2,
+    "url":      1,
+}
 
-# ==== 検索 ====
-def match_score(row: Dict[str, Any], phrase_re: Optional[re.Pattern], term_res: List[re.Pattern]) -> Tuple[int,int]:
-    """(score, flags) を返す。score: 大きいほど優先。flags: フレーズ一致、有無などのヒント。"""
-    text = f"{row['title']}\n{row['body']}"
-    score = 0
-    flags = 0
-    if phrase_re and phrase_re.search(text):
-        score += 100
-        flags |= 1
-    # 語単位
-    hits = 0
-    for r in term_res:
-        if r.search(text):
-            hits += 1
-    score += hits * 10
-    # 日付が新しいほど少し優遇
-    if row.get("date"):
-        try:
-            y,m,d = map(int, row["date"].split("-"))
-            score += y  # 年で微加点（同点時の並びを安定化）
-        except Exception:
-            pass
-    return score, flags
+PHRASE_BONUS_TITLE = 100
+PHRASE_BONUS_TEXT  = 60
+PHRASE_BONUS_OTHER = 40  # ← 追加：他フィールドでもフレーズ一致に加点
 
-def search_rows(q: str, page: int, page_size: int, strict_phrase: bool) -> Dict[str, Any]:
-    ensure_cache(force=False)
-    rows = _CACHE["rows"]
+def _norm_pair(s: str) -> Tuple[str, str]:
+    ns = normalize_text(s)
+    return ns, to_hira(ns)
 
-    phrase, terms = expand_query_terms(q or "")
-    if strict_phrase and not phrase:
-        # ユーザーが strict_phrase=1 を指定したのに "..." でない場合は、フレーズ=全文で代替
-        phrase = normalize_text(q or "")
+def _contains_all_terms(hay: str, terms: List[str]) -> bool:
+    if not hay: return False
+    a, ah = _norm_pair(hay)
+    for t in terms:
+        if not t: return False
+        b, bh = _norm_pair(t)
+        if b not in a and bh not in ah:
+            return False
+    return True
 
-    phrase_re, term_res = compile_patterns(phrase if strict_phrase else phrase, terms)
+def _count_occurrences(needle: str, hay: str) -> int:
+    """
+    - 通常: 部分一致回数（NFKC と ひらがな化の双方で数える）
+    - 針にスペースがある場合: 「各部分がすべて含まれる」なら 1 を返す（空白あり/なし同義）
+      例) 'コンテスト 結果' は 'コンテスト結果' や 'コンテスト の 結果' をヒットとみなす
+    """
+    if not needle or not hay: return 0
+    if " " in needle.strip():
+        parts = [p for p in needle.split(" ") if p]
+        return 1 if _contains_all_terms(hay, parts) else 0
+    a, ah = _norm_pair(hay)
+    b, bh = _norm_pair(needle)
+    return a.count(b) + ah.count(bh)
 
-    scored: List[Tuple[int,int,Dict[str,Any]]] = []
-    for r in rows:
-        s, f = match_score(r, phrase_re, term_res)
-        if s > 0:
-            scored.append((s, f, r))
+def _field_texts(rec: Dict[str, Any]) -> Dict[str, str]:
+    out = {}
+    for field in FIELD_WEIGHTS.keys():
+        out[field] = record_as_text(rec, "date") if field == "date" else record_as_text(rec, field)
+    return out
 
-    # スコア降順→日付で暗黙加点しているので概ね新しい順が上に
-    scored.sort(key=lambda x: x[0], reverse=True)
+def _group_hit_in_any_field(rec: Dict[str, Any], group: List[str]) -> Tuple[bool, int]:
+    hit = False; score_add = 0
+    fields = _field_texts(rec)
+    for field, w in FIELD_WEIGHTS.items():
+        s = fields.get(field) or ""
+        if not s: continue
+        c = 0
+        for t in group:
+            c += _count_occurrences(t, s)
+        if c > 0:
+            hit = True
+            score_add += w * c
+    return hit, score_add
 
-    total = len(scored)
-    if page < 1: page = 1
-    if page_size < 1: page_size = 5
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_items = [x[2] for x in scored[start:end]]
+def _phrase_bonus_any_field(rec: Dict[str, Any], phrase: str) -> Tuple[bool, int]:
+    ok = False; add = 0
+    fields = _field_texts(rec)
+    for field, w in FIELD_WEIGHTS.items():
+        s = fields.get(field) or ""
+        if not s: continue
+        if _contains_all_terms(s, [phrase]) or _count_occurrences(phrase, s) > 0:
+            ok = True
+            if field == "title":   add += PHRASE_BONUS_TITLE
+            elif field == "text":  add += PHRASE_BONUS_TEXT
+            else:                  add += PHRASE_BONUS_OTHER
+    return ok, add
 
-    # ハイライト生成（title / body 両方）
-    phrase_re_h, term_res_h = compile_patterns(phrase, terms)
-    items_out = []
-    for r in page_items:
-        title_h = highlight_text(r["title"], phrase_re_h, term_res_h)
-        body_h  = highlight_text(r["body"],  phrase_re_h, term_res_h)
-        # 短いスニペット（長すぎる本文を少しだけ）
-        snippet = body_h
-        if len(snippet) > 600:
-            snippet = snippet[:600] + "…"
-        items_out.append({
-            "title": title_h or "(無題)",
-            "content": snippet,
-            "url": r["url"],
-            "rank": 0,
-            "date": r.get("date",""),
-        })
+def compute_score(rec: Dict[str, Any],
+                  pos_groups: List[List[str]],
+                  neg_groups: List[List[str]],
+                  phrases: List[str]) -> int:
+    # NOT
+    for ng in neg_groups:
+        ok, _ = _group_hit_in_any_field(rec, ng)
+        if ok: return -1
 
+    # AND
+    total = 0
+    for g in pos_groups:
+        ok, add = _group_hit_in_any_field(rec, g)
+        if not ok: return -1
+        total += add
+
+    # フレーズ（必須条件）— 全フィールド対象に拡張
+    if phrases:
+        for p in phrases:
+            ok, add = _phrase_bonus_any_field(rec, p)
+            if not ok: return -1
+            total += add
+
+    return total
+
+# ==================== 抜粋/ハイライト ====================
+TAG_RE = re.compile(r"<[^>]+>")
+
+def html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def highlight(text: str, terms: List[str]) -> str:
+    if not text: return ""
+    esc = html_escape(text)
+    for t in sorted(set(terms), key=len, reverse=True):
+        et = html_escape(t)
+        if not et: continue
+        esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
+    return esc
+
+def make_head_snippet(body: str, terms: List[str], max_chars: int) -> str:
+    if not body: return ""
+    head = body[:max_chars]
+    out = highlight(head, terms)
+    if len(body) > max_chars: out += "…"
+    return out
+
+def make_hit_snippet(body: str, terms: List[str], max_chars: int, side: int = 80) -> str:
+    if not body: return ""
+    marked = highlight(body, terms)
+    plain = TAG_RE.sub("", marked)
+    if not plain: return ""
+    m = re.search(r"<mark>", marked)
+    if not m: return make_head_snippet(body, terms, max_chars)
+    pm = TAG_RE.sub("", marked[:m.start()])
+    pos = len(pm)
+    start = max(0, pos - side); end = min(len(plain), pos + side)
+    snippet_text = plain[start:end]
+    if start > 0: snippet_text = "…" + snippet_text
+    if end < len(plain): snippet_text = snippet_text + "…"
+    snippet_html = highlight(snippet_text, terms)
+    if len(TAG_RE.sub("", snippet_html)) > max_chars + 40:
+        t = TAG_RE.sub("", snippet_html)[:max_chars] + "…"
+        snippet_html = html_escape(t)
+    return snippet_html
+
+def build_item(rec: Dict[str, Any], hl_terms: List[str], is_first_in_page: bool) -> Dict[str, Any]:
+    body = record_as_text(rec, "text")
+    snippet = (
+        make_head_snippet(body, hl_terms, max_chars=300)
+        if is_first_in_page else
+        make_hit_snippet(body, hl_terms, max_chars=160, side=80)
+    )
     return {
-        "items": items_out,
-        "total_hits": total,
-        "page": page,
-        "page_size": page_size,
-        "has_more": end < total,
-        "next_page": (page + 1) if end < total else None,
-        "error": None,
-        "order_used": "relevance",
-        "source": "notion",
+        "title": record_as_text(rec, "title") or "(無題)",
+        "content": snippet,
+        "url": record_as_text(rec, "url"),
+        "rank": None,
+        "date": record_as_text(rec, "date"),
     }
 
-# ==== エンドポイント ====
+# ==================== エンドポイント ====================
+@app.get("/health")
+def health():
+    ok = os.path.exists(KB_PATH) and KB_LINES > 0
+    return {"ok": ok, "kb_url": KB_URL, "kb_size": KB_LINES, "kb_fingerprint": KB_HASH}
 
 @app.get("/version")
 def version():
-    return PlainTextResponse(APP_VERSION, media_type="text/plain; charset=utf-8")
-
-@app.get("/health")
-def health():
-    ok = _notion_ok()
-    ensure_cache(force=False)
-    return JSONResponse({
-        "ok": ok and bool(_CACHE["rows"]),
-        "source": _CACHE["source"],
-        "rows_cached": len(_CACHE["rows"]),
-        "last_sync": _CACHE["last_sync"],
-        "db_id": NOTION_DATABASE_ID[:6] + "…" if NOTION_DATABASE_ID else "",
-        "env": {"APP_VERSION": APP_VERSION},
-    })
+    return {"version": VERSION}
 
 @app.get("/diag")
-def diag():
-    ensure_cache(force=False)
-    return JSONResponse({
-        "source": _CACHE["source"],
-        "rows": _CACHE["last_count"],
-        "cache_ttl": CACHE_TTL_SECONDS,
-        "has_token": bool(NOTION_TOKEN),
-        "has_dbid": bool(NOTION_DATABASE_ID),
-    })
+def diag(q: str = Query("", description="クエリ（年尾解析の確認用）")):
+    base_q, y, yr = _parse_year_from_query(q)
+    return {
+        "kb": {"path": KB_PATH, "exists": os.path.exists(KB_PATH), "lines": KB_LINES, "sha256": KB_HASH, "url": KB_URL},
+        "env": {"APP_VERSION": VERSION, "cwd": os.getcwd()},
+        "last": {"event": LAST_EVENT, "error": LAST_ERROR},
+        "query_parse": {"raw": q, "base_q": base_q, "year": y, "year_range": yr},
+        "ui": {"static_ui_html": os.path.exists(os.path.join("static", "ui.html"))},
+    }
+
+@app.get("/ui")
+def ui():
+    path = os.path.join("static", "ui.html")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="text/html; charset=utf-8")
+    return PlainTextResponse("static/ui.html not found", status_code=404)
+
+def iter_records():
+    if not os.path.exists(KB_PATH): return
+    with io.open(KB_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
 
 @app.get("/api/search")
 def api_search(
-    q: str = Query("", description="検索クエリ。フレーズは \"...\" で指定"),
+    q: str = Query("", description="検索クエリ（末尾に年/年範囲も可：例『コンテスト 2024』『剪定 1999〜2001』）"),
     page: int = Query(1, ge=1),
     page_size: int = Query(5, ge=1, le=50),
-    strict_phrase: int = Query(0, description="1=フレーズのみで照合（分割一致なし）"),
-    refresh: int = Query(0, description="1=Notionを強制再読込"),
+    order: str = Query("relevance", pattern="^(relevance|latest)$"),
 ):
-    if refresh == 1:
-        ensure_cache(force=True)
-    data = search_rows(q=q, page=page, page_size=page_size, strict_phrase=bool(strict_phrase))
-    return JSONResponse(data)
+    """
+    - 空白=AND, '|'=OR, '-語'=NOT, "..."=フレーズ（必須条件）
+    - 入力語は自動分割しないが、「空白なし⇔空白あり」を自動同義化（例: 'コンテスト結果'≒'コンテスト 結果'）
+    - クエリ末尾の 2024 / 1999-2001 等は年フィルタとして解釈
+    """
+    try:
+        if not os.path.exists(KB_PATH) or KB_LINES <= 0:
+            return JSONResponse(
+                {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                 "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order},
+                headers={"Cache-Control": "no-store"},
+            )
 
-@app.get("/")
-def root():
-    return HTMLResponse("<!doctype html><html><head><meta charset='utf-8'><title>Mini Rose</title></head><body><p>OK</p></body></html>")
+        # --- 末尾の年/範囲を解釈（検索語から除去） ---
+        base_q, year_tail, yr_tail = _parse_year_from_query(q)
+        q_used = base_q
 
-# 既存UIがある場合は /ui から参照（static/ui.html をそのまま使う）
-@app.get("/ui")
-def ui_entry():
-    if os.path.exists("static/ui.html"):
-        with open("static/ui.html", "r", encoding="utf-8") as f:
-            html = f.read()
-        return HTMLResponse(html)
-    return HTMLResponse("<p>UI not found. Deploy static/ui.html</p>")
+        pos_groups, neg_groups, phrases, hl_terms = parse_query(q_used)
+        if not pos_groups and not neg_groups and not phrases:
+            return JSONResponse(
+                {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                 "has_more": False, "next_page": None, "error": None, "order_used": order},
+                headers={"Cache-Control": "no-store"},
+            )
+
+        hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = []
+
+        for rec in iter_records():
+            # 年フィルタを先に適用
+            if not _matches_year(rec, year_tail, yr_tail):
+                continue
+
+            score = compute_score(rec, pos_groups, neg_groups, phrases)
+            if score < 0:
+                continue
+            d = record_date(rec)
+            hits.append((score, d, rec))
+
+        total_hits = len(hits)
+
+        # 並び順
+        if order == "latest":
+            hits.sort(key=lambda x: (x[1] or datetime.min), reverse=True)
+            order_used = "latest"
+        else:
+            hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)
+            order_used = "relevance"
+
+        # ページング
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_hits = hits[start:end]
+        has_more = end < total_hits
+        next_page = page + 1 if has_more else None
+
+        # 結果
+        items: List[Dict[str, Any]] = []
+        for i, (_, _d, rec) in enumerate(page_hits):
+            items.append(build_item(rec, hl_terms, is_first_in_page=(i == 0)))
+
+        # rank付与
+        for idx, _ in enumerate(hits, start=1):
+            if start < idx <= end:
+                items[idx - start - 1]["rank"] = idx
+
+        return JSONResponse(
+            {"items": items, "total_hits": total_hits, "page": page, "page_size": page_size,
+             "has_more": has_more, "next_page": next_page, "error": None, "order_used": order_used},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            {"items": [], "total_hits": 0, "page": 1, "page_size": page_size,
+             "has_more": False, "next_page": None, "error": "exception", "message": textify(e)},
+            headers={"Cache-Control": "no-store"},
+        )
+
+# ==================== ローカル実行 ====================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
