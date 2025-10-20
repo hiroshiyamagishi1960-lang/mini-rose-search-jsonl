@@ -3,20 +3,19 @@ name: Refresh KB Daily
 on:
   workflow_dispatch:
   schedule:
-    # 毎日 03:00 JST（= 18:00 UTC）
-    - cron: "0 18 * * *"
+    - cron: "0 18 * * *"   # JST毎日03:00
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
-    # ← ここがポイント：既存の NOTION_DB_ID を正として維持しつつ両対応
     env:
       NOTION_TOKEN:        ${{ secrets.NOTION_TOKEN }}
-      NOTION_DB_ID:        ${{ secrets.NOTION_DB_ID }}                      # 既存仕様（これが空だと今回のエラー）
-      NOTION_DATABASE_ID:  ${{ secrets.NOTION_DATABASE_ID || secrets.NOTION_DB_ID }}  # どちらでも可にする
-      # 列名はスクリプトが自動検出するので必須ではありません（必要なら指定してください）
-      # FIELD_TITLE: "Name"
+      NOTION_DB_ID:        ${{ secrets.NOTION_DB_ID }}
+      NOTION_DATABASE_ID:  ${{ secrets.NOTION_DATABASE_ID || secrets.NOTION_DB_ID }}
       FIELD_AUTHOR: "講師/著者"
       FIELD_URL:    "出典URL"
       FIELD_TEXT:   "講習会等内容"
@@ -26,6 +25,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -37,7 +38,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 互換のため、どちら名でも子プロセスに確実に渡す（保険）
       - name: Export env (compat)
         run: |
           echo "NOTION_DB_ID=${NOTION_DB_ID}" >> $GITHUB_ENV
@@ -46,11 +46,25 @@ jobs:
       - name: Build kb.jsonl from Notion
         run: python refresh_kb.py
 
+      # ────────── ここから診断ステップ ──────────
+      - name: Inspect kb.jsonl before commit
+        run: |
+          echo "---- ls -l kb.jsonl"; ls -l kb.jsonl || true
+          echo "---- head -n 2"; head -n 2 kb.jsonl || true
+          echo "---- git status"; git status --porcelain
+          echo "---- check-ignore"; git check-ignore -v kb.jsonl || echo "not ignored"
+          echo "---- diff-name-only (worktree vs index)"
+          git add -N kb.jsonl || true
+          git diff --name-only
+          echo "---- last commit touched files (for reference)"
+          git show --name-status --oneline -1 || true
+      # ────────── ここまで診断ステップ ──────────
+
       - name: Commit & Push
         run: |
           git config user.name  "actions-user"
           git config user.email "actions@github"
           git add -A
+          echo "---- about to commit these files"; git diff --cached --name-status
           git commit -m "Auto update KB $(date +%s)" || echo "no changes"
           git push
-
