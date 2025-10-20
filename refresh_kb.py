@@ -1,199 +1,149 @@
-#!/usr/bin/env python3
-# refresh_kb.py — Notion → JSONL 変換（設計/診断対応版）
-# - DIAG=1 で取得件数やプロパティ一覧をログ出力
-# - ALLOW_EMPTY=1 で title/text が空でも出力（設計段階の型確認用）
+# refresh_kb.py — Notion → kb.jsonl 変換（title型のみ・フォールバックなし）
+# version: 2025-10-20 strict-title
 
-import os, sys, json, time, hashlib, re, io
-from datetime import datetime, timezone
-from typing import Dict, Any, List
+import os
+import json
 import requests
+import datetime as dt
+from typing import Dict, Any, List
 
-# ==== 診断フラグ（環境変数） ====
-DIAG = os.getenv("DIAG") == "1"
-ALLOW_EMPTY = os.getenv("ALLOW_EMPTY") == "1"
+# ===== Notion 認証 =====
+NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
+# 既存仕様（NOTION_DB_ID）を優先し、無ければ NOTION_DATABASE_ID を使う
+NOTION_DATABASE_ID = os.getenv("NOTION_DB_ID", "") or os.getenv("NOTION_DATABASE_ID", "")
 
-# ==== 環境変数 ====
-NOTION_TOKEN       = os.getenv("NOTION_TOKEN", "")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
+# ===== 列名（任意） =====
+# ※ 指定しなくてもOK。指定した場合は、その列が「type=='title'」のときだけ採用します。
+FIELD_TITLE  = os.getenv("FIELD_TITLE", "").strip()
 
-# Notion の列名（既定値）。日本語環境の「名前」もフォールバックで拾う
-FIELD_TITLE  = os.getenv("FIELD_TITLE",  "タイトル")
-FIELD_AUTHOR = os.getenv("FIELD_AUTHOR", "著者")
-FIELD_URL    = os.getenv("FIELD_URL",    "出典URL")
-FIELD_TEXT   = os.getenv("FIELD_TEXT",   "本文")
-FIELD_ISSUE  = os.getenv("FIELD_ISSUE",  "会報号")
-FIELD_DATE   = os.getenv("FIELD_DATE",   "代表日付")
+# そのほか任意の列（必要に応じて環境変数で上書き可）
+FIELD_AUTHOR = os.getenv("FIELD_AUTHOR", "講師/著者")
+FIELD_URL    = os.getenv("FIELD_URL", "出典URL")
+FIELD_TEXT   = os.getenv("FIELD_TEXT", "講習会等内容")
+FIELD_ISSUE  = os.getenv("FIELD_ISSUE", "会報号")
+FIELD_DATE   = os.getenv("FIELD_DATE", "開催日/発行日")
 
-# 出力ファイル
-KB_PATH        = os.getenv("KB_PATH", "kb.jsonl")
-BK_PATH        = "kb_backup.jsonl"
-INTEGRITY_PATH = "kb_integrity.txt"
-
-# Notion API
-NOTION_API = "https://api.notion.com/v1/databases/{db}/query"
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": "2022-06-28",
     "Content-Type": "application/json",
 }
 
-def _n_text(prop: Dict[str, Any]) -> str:
-    """Notionのプロパティからプレーンテキストを抽出"""
-    if not prop:
+def _plain_from_list(arr: Any) -> str:
+    """title / rich_text 用: plain_text を連結"""
+    if not isinstance(arr, list):
         return ""
-    if "title" in prop:
-        return "".join(t.get("plain_text", "") for t in prop.get("title", [])).strip()
-    if "rich_text" in prop:
-        return "".join(t.get("plain_text", "") for t in prop.get("rich_text", [])).strip()
-    if "url" in prop and isinstance(prop.get("url"), str):
-        return prop["url"].strip()
-    if "select" in prop and prop["select"]:
-        return prop["select"].get("name", "").strip()
-    if "multi_select" in prop and prop["multi_select"]:
-        return " ".join(t.get("name", "") for t in prop["multi_select"]).strip()
-    if "date" in prop and prop["date"]:
-        return (prop["date"].get("start") or "").strip()
-    if "people" in prop and prop["people"]:
-        return " ".join(p.get("name", "") or p.get("id", "") for p in prop["people"]).strip()
-    if "number" in prop and prop["number"] is not None:
-        return str(prop["number"])
-    if "email" in prop and prop["email"]:
-        return prop["email"].strip()
-    if "phone_number" in prop and prop["phone_number"]:
-        return prop["phone_number"].strip()
-    if "checkbox" in prop:
-        return "true" if prop["checkbox"] else "false"
-    if "formula" in prop and prop["formula"]:
-        f = prop["formula"]
-        return str(next(iter(f.values()), ""))
+    return "".join([x.get("plain_text", "") for x in arr]).strip()
+
+def extract_text_from_prop(prop: Dict[str, Any]) -> str:
+    """プロパティから文字列を抽出（title / rich_text / select 等に対応）"""
+    t = prop.get("type")
+    if t in ("title", "rich_text"):
+        return _plain_from_list(prop.get(t, []))
+    if t == "date":
+        d = prop.get("date") or {}
+        return d.get("start", "") or ""
+    if t == "select":
+        s = prop.get("select") or {}
+        return s.get("name", "") or ""
+    if t == "multi_select":
+        return ",".join([x.get("name", "") for x in prop.get("multi_select", [])]).strip()
+    if t == "url":
+        return prop.get("url") or ""
+    if t == "number":
+        n = prop.get("number", None)
+        return "" if n is None else str(n)
+    if t == "people":
+        return ",".join([x.get("name", "") for x in prop.get("people", [])]).strip()
+    # それ以外は素直に文字列化
+    return str(prop.get(t, "")).strip()
+
+def pick_title_key(props: Dict[str, Any]) -> str:
+    """
+    title型のプロパティ名を返す。
+    - FIELD_TITLE が設定され、その列が title 型なら最優先。
+    - そうでなければ props から type=='title' を探索。
+    - 見つからなければ空文字。
+    """
+    if FIELD_TITLE and FIELD_TITLE in props and props[FIELD_TITLE].get("type") == "title":
+        return FIELD_TITLE
+    for k, v in props.items():
+        if v.get("type") == "title":
+            return k
     return ""
 
-def _extract(record: Dict[str, Any]) -> Dict[str, Any]:
-    props = record.get("properties", {}) or {}
-
-    # タイトル列：環境変数→既定→一般的フォールバック（Name/名前）
-    title = _n_text(
-        props.get(FIELD_TITLE)
-        or props.get("タイトル")
-        or props.get("Name")
-        or props.get("名前")
-        or {}
-    )
-
-    author = _n_text(props.get(FIELD_AUTHOR) or props.get("著者") or {})
-    url    = _n_text(props.get(FIELD_URL)    or props.get("出典URL") or {})
-    text   = _n_text(props.get(FIELD_TEXT)   or props.get("本文")   or {})
-    issue  = _n_text(props.get(FIELD_ISSUE)  or props.get("会報号") or {})
-    date_p = _n_text(props.get(FIELD_DATE)   or props.get("代表日付") or props.get("日付") or {})
-
-    # 公開URLが空ならページURLで代替
-    if not url:
-        url = record.get("url", "")
-
-    # 日付の標準化（YYYY-MM-DD 先頭一致 or / を - に）
-    date_primary = ""
-    if date_p:
-        m = re.match(r"^(\d{4}-\d{2}-\d{2})", date_p)
-        date_primary = m.group(1) if m else date_p.replace("/", "-")
-
-    return {
-        "issue": issue or "",
-        "date_primary": date_primary,
-        "author": author or "",
-        "title": title or "",
-        "text": text or "",
-        "url": url or ""
-    }
-
 def fetch_all_pages(database_id: str) -> List[Dict[str, Any]]:
-    """Notionデータベース全件をページング取得"""
+    """Notion DB をページネーション付きで全件取得"""
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    body = {"page_size": 100}
     results: List[Dict[str, Any]] = []
-    has_more, cursor = True, None
-    while has_more:
-        payload = {"page_size": 100}
-        if cursor:
-            payload["start_cursor"] = cursor
-        r = requests.post(NOTION_API.format(db=database_id), headers=HEADERS, json=payload, timeout=60)
-        if r.status_code >= 500:
-            # 一時障害はリトライ
-            ok = False
-            for _ in range(3):
-                time.sleep(2)
-                r = requests.post(NOTION_API.format(db=database_id), headers=HEADERS, json=payload, timeout=60)
-                if r.ok:
-                    ok = True
-                    break
-            if not ok:
-                r.raise_for_status()
-        elif not r.ok:
-            r.raise_for_status()
-
-        data = r.json()
-        results.extend(data.get("results", []))
-        has_more = data.get("has_more", False)
-        cursor = data.get("next_cursor")
+    while True:
+        r = requests.post(url, headers=HEADERS, json=body, timeout=60)
+        r.raise_for_status()
+        js = r.json()
+        results.extend(js.get("results", []))
+        if not js.get("has_more"):
+            break
+        body["start_cursor"] = js.get("next_cursor")
     return results
 
-def write_jsonl(rows: List[Dict[str, Any]], path: str) -> None:
-    # 既存をバックアップ
-    if os.path.exists(path):
-        try:
-            os.replace(path, BK_PATH)
-        except Exception:
-            pass
-    with io.open(path, "w", encoding="utf-8", newline="\n") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-def sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def main() -> int:
-    if not NOTION_TOKEN or not NOTION_DATABASE_ID:
-        print("ERROR: NOTION_TOKEN / NOTION_DATABASE_ID が未設定です。", file=sys.stderr)
-        return 2
-
-    pages = fetch_all_pages(NOTION_DATABASE_ID)
-
-    if DIAG:
-        print(f"DIAG: total_pages_from_notion={len(pages)}")
-        for i, p in enumerate(pages[:3]):
-            keys = sorted(list((p.get('properties') or {}).keys()))
-            print(f"DIAG: page#{i+1}_props={keys}")
-
+def build_records(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """kb.jsonl に書き出すレコード群を組み立て"""
     records: List[Dict[str, Any]] = []
-    valid = 0
 
-    for p in pages:
-        try:
-            rec = _extract(p)
-            keep = bool(rec.get("title") or rec.get("text"))
-            if ALLOW_EMPTY:
-                keep = True  # 設計診断モード：空でも書き出し
-            if keep:
-                records.append(rec)
-                valid += 1
-        except Exception as e:
-            print(f"WARN: skip record: {e}", file=sys.stderr)
-            continue
+    if not pages:
+        return records
+    props0 = pages[0].get("properties", {})
+    title_key = pick_title_key(props0)
+    print(f"[INFO] title_key={repr(title_key)} (type='title' only)")
 
-    if DIAG:
-        print(f"DIAG: extracted_records={valid}")
-        if records:
-            sample = json.dumps(records[0], ensure_ascii=False)
-            print(f"DIAG: sample_record={sample[:400]}")
+    for page in pages:
+        props = page.get("properties", {})
 
-    write_jsonl(records, KB_PATH)
-    digest = sha256_file(KB_PATH)
-    with io.open(INTEGRITY_PATH, "w", encoding="utf-8") as g:
-        g.write(f"lines={valid}\nsha256={digest}\nupdated_utc={datetime.now(timezone.utc).isoformat()}\n")
+        # --- title（必須: title型のみ使用。フォールバックなし） ---
+        title_val = ""
+        if title_key and title_key in props and props[title_key].get("type") == "title":
+            title_val = extract_text_from_prop(props[title_key])
 
-    print(f"OK: Valid lines={valid}, sha256={digest[:12]}...")
-    return 0
+        # --- 任意の他フィールド ---
+        def get(field_name: str) -> str:
+            if field_name in props:
+                return extract_text_from_prop(props[field_name])
+            return ""
+
+        rec = {
+            "issue":        get(FIELD_ISSUE),
+            "date_primary": get(FIELD_DATE),
+            "author":       get(FIELD_AUTHOR),
+            "title":        title_val,   # ← 定義（空は空のまま）
+            "text":         get(FIELD_TEXT),
+            "url":          get(FIELD_URL),
+        }
+        records.append(rec)
+    return records
+
+def save_jsonl(records: List[Dict[str, Any]], path: str = "kb.jsonl") -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"[OK] wrote {len(records)} records to {path}")
+
+def main() -> None:
+    if not NOTION_TOKEN or not NOTION_DATABASE_ID:
+        dbid_len_old = len(os.getenv("NOTION_DB_ID", "") or "")
+        dbid_len_new = len(os.getenv("NOTION_DATABASE_ID", "") or "")
+        raise SystemExit(
+            f"❌ Notion認証不足: NOTION_TOKEN={bool(NOTION_TOKEN)} "
+            f"/ NOTION_DB_ID.len={dbid_len_old} / NOTION_DATABASE_ID.len={dbid_len_new}"
+        )
+
+    print("[INFO] fetching pages from Notion…")
+    pages = fetch_all_pages(NOTION_DATABASE_ID)
+    print(f"[INFO] fetched {len(pages)} pages")
+
+    records = build_records(pages)
+    save_jsonl(records)
+    print("[DONE]", dt.datetime.now().isoformat())
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
