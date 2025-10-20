@@ -53,3 +53,4 @@ jobs:
           git add -A
           git commit -m "Auto update KB $(date +%s)" || echo "no changes"
           git push
+
