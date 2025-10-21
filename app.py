@@ -1,15 +1,8 @@
-# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版・検索仕様アップデート v3）
-# 変更点（v3）:
-# - （無題）対策：日本語キーを追加（タイトル/本文/URL/日付/著者/区分/号）
-# - compute_score を実装（0件化の主因を解消）
-# - 既存仕様の維持：
-#   ・連結語はそのまま一致（例：コンテスト結果）
-#   ・空白ありは AND（例：コンテスト 結果）
-#   ・年フィルタは末尾のみ発動（例：コンテスト2024 / コンテスト 2023-2025）
-#   ・同義語は 苔/コケ/こけ
-#   ・簡易文字化け修復＋ハイライト
-#
-# バージョン: jsonl-2025-10-19-search-spec-v3
+# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版・検索仕様アップデート v3.1）
+# 変更点（v3.1）:
+# - ★重複排除をサーバ側で確実化：同一レコード（id / (title,url)）は最良スコアの1件だけ返す
+# - 既存の検索仕様v3は保持（年末尾フィルタ、苔/コケ/こけ、モジバケ修復、ハイライト等）
+# - UIは変更不要（/api/search の返却だけが一意化）
 
 import os, io, re, json, hashlib, unicodedata
 from datetime import datetime
@@ -39,7 +32,7 @@ app.add_middleware(
 KB_URL   = (os.getenv("KB_URL", "") or "").strip()
 _cfg     = (os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip()
 KB_PATH  = os.path.normpath(_cfg if os.path.isabs(_cfg) else os.path.join(os.getcwd(), _cfg))
-VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-19-search-spec-v3")
+VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-19-search-spec-v3.1")
 
 MOJIBAKE_REPAIR = (os.getenv("MOJIBAKE_REPAIR", "1") != "0")  # 既定 ON
 
@@ -327,11 +320,7 @@ TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')  # "..." or non-space token
 
 def _expand_term_forms(term: str) -> List[str]:
     """
-    自動空白バリアントは生成しない（仕様）。
-    行うのは：
-      - NFKC 正規化
-      - かな/カナ相互
-      - 登録同義語（苔/コケ/こけ）
+    NFKC正規化 + かな/カナ相互 + 同義語（苔/コケ/こけ）
     """
     term = normalize_text(term)
     forms = [term]
@@ -364,7 +353,6 @@ def parse_query(q: str) -> Tuple[List[List[str]], List[List[str]], List[str], Li
         if m.group(1) is not None:
             phrase = normalize_text(token)
             phrases.append(phrase)
-            # ハイライト用にはフレーズ内の語も吸収（表示の見やすさ）
             for t in re.split(r"\s+", phrase.strip()):
                 if t:
                     for f in _expand_term_forms(t):
@@ -415,8 +403,8 @@ def _contains_all_terms(hay: str, terms: List[str]) -> bool:
 
 def _count_occurrences(needle: str, hay: str) -> int:
     """
-    - 単語（空白なし）の場合: 連結語そのものの部分一致回数
-    - 空白が含まれる場合: 各部分がすべて含まれるなら 1（AND）
+    - 単語（空白なし）: 連結語そのものの部分一致回数
+    - 空白あり       : 各部分がすべて含まれるなら 1（AND）
     - かな正規化も併用
     """
     if not needle or not hay: return 0
@@ -517,7 +505,6 @@ def _is_meaningful_line(s: str) -> bool:
 
 def _score_title_candidate(line: str, hl_terms: List[str]) -> int:
     t = _nfkc(line).strip()
-    if not t: return -1
     if len(t) < 6: return -1
     score = max(0, 120 - min(len(t), 120))
     for term in hl_terms:
@@ -530,9 +517,7 @@ def _score_title_candidate(line: str, hl_terms: List[str]) -> int:
 
 def _shorten_title(s: str, limit: int = 80) -> str:
     t = _nfkc(s).strip()
-    if len(t) <= limit:
-        return t
-    return t[:limit] + "…"
+    return t if len(t) <= limit else (t[:limit] + "…")
 
 def _extract_title_fallback(body: str, hl_terms: List[str]) -> Optional[str]:
     if not body:
@@ -778,7 +763,9 @@ def api_search(
             return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
                               "has_more": False, "next_page": None, "error": None, "order_used": order})
 
-        hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = []
+        # ★★★ デデュープ用のベストヒット集約（id か (title,url) をキーにする）
+        best: Dict[Any, Tuple[int, Optional[datetime], Dict[str, Any]]] = {}
+
         for rec in iter_records():
             if not _matches_year(rec, year_tail, yr_tail):
                 continue
@@ -786,8 +773,13 @@ def api_search(
             if score < 0:
                 continue
             d = record_date(rec)
-            hits.append((score, d, rec))
+            key = rec.get("id") or (record_as_text(rec, "title"), record_as_text(rec, "url"))
+            prev = best.get(key)
+            if (prev is None) or (score > prev[0]) or (score == prev[0] and (d or datetime.min) > (prev[1] or datetime.min)):
+                best[key] = (score, d, rec)
 
+        # 集約 → 配列化
+        hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = list(best.values())
         total_hits = len(hits)
 
         if order == "latest":
@@ -807,6 +799,7 @@ def api_search(
         for i, (_, _d, rec) in enumerate(page_hits):
             items.append(build_item(rec, hl_terms, is_first_in_page=(i == 0)))
 
+        # ランク付け（1始まり）
         for idx, _ in enumerate(hits, start=1):
             if start < idx <= end:
                 items[idx - start - 1]["rank"] = idx
