@@ -1,11 +1,9 @@
-# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版・検索仕様アップデート v3.1+d）
-# 変更点（v3.1+d）:
-# - ★重複排除をより厳密に: id が無い場合は (title_norm, url_canon) をキーに集約
-#   ・url_canon: #fragment 除去、? の既知パラメータ（source=copy_link 等）を削除して正規化
-# - ★並び順の決定化: 同点時のページ跨ぎ再出現を防止（score↓, date↓, url_canon↑, title_norm↑）
-# - その他の検索仕様（v3.1の年末尾フィルタ/かな・カナ/同義語/ハイライト/モジバケ修復）は維持
-#
-# ※ UI 変更は不要（/api/search の返却のみ一意化/安定化）
+# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版・検索仕様 v3.2）
+# 目的：
+# - 一般的な検索ロジックに準拠（スナップショット→完全順序→ページング前dedupe→ページ切り出し→表示加工）
+# - 「次へ」で同じ文書が再出現しない（決定的ソート＋ページング前dedupe）
+# - 既存仕様（年末尾フィルタ／かな↔カナ／同義語（苔/コケ/こけ）／モジバケ修復／ハイライト／タイトルフォールバック）を維持
+# - UI変更なし（/api/search の返却フォーマットは従来どおり）
 
 import os, io, re, json, hashlib, unicodedata
 from datetime import datetime
@@ -22,7 +20,7 @@ except Exception:
     requests = None
 
 # ==================== 初期化 ====================
-app = FastAPI(title="mini-rose-search-jsonl (kb.jsonl)")
+app = FastAPI(title="mini-rose-search-jsonl (kb.jsonl) v3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +34,7 @@ app.add_middleware(
 KB_URL   = (os.getenv("KB_URL", "") or "").strip()
 _cfg     = (os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip()
 KB_PATH  = os.path.normpath(_cfg if os.path.isabs(_cfg) else os.path.join(os.getcwd(), _cfg))
-VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-21-v3.1+d-stable")
+VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-21-v3.2")
 
 MOJIBAKE_REPAIR = (os.getenv("MOJIBAKE_REPAIR", "1") != "0")  # 既定 ON
 
@@ -56,18 +54,9 @@ _REPAIR_STATS = {
 # メモリ常駐（高速化）
 _KB_ROWS: Optional[List[Dict[str, Any]]] = None
 
-# ==================== 正規化ユーティリティ ====================
+# ==================== 正規化・ユーティリティ ====================
 def _nfkc(s: Optional[str]) -> str:
     return unicodedata.normalize("NFKC", s or "")
-
-KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
-HIRA_TO_KATA = str.maketrans({chr(h): chr(h + 0x60) for h in range(ord("ぁ"), ord("ん") + 1)})
-
-def to_hira(s: str) -> str:
-    return (s or "").translate(KATA_TO_HIRA)
-
-def to_kata(s: str) -> str:
-    return (s or "").translate(HIRA_TO_KATA)
 
 def normalize_text(s: str) -> str:
     if not s:
@@ -86,27 +75,53 @@ def textify(x: Any) -> str:
     except Exception:
         return str(x)
 
-# ---- URL 正規化（dedupe用）----
-# 追跡/複製由来のクエリは無視して同一視する（必要に応じて追加）
+KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
+HIRA_TO_KATA = str.maketrans({chr(h): chr(h + 0x60) for h in range(ord("ぁ"), ord("ん") + 1)})
+
+def to_hira(s: str) -> str:
+    return (s or "").translate(KATA_TO_HIRA)
+
+def to_kata(s: str) -> str:
+    return (s or "").translate(HIRA_TO_KATA)
+
+# ---- URL 正規化（dedupe/安定ソート用）----
 _DROP_QS = {"source", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"}
+
+_NOTION_PAGEID_RE = re.compile(r"[0-9a-f]{32}", re.IGNORECASE)
+
+def _extract_notion_page_id(path: str) -> Optional[str]:
+    m = _NOTION_PAGEID_RE.search(path.replace("-", ""))
+    return m.group(0).lower() if m else None
 
 def canonical_url(url: str) -> str:
     u = (url or "").strip()
-    if not u:
+    if not u or u.lower() in {"notion", "null", "none", "undefined"}:
         return ""
     try:
         p = urlparse(u)
         # fragment は比較対象外
-        fragless = p._replace(fragment="")
-        # 主要でないクエリは落とす（? を全部消すのではなく、残す価値のあるものだけ残す仕様にしたければここで調整）
-        qs_pairs = [(k, v) for (k, v) in parse_qsl(fragless.query, keep_blank_values=True) if k not in _DROP_QS]
+        p = p._replace(fragment="")
+        # 不要クエリ除去
+        qs_pairs = [(k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=True) if k not in _DROP_QS]
         qs = "&".join([f"{k}={v}" if v != "" else k for k, v in qs_pairs])
-        norm = fragless._replace(query=qs)
-        # スキーム/ホストは小文字化
-        norm = norm._replace(scheme=norm.scheme.lower(), netloc=norm.netloc.lower())
-        return urlunparse(norm)
+        p = p._replace(query=qs)
+        # スキーム/ホスト小文字化
+        p = p._replace(scheme=p.scheme.lower(), netloc=p.netloc.lower())
+        # Notion公開URLは page_id を優先キーに正規化
+        if "notion.site" in p.netloc:
+            pid = _extract_notion_page_id(p.path)
+            if pid:
+                return f"notion://{pid}"
+        return urlunparse(p)
     except Exception:
         return u
+
+def stable_hash(*parts: str) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        h.update((part or "").encode("utf-8"))
+        h.update(b"\x1e")  # セパレータ
+    return h.hexdigest()
 
 # ==================== 同義語（最小） ====================
 SYNONYMS: Dict[str, List[str]] = {
@@ -233,7 +248,7 @@ def parse_date_str(s: str) -> Optional[datetime]:
 def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
     for k in (
         "date","date_primary","Date","published_at","published","created_at",
-        # 日本語キーを追加
+        # 日本語キー
         "開催日/発行日","開催日","発行日","日付","作成日","更新日"
     ):
         d = rec.get(k)
@@ -266,8 +281,7 @@ RANGE_SEP = r"(?:-|–|—|~|〜|～|\.{2})"
 def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tuple[int,int]]]:
     """
     末尾に年 or 年範囲があるときだけ年フィルタを発動。
-    さらに「末尾連結の年」（例: 'コンテスト2024'）も年フィルタとして解釈。
-    先頭年（例: '2024コンテスト'）はフィルタ不発（リテラル検索）。
+    'コンテスト2024' のような末尾連結も年と解釈。
     """
     q = _nfkc(q_raw).strip()
     if not q: return "", None, None
@@ -278,12 +292,12 @@ def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tup
 
     last = parts[-1]
 
-    # 1) 末尾が「YYYY」だけのトークン
+    # 1) 末尾が YYYY 単独
     if re.fullmatch(r"(19|20|21)\d{2}", last):
         base = " ".join(parts[:-1]).strip()
         return (base, int(last), None)
 
-    # 2) 末尾が「YYYY-YYYY」等のトークン
+    # 2) 末尾が YYYY-YYYY 等の範囲
     m_rng = re.fullmatch(rf"((?:19|20|21)\d{{2}})\s*{RANGE_SEP}\s*((?:19|20|21)\d{{2}})", last)
     if m_rng:
         y1, y2 = int(m_rng.group(1)), int(m_rng.group(2))
@@ -291,7 +305,7 @@ def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tup
         base = " ".join(parts[:-1]).strip()
         return (base, None, (y1, y2))
 
-    # 3) 末尾連結（例: 'コンテスト2024' → 最後のトークン内部の末尾が年）
+    # 3) 末尾連結 YYYY
     m_suf = re.fullmatch(rf"^(.*?)(?:((?:19|20|21)\d{{2}}))$", last)
     if m_suf:
         prefix, ystr = m_suf.group(1), m_suf.group(2)
@@ -299,7 +313,6 @@ def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tup
             base = " ".join(parts[:-1] + [prefix]).strip()
             return (base, int(ystr), None)
 
-    # それ以外：年フィルタ不発（リテラル検索）
     return (q, None, None)
 
 def _matches_year(rec: Dict[str, Any], year: Optional[int], yr: Optional[Tuple[int,int]]) -> bool:
@@ -313,12 +326,12 @@ def _matches_year(rec: Dict[str, Any], year: Optional[int], yr: Optional[Tuple[i
 # ==================== フィールド抽出 ====================
 TITLE_KEYS = [
     "title","Title","name","Name","page_title","source_title","heading","headline","subject",
-    # 日本語キーを追加
+    # 日本語キー
     "タイトル","題名","見出し","名前","表題"
 ]
 TEXT_KEYS  = [
     "text","content","body","description","summary","note","content_full","excerpt",
-    # 日本語キーを追加
+    # 日本語キー
     "本文","内容","記事","テキスト","講習会等内容","講習会内容","資料本文","本文テキスト"
 ]
 
@@ -338,6 +351,7 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
         "date":   ["date","date_primary","Date","published_at","published","created_at","開催日/発行日","開催日","発行日","日付","作成日","更新日"],
         "category": ["category","Category","tags","Tags","資料区分","区分","カテゴリ","カテゴリー","タグ"],
         "url":    ["url","source","link","permalink","出典URL","URL","リンク","出典","公開URL"],
+        "id":     ["id","doc_id","ページID","record_id"],
     }
     return _get_field(rec, key_map.get(field, [field]))
 
@@ -482,26 +496,26 @@ def compute_score(rec: Dict[str, Any],
                   pos_groups: List[List[str]],
                   neg_groups: List[List[str]],
                   phrases: List[str]) -> int:
+    # NG（除外）
     for ng in neg_groups:
         ng_hit, _ = _group_hit_in_any_field(rec, ng)
         if ng_hit:
             return -1
-
+    # 必須（AND）
     total = 0
     for pg in pos_groups:
         pg_hit, add = _group_hit_in_any_field(rec, pg)
         if not pg_hit:
             return -1
         total += add
-
+    # フレーズ・ボーナス
     for ph in phrases:
         ok, bonus = _phrase_match_any_field(rec, ph)
         if ok:
             total += bonus
-
     return total
 
-# ==================== タイトル・フォールバック/表示整形 ====================
+# ==================== タイトル整形・ハイライト ====================
 _RE_HAS_LETTER = re.compile(r"[A-Za-z0-9\u3040-\u30FF\u4E00-\u9FFF]")
 
 def _is_meaningful_line(s: str) -> bool:
@@ -656,14 +670,11 @@ def build_item(rec: Dict[str, Any], hl_terms: List[str], is_first_in_page: bool)
     orig_title = record_as_text(rec, "title")
     body  = record_as_text(rec, "text")
 
-    # (1) タイトルフォールバック（必要時）
+    # (1) タイトルフォールバック
     title_disp = (orig_title or "").strip()
     if not title_disp or title_disp == "(無題)":
         fb = _extract_title_fallback(body, hl_terms)
-        if fb:
-            title_disp = fb
-        else:
-            title_disp = orig_title or "(無題)"
+        title_disp = fb if fb else (orig_title or "(無題)")
 
     # (2) 文字化け修復＋ハイライト
     title_disp = maybe_repair_for_display(title_disp, "title")
@@ -708,6 +719,35 @@ def json_utf8(payload: Dict[str, Any], status: int = 200) -> JSONResponse:
         headers={"Cache-Control": "no-store", "Content-Type": "application/json; charset=utf-8"},
     )
 
+# ==================== ドキュメントID（完全順序・dedupeの基礎） ====================
+def doc_id_for(rec: Dict[str, Any]) -> str:
+    # 1) 明示idがあればそれを使う
+    rid = record_as_text(rec, "id").strip()
+    if rid:
+        return f"id://{rid}"
+    # 2) URL正規化ベース
+    url_c = canonical_url(record_as_text(rec, "url"))
+    if url_c:
+        return f"url://{url_c}"
+    # 3) それも無ければ内容から安定ハッシュ（タイトル・日付・著者）
+    title_n = normalize_text(record_as_text(rec, "title"))
+    date_n  = normalize_text(record_as_text(rec, "date"))
+    auth_n  = normalize_text(record_as_text(rec, "author"))
+    return f"hash://{stable_hash(title_n, date_n, auth_n)}"
+
+# ==================== 並び順（完全順序） ====================
+def sort_key_relevance(entry: Tuple[int, Optional[datetime], str, Dict[str, Any]]) -> Tuple:
+    score, d, did, rec = entry
+    date_key = d or datetime.min
+    # 完全順序：score↓, date↓, doc_id↑
+    return (-int(score), -int(date_key.strftime("%Y%m%d%H%M%S")), did)
+
+def sort_key_latest(entry: Tuple[int, Optional[datetime], str, Dict[str, Any]]) -> Tuple:
+    score, d, did, rec = entry
+    date_key = d or datetime.min
+    # 完全順序：date↓, score↓, doc_id↑
+    return (-int(date_key.strftime("%Y%m%d%H%M%S")), -int(score), did)
+
 # ==================== エンドポイント ====================
 @app.get("/health")
 def health():
@@ -746,23 +786,6 @@ def admin_refresh():
         "repair_stats": _REPAIR_STATS,
     })
 
-# ---- 並び順キー（決定化）----
-def _sort_key_relevance(entry: Tuple[int, Optional[datetime], Dict[str, Any]]) -> Tuple:
-    score, d, rec = entry
-    date_key = d or datetime.min
-    url_c = canonical_url(record_as_text(rec, "url"))
-    title_n = normalize_text(record_as_text(rec, "title"))
-    # score↓, date↓, url↑, title↑
-    return (-int(score), -int(date_key.strftime("%Y%m%d%H%M%S")), url_c, title_n)
-
-def _sort_key_latest(entry: Tuple[int, Optional[datetime], Dict[str, Any]]) -> Tuple:
-    score, d, rec = entry
-    date_key = d or datetime.min
-    url_c = canonical_url(record_as_text(rec, "url"))
-    title_n = normalize_text(record_as_text(rec, "title"))
-    # date↓, score↓, url↑, title↑
-    return (-int(date_key.strftime("%Y%m%d%H%M%S")), -int(score), url_c, title_n)
-
 @app.get("/api/search")
 def api_search(
     q: str = Query("", description="検索クエリ（末尾年/年範囲でフィルタ可：例『コンテスト2024』『剪定 1999〜2001』）"),
@@ -779,7 +802,7 @@ def api_search(
             return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
                               "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order})
 
-        # 末尾の年/範囲のみ年フィルタ
+        # 末尾 年/年範囲 抽出
         base_q, year_tail, yr_tail = _parse_year_from_query(q)
         q_used = base_q
 
@@ -788,9 +811,8 @@ def api_search(
             return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
                               "has_more": False, "next_page": None, "error": None, "order_used": order})
 
-        # ★★★ ベストヒット集約（id or (title_norm, url_canon)）＋最良スコア採用
-        best: Dict[Any, Tuple[int, Optional[datetime], Dict[str, Any]]] = {}
-
+        # ---------- (1) スナップショット作成：スコアリング＋doc_id＋日付 ----------
+        snapshot: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
         for rec in iter_records():
             if not _matches_year(rec, year_tail, yr_tail):
                 continue
@@ -798,48 +820,66 @@ def api_search(
             if score < 0:
                 continue
             d = record_date(rec)
+            did = doc_id_for(rec)  # 完全順序 & dedupe の核
+            snapshot.append((score, d, did, rec))
 
-            # キー生成（厳密化）
-            rid = rec.get("id")
-            title_n = normalize_text(record_as_text(rec, "title"))
-            url_c   = canonical_url(record_as_text(rec, "url"))
-            key = rid or (title_n, url_c)
+        # 空
+        if not snapshot:
+            return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                              "has_more": False, "next_page": None, "error": None, "order_used": order})
 
-            prev = best.get(key)
-            if (prev is None) or (score > prev[0]) or (score == prev[0] and (d or datetime.min) > (prev[1] or datetime.min)):
-                best[key] = (score, d, rec)
+        # ---------- (2) ページング前 dedupe（doc_id 単位でベスト1件） ----------
+        best_by_id: Dict[str, Tuple[int, Optional[datetime], str, Dict[str, Any]]] = {}
+        for entry in snapshot:
+            score, d, did, rec = entry
+            prev = best_by_id.get(did)
+            if prev is None:
+                best_by_id[did] = entry
+            else:
+                pscore, pd, _, _ = prev
+                # ルール：score 高い方 → 同点なら日付新しい方
+                if (score > pscore) or (score == pscore and (d or datetime.min) > (pd or datetime.min)):
+                    best_by_id[did] = entry
 
-        # 集約 → 配列化
-        hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = list(best.values())
-        total_hits = len(hits)
+        deduped: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = list(best_by_id.values())
 
-        # 決定的ソート（ページング前に一度だけ）
+        # ---------- (3) 決定的ソート（完全順序） ----------
         if order == "latest":
-            hits.sort(key=_sort_key_latest)
+            deduped.sort(key=sort_key_latest)
             order_used = "latest"
         else:
-            hits.sort(key=_sort_key_relevance)
+            deduped.sort(key=sort_key_relevance)
             order_used = "relevance"
 
-        # ページング
+        total_hits = len(deduped)
+
+        # ---------- (4) ページ切り出し（同じ配列から [start:end]） ----------
         start = (page - 1) * page_size
         end = start + page_size
-        page_hits = hits[start:end]
+        page_slice = deduped[start:end]
         has_more = end < total_hits
         next_page = page + 1 if has_more else None
 
-        # 表示用アイテム化
+        # ---------- (5) 表示加工（ハイライト/スニペットは最後） ----------
         items: List[Dict[str, Any]] = []
-        for i, (_, _d, rec) in enumerate(page_hits):
+        for i, (_sc, _d, _did, rec) in enumerate(page_slice):
             items.append(build_item(rec, hl_terms, is_first_in_page=(i == 0)))
 
-        # ランク付け（1始まり）
-        for idx, _ in enumerate(hits, start=1):
+        # ランク（1始まり）：全体順位を採番
+        for idx, _ in enumerate(deduped, start=1):
             if start < idx <= end:
                 items[idx - start - 1]["rank"] = idx
 
-        return json_utf8({"items": items, "total_hits": total_hits, "page": page, "page_size": page_size,
-                          "has_more": has_more, "next_page": next_page, "error": None, "order_used": order_used})
+        return json_utf8({
+            "items": items,
+            "total_hits": total_hits,
+            "page": page,
+            "page_size": page_size,
+            "has_more": has_more,
+            "next_page": next_page,
+            "error": None,
+            "order_used": order_used
+        })
 
     except Exception as e:
         return json_utf8({"items": [], "total_hits": 0, "page": 1, "page_size": page_size,
