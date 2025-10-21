@@ -1,12 +1,16 @@
-# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版・検索仕様アップデート v3.1）
-# 変更点（v3.1）:
-# - ★重複排除をサーバ側で確実化：同一レコード（id / (title,url)）は最良スコアの1件だけ返す
-# - 既存の検索仕様v3は保持（年末尾フィルタ、苔/コケ/こけ、モジバケ修復、ハイライト等）
-# - UIは変更不要（/api/search の返却だけが一意化）
+# app.py — ミニバラ盆栽愛好会 デジタル資料館（JSONL版・検索仕様アップデート v3.1+d）
+# 変更点（v3.1+d）:
+# - ★重複排除をより厳密に: id が無い場合は (title_norm, url_canon) をキーに集約
+#   ・url_canon: #fragment 除去、? の既知パラメータ（source=copy_link 等）を削除して正規化
+# - ★並び順の決定化: 同点時のページ跨ぎ再出現を防止（score↓, date↓, url_canon↑, title_norm↑）
+# - その他の検索仕様（v3.1の年末尾フィルタ/かな・カナ/同義語/ハイライト/モジバケ修復）は維持
+#
+# ※ UI 変更は不要（/api/search の返却のみ一意化/安定化）
 
 import os, io, re, json, hashlib, unicodedata
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
+from urllib.parse import urlparse, urlunparse, parse_qsl
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
@@ -32,7 +36,7 @@ app.add_middleware(
 KB_URL   = (os.getenv("KB_URL", "") or "").strip()
 _cfg     = (os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip()
 KB_PATH  = os.path.normpath(_cfg if os.path.isabs(_cfg) else os.path.join(os.getcwd(), _cfg))
-VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-19-search-spec-v3.1")
+VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-21-v3.1+d-stable")
 
 MOJIBAKE_REPAIR = (os.getenv("MOJIBAKE_REPAIR", "1") != "0")  # 既定 ON
 
@@ -81,6 +85,28 @@ def textify(x: Any) -> str:
         return json.dumps(x, ensure_ascii=False)
     except Exception:
         return str(x)
+
+# ---- URL 正規化（dedupe用）----
+# 追跡/複製由来のクエリは無視して同一視する（必要に応じて追加）
+_DROP_QS = {"source", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"}
+
+def canonical_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    try:
+        p = urlparse(u)
+        # fragment は比較対象外
+        fragless = p._replace(fragment="")
+        # 主要でないクエリは落とす（? を全部消すのではなく、残す価値のあるものだけ残す仕様にしたければここで調整）
+        qs_pairs = [(k, v) for (k, v) in parse_qsl(fragless.query, keep_blank_values=True) if k not in _DROP_QS]
+        qs = "&".join([f"{k}={v}" if v != "" else k for k, v in qs_pairs])
+        norm = fragless._replace(query=qs)
+        # スキーム/ホストは小文字化
+        norm = norm._replace(scheme=norm.scheme.lower(), netloc=norm.netloc.lower())
+        return urlunparse(norm)
+    except Exception:
+        return u
 
 # ==================== 同義語（最小） ====================
 SYNONYMS: Dict[str, List[str]] = {
@@ -269,7 +295,7 @@ def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tup
     m_suf = re.fullmatch(rf"^(.*?)(?:((?:19|20|21)\d{{2}}))$", last)
     if m_suf:
         prefix, ystr = m_suf.group(1), m_suf.group(2)
-        if prefix:  # prefix が空なら「YYYY」単独なので(1)で拾われる
+        if prefix:
             base = " ".join(parts[:-1] + [prefix]).strip()
             return (base, int(ystr), None)
 
@@ -292,7 +318,7 @@ TITLE_KEYS = [
 ]
 TEXT_KEYS  = [
     "text","content","body","description","summary","note","content_full","excerpt",
-    # 日本語キーを追加（Notionの項目に合わせる）
+    # 日本語キーを追加
     "本文","内容","記事","テキスト","講習会等内容","講習会内容","資料本文","本文テキスト"
 ]
 
@@ -319,9 +345,6 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
 TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')  # "..." or non-space token
 
 def _expand_term_forms(term: str) -> List[str]:
-    """
-    NFKC正規化 + かな/カナ相互 + 同義語（苔/コケ/こけ）
-    """
     term = normalize_text(term)
     forms = [term]
     h = to_hira(term); k = to_kata(h)
@@ -402,11 +425,6 @@ def _contains_all_terms(hay: str, terms: List[str]) -> bool:
     return True
 
 def _count_occurrences(needle: str, hay: str) -> int:
-    """
-    - 単語（空白なし）: 連結語そのものの部分一致回数
-    - 空白あり       : 各部分がすべて含まれるなら 1（AND）
-    - かな正規化も併用
-    """
     if not needle or not hay: return 0
     if " " in needle.strip():
         parts = [p for p in needle.split(" ") if p]
@@ -464,19 +482,11 @@ def compute_score(rec: Dict[str, Any],
                   pos_groups: List[List[str]],
                   neg_groups: List[List[str]],
                   phrases: List[str]) -> int:
-    """
-    スコア計算：
-      - neg_groups：どれか1つでもヒット → 不合格（-1）
-      - pos_groups：全部のグループがヒット → 合格（加点）。1つでも未ヒット → 不合格（-1）
-      - phrases   ：ヒット箇所に応じてボーナス加点
-    """
-    # NG（除外）判定
     for ng in neg_groups:
         ng_hit, _ = _group_hit_in_any_field(rec, ng)
         if ng_hit:
             return -1
 
-    # 必須（AND）判定＋加点
     total = 0
     for pg in pos_groups:
         pg_hit, add = _group_hit_in_any_field(rec, pg)
@@ -484,7 +494,6 @@ def compute_score(rec: Dict[str, Any],
             return -1
         total += add
 
-    # フレーズ・ボーナス
     for ph in phrases:
         ok, bonus = _phrase_match_any_field(rec, ph)
         if ok:
@@ -492,14 +501,14 @@ def compute_score(rec: Dict[str, Any],
 
     return total
 
-# ==================== タイトル・フォールバック抽出 ====================
+# ==================== タイトル・フォールバック/表示整形 ====================
 _RE_HAS_LETTER = re.compile(r"[A-Za-z0-9\u3040-\u30FF\u4E00-\u9FFF]")
 
 def _is_meaningful_line(s: str) -> bool:
     if not s: return False
     t = _nfkc(s).strip()
     if not t: return False
-    if not _RE_HAS_LETTER.search(t):  # 記号のみは除外
+    if not _RE_HAS_LETTER.search(t):
         return False
     return True
 
@@ -545,7 +554,6 @@ def _extract_title_fallback(body: str, hl_terms: List[str]) -> Optional[str]:
             return _shorten_title(t, 80)
     return None
 
-# ==================== 抜粋/ハイライト + モジバケ修復 ====================
 TAG_RE = re.compile(r"<[^>]+>")
 
 def html_escape(s: str) -> str:
@@ -593,8 +601,8 @@ def _try_repairs(s: str) -> str:
         if cand and cand != s:
             gain = _ratio_japanese(cand) - base_jp
             if gain > best_gain:
-                best_gain = gain
                 best = cand
+                best_gain = gain
     return best
 
 def maybe_repair_for_display(s: str, kind: str) -> str:
@@ -738,6 +746,23 @@ def admin_refresh():
         "repair_stats": _REPAIR_STATS,
     })
 
+# ---- 並び順キー（決定化）----
+def _sort_key_relevance(entry: Tuple[int, Optional[datetime], Dict[str, Any]]) -> Tuple:
+    score, d, rec = entry
+    date_key = d or datetime.min
+    url_c = canonical_url(record_as_text(rec, "url"))
+    title_n = normalize_text(record_as_text(rec, "title"))
+    # score↓, date↓, url↑, title↑
+    return (-int(score), -int(date_key.strftime("%Y%m%d%H%M%S")), url_c, title_n)
+
+def _sort_key_latest(entry: Tuple[int, Optional[datetime], Dict[str, Any]]) -> Tuple:
+    score, d, rec = entry
+    date_key = d or datetime.min
+    url_c = canonical_url(record_as_text(rec, "url"))
+    title_n = normalize_text(record_as_text(rec, "title"))
+    # date↓, score↓, url↑, title↑
+    return (-int(date_key.strftime("%Y%m%d%H%M%S")), -int(score), url_c, title_n)
+
 @app.get("/api/search")
 def api_search(
     q: str = Query("", description="検索クエリ（末尾年/年範囲でフィルタ可：例『コンテスト2024』『剪定 1999〜2001』）"),
@@ -763,7 +788,7 @@ def api_search(
             return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
                               "has_more": False, "next_page": None, "error": None, "order_used": order})
 
-        # ★★★ デデュープ用のベストヒット集約（id か (title,url) をキーにする）
+        # ★★★ ベストヒット集約（id or (title_norm, url_canon)）＋最良スコア採用
         best: Dict[Any, Tuple[int, Optional[datetime], Dict[str, Any]]] = {}
 
         for rec in iter_records():
@@ -773,7 +798,13 @@ def api_search(
             if score < 0:
                 continue
             d = record_date(rec)
-            key = rec.get("id") or (record_as_text(rec, "title"), record_as_text(rec, "url"))
+
+            # キー生成（厳密化）
+            rid = rec.get("id")
+            title_n = normalize_text(record_as_text(rec, "title"))
+            url_c   = canonical_url(record_as_text(rec, "url"))
+            key = rid or (title_n, url_c)
+
             prev = best.get(key)
             if (prev is None) or (score > prev[0]) or (score == prev[0] and (d or datetime.min) > (prev[1] or datetime.min)):
                 best[key] = (score, d, rec)
@@ -782,19 +813,22 @@ def api_search(
         hits: List[Tuple[int, Optional[datetime], Dict[str, Any]]] = list(best.values())
         total_hits = len(hits)
 
+        # 決定的ソート（ページング前に一度だけ）
         if order == "latest":
-            hits.sort(key=lambda x: (x[1] or datetime.min), reverse=True)
+            hits.sort(key=_sort_key_latest)
             order_used = "latest"
         else:
-            hits.sort(key=lambda x: (x[0], x[1] or datetime.min), reverse=True)
+            hits.sort(key=_sort_key_relevance)
             order_used = "relevance"
 
+        # ページング
         start = (page - 1) * page_size
         end = start + page_size
         page_hits = hits[start:end]
         has_more = end < total_hits
         next_page = page + 1 if has_more else None
 
+        # 表示用アイテム化
         items: List[Dict[str, Any]] = []
         for i, (_, _d, rec) in enumerate(page_hits):
             items.append(build_item(rec, hl_terms, is_first_in_page=(i == 0)))
