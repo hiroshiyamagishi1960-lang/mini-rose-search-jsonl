@@ -607,3 +607,9 @@ def api_search(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+@app.get("/dump")
+def dump():
+    import inspect
+    src = inspect.getsourcefile(dump)
+    with open(__file__, "r") as f:
+        return PlainTextResponse(f.read())
