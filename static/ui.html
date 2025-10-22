@@ -47,16 +47,7 @@
     display:inline-block;padding:10px 12px;border:1px solid var(--b);border-radius:10px;
     color:var(--link);text-decoration:none;-webkit-tap-highlight-color:transparent;
   }
-  .src a:focus-visible{ outline:2px solid #93c5fd; outline-offset:2px }
   .src .rawurl{display:block;margin-top:6px;word-break:break-all}
-
-  details summary{cursor:pointer;padding:12px 16px;border-bottom:1px solid var(--b)}
-  .json{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:#0b1020;color:#d1e7ff;border-radius:12px;padding:10px;overflow:auto}
-
-  .notice{background:var(--warn);border:1px solid var(--warn-b);border-radius:14px;padding:12px 14px;margin-top:16px}
-  .howto{background:var(--how);border:1px solid var(--how-b);border-radius:14px;padding:14px;margin-top:12px}
-  .howto h3{margin:0 0 8px}
-
   mark{background:var(--hl);padding:0 .15em;border-radius:3px}
 </style>
 </head>
@@ -99,14 +90,6 @@
       </div>
     </div>
 
-    <details class="section" style="margin-top:12px">
-      <summary>開発者向け：レスポンス（生のJSON）</summary>
-      <div class="body">
-        <div class="meta">※ タイトルと本文の<strong>ハイライト（薄い青）</strong>はサーバの <code>&lt;mark&gt;</code> をそのまま表示します。</div>
-        <div id="raw" class="json">（未取得）</div>
-      </div>
-    </details>
-
     <div class="notice">
       <strong>お知らせ</strong><br/>
       チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。
@@ -135,18 +118,7 @@
     return await r.json();
   }
 
-  function normalize(raw, page){
-    const items = asArray(raw?.items)||[];
-    const norm = items.map(it=>{
-      const title = (it.title || "(無題)").replace(/<(?!\/?mark\b)[^>]+>/g,"");
-      const content = String(it.content || "");
-      const url = String(it.url || "");
-      const date = String(it.date || "");
-      return {title,content,url,date};
-    });
-    return { items:norm, total:(typeof raw?.total_hits==="number")?raw.total_hits:norm.length,
-             has_more:!!raw?.has_more, order_used: raw?.order_used || null, page };
-  }
+  function hasMark(html){ return /<mark>/.test(html||""); }
 
   async function doSearch(page){
     const q=$("q").value.trim(); if(!q){
@@ -158,20 +130,21 @@
       const ord="latest"; // ✅ 常に最新順で検索
       const url=`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(ord)}`;
       const raw=await jget(url);
-      const data=normalize(raw,page);
+      const items=asArray(raw?.items)||[];
+      if(!items.length){ $("meta").textContent="該当なし"; return; }
 
-      if(!data.items.length){ $("meta").textContent="該当なし"; return; }
+      $("results").innerHTML=items.map((it,i)=>{
+        const title = it.title || "(無題)";
+        const content = it.content || "";
+        const url = it.url || "";
+        const snippet = (i===0) ? content.slice(0,300)+"…" : content.slice(0,160)+"…";
+        const hit = hasMark(content) ? '<span class="hit">（本文にヒット）</span>' : '';
+        const link = url ? `<div class="src"><a href="${url}" target="_blank">本文表示（クリックして下さい。）</a></div>` : "";
+        return `<div class="result"><div class="title">${title}${hit}</div><div class="snippet">${snippet}</div>${link}</div>`;
+      }).join("");
 
-      $("results").innerHTML=data.items.map(it=>`
-        <div class="result">
-          <div class="title">${it.title}</div>
-          <div class="snippet">${(it.content||"").slice(0,300)}...</div>
-          ${it.url ? `<div class="src"><a href="${it.url}" target="_blank">本文表示</a></div>` : ""}
-        </div>
-      `).join("");
-
-      $("meta").textContent=`${data.total} 件中 ${(page-1)*PAGE_SIZE+1}–${Math.min(data.total,page*PAGE_SIZE)} 件を表示`;
-      $("prev").disabled = page<=1; $("next").disabled=!data.has_more;
+      $("meta").textContent=`${raw.total_hits||items.length} 件中 ${(page-1)*PAGE_SIZE+1}–${Math.min((page)*PAGE_SIZE,raw.total_hits||items.length)} 件を表示`;
+      $("prev").disabled = page<=1; $("next").disabled=!raw.has_more;
       window.__page=page;
     }catch(e){
       $("meta").textContent=`エラー：${String(e.message||e)}`;
