@@ -12,7 +12,6 @@
     --warn:#fff7cc; --warn-b:#fde68a; --how:#ffeff0; --how-b:#fecdd3;
   }
   html,body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;line-height:1.7}
-  /* 文字を少し大きく */
   html{font-size:20px}
   @media (max-width:480px){ html{font-size:21px} }
 
@@ -23,7 +22,6 @@
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .api{font-size:12px;color:var(--muted)}
 
-  /* 入力欄：濃紺の太枠＋薄い青の背景（ご要望） */
   input[type="text"]{
     flex:1 1 520px;min-width:260px;
     padding:16px 18px;border-radius:12px;background:var(--inbg);
@@ -75,8 +73,8 @@
       <div class="row" style="margin-top:8px">
         <input id="q" type="text" placeholder="例） コンテスト結果　／　例） コンテスト 2023　／　例） 剪定 1999-2001" />
         <select id="order" title="並び順">
-          <option value="relevance" selected>関連順</option>
-          <option value="latest">最新順</option>
+          <option value="relevance">関連順</option>
+          <option value="latest" selected>最新順</option>
         </select>
         <button class="primary" id="btnSearch">検索</button>
         <button id="btnClear">クリア</button>
@@ -104,7 +102,7 @@
     <details class="section" style="margin-top:12px">
       <summary>開発者向け：レスポンス（生のJSON）</summary>
       <div class="body">
-        <div class="meta">※ タイトルと本文の<strong>ハイライト（薄い青）</strong>はサーバの <code>&lt;mark&gt;</code> をそのまま表示します。<span class="hit">（本文にヒット）</span> は本文に <code>&lt;mark&gt;</code> がある時に付与します。</div>
+        <div class="meta">※ タイトルと本文の<strong>ハイライト（薄い青）</strong>はサーバの <code>&lt;mark&gt;</code> をそのまま表示します。</div>
         <div id="raw" class="json">（未取得）</div>
       </div>
     </details>
@@ -127,167 +125,66 @@
   </div>
 
 <script>
-  /* ===== 仕様どおりの挙動 ===== */
-  const PAGE_SIZE = 5; // 常に5件固定
+  const PAGE_SIZE = 5;
   const $ = (id) => document.getElementById(id);
   const asArray = (x) => Array.isArray(x) ? x : [];
-
-  /* マークを保持したまま文字数でトリミング */
-  function htmlSlicePreserveMark(html, start, end){
-    const div = document.createElement("div");
-    div.innerHTML = html || "";
-    let pos = 0, out = "";
-    function walk(node, inMark=false){
-      if (pos >= end) return;
-      if (node.nodeType === 1){
-        const isMark = node.tagName && node.tagName.toLowerCase() === "mark";
-        const nowMark = inMark || isMark;
-        node.childNodes.forEach(n => walk(n, nowMark));
-      }else if (node.nodeType === 3){
-        const text = node.nodeValue || "";
-        const len = text.length;
-        if (pos + len <= start){ pos += len; return; }
-        const s = Math.max(0, start - pos);
-        const e = Math.min(len, end - pos);
-        const chunk = text.slice(s, e);
-        if (chunk){
-          out += inMark ? ("<mark>" + chunk + "</mark>") : chunk;
-        }
-        pos += len;
-      }
-    }
-    walk(div, false);
-    return out;
-  }
-  function firstNHTML(html, n){
-    const div = document.createElement("div");
-    div.innerHTML = html || "";
-    const total = (div.textContent || "").length;
-    const end = Math.min(n, total);
-    let s = htmlSlicePreserveMark(html, 0, end);
-    if (end < total) s += "…";
-    return s;
-  }
-  function aroundFirstMarkHTML(html, side=80, fallback=160){
-    const div = document.createElement("div");
-    div.innerHTML = html || "";
-    const total = (div.textContent || "").length;
-    let pos = 0, ms = null, me = null;
-    (function find(node){
-      if (node.nodeType === 1){
-        if (node.tagName && node.tagName.toLowerCase()==="mark"){
-          const t = node.textContent || "";
-          ms = pos; me = pos + t.length;
-        }
-        node.childNodes.forEach(find);
-      }else if (node.nodeType === 3){
-        pos += (node.nodeValue || "").length;
-      }
-    })(div);
-    if (ms==null){ return firstNHTML(html, fallback); }
-    const start = Math.max(0, ms - side);
-    const end   = Math.min(total, me + side);
-    return (start>0?"…":"") + htmlSlicePreserveMark(html, start, end) + (end<total?"…":"");
-  }
-  function hasMark(html){ return /<mark>/.test(html||""); }
 
   async function jget(url){
     const r = await fetch(url, {cache:"no-store", headers:{Accept:"application/json"}});
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     return await r.json();
   }
+
   function normalize(raw, page){
-    const items = asArray(raw?.items)||asArray(raw?.results)||[];
+    const items = asArray(raw?.items)||[];
     const norm = items.map(it=>{
       const title = (it.title || "(無題)").replace(/<(?!\/?mark\b)[^>]+>/g,"");
-      const content = String(it.content || it.text || "");
-      const url = String(it.url || it.source || "");
-      const date = String(it.date || it.date_primary || "");
-      const rank = (typeof it.rank==="number") ? it.rank : null;
-      return {title,content,url,date,rank};
+      const content = String(it.content || "");
+      const url = String(it.url || "");
+      const date = String(it.date || "");
+      return {title,content,url,date};
     });
-    return {
-      items:norm,
-      total:(typeof raw?.total_hits==="number")?raw.total_hits:norm.length,
-      has_more:!!raw?.has_more,
-      order_used: raw?.order_used || null,
-      page
-    };
-  }
-  function metaText(total,page,shown,order_used){
-    const start=(page-1)*PAGE_SIZE+1, end=Math.min(total,start+shown-1);
-    return `${total} 件中 ${start}–${end} 件を表示　/　order_used: ${order_used||"unknown"}`;
-  }
-  function rowFirst(it){
-    const snippet = firstNHTML(it.content, 300); // 先頭は約300字
-    const hit = hasMark(it.content) ? '<span class="hit">（本文にヒット）</span>' : '';
-    const urlBlock = it.url
-      ? `<div class="src">
-           <a href="${it.url}" target="_blank" rel="noopener">本文表示（クリックして下さい。）</a>
-           <a class="rawurl" href="${it.url}" target="_blank" rel="noopener">${it.url}</a>
-         </div>` : "";
-    return `
-      <div class="result">
-        <div class="title">${it.title}${hit}</div>
-        <div class="snippet">${snippet}</div>
-        ${urlBlock}
-      </div>`;
-  }
-  function rowRest(it){
-    const snippet = aroundFirstMarkHTML(it.content, 80, 160); // 2〜5件はハイライト周辺
-    const urlBlock = it.url
-      ? `<div class="src">
-           <a href="${it.url}" target="_blank" rel="noopener">本文表示（クリックして下さい。）</a>
-           <a class="rawurl" href="${it.url}" target="_blank" rel="noopener">${it.url}</a>
-         </div>` : "";
-    return `
-      <div class="result">
-        <div class="title">${it.title}</div>
-        <div class="snippet">${snippet}</div>
-        ${urlBlock}
-      </div>`;
+    return { items:norm, total:(typeof raw?.total_hits==="number")?raw.total_hits:norm.length,
+             has_more:!!raw?.has_more, order_used: raw?.order_used || null, page };
   }
 
   async function doSearch(page){
     const q=$("q").value.trim(); if(!q){
-      $("results").innerHTML=""; $("meta").textContent="（未取得）"; $("raw").textContent="（未取得）";
+      $("results").innerHTML=""; $("meta").textContent="（未取得）";
       $("prev").disabled=true; $("next").disabled=true; return;
     }
-    $("btnSearch").disabled=true; $("prev").disabled=true; $("next").disabled=true;
-    $("meta").textContent="検索中…"; $("results").innerHTML="";
+    $("btnSearch").disabled=true; $("meta").textContent="検索中…"; $("results").innerHTML="";
     try{
-      const ord=$("order").value;
+      const ord="latest"; // ✅ 常に最新順で検索
       const url=`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(ord)}`;
-      const raw=await jget(url); $("raw").textContent=JSON.stringify(raw,null,2);
+      const raw=await jget(url);
       const data=normalize(raw,page);
-      if(data.order_used && $("order").value!==data.order_used){ $("order").value=data.order_used; } // APIに合わせる
 
-      const items=data.items;
-      if(!items.length){ $("meta").textContent="該当なし"; return; }
+      if(!data.items.length){ $("meta").textContent="該当なし"; return; }
 
-      $("results").innerHTML = rowFirst(items[0]) + items.slice(1).map(rowRest).join("");
-      $("meta").textContent = metaText(data.total,data.page,items.length,data.order_used);
-      $("prev").disabled = page<=1; $("next").disabled=!data.has_more; window.__page=page;
+      $("results").innerHTML=data.items.map(it=>`
+        <div class="result">
+          <div class="title">${it.title}</div>
+          <div class="snippet">${(it.content||"").slice(0,300)}...</div>
+          ${it.url ? `<div class="src"><a href="${it.url}" target="_blank">本文表示</a></div>` : ""}
+        </div>
+      `).join("");
+
+      $("meta").textContent=`${data.total} 件中 ${(page-1)*PAGE_SIZE+1}–${Math.min(data.total,page*PAGE_SIZE)} 件を表示`;
+      $("prev").disabled = page<=1; $("next").disabled=!data.has_more;
+      window.__page=page;
     }catch(e){
       $("meta").textContent=`エラー：${String(e.message||e)}`;
     }finally{ $("btnSearch").disabled=false; }
   }
 
-  // イベント（btnSearch / doSearch どちらでも動く保険）
-  document.getElementById("btnSearch")?.addEventListener("click", ()=>doSearch(1));
-  document.getElementById("doSearch") ?.addEventListener("click", ()=>doSearch(1));
-  $("btnClear").addEventListener("click", ()=>{ $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; $("raw").textContent="（未取得）"; $("prev").disabled=true; $("next").disabled=true; });
+  $("btnSearch").addEventListener("click", ()=>doSearch(1));
+  $("btnClear").addEventListener("click", ()=>{ $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; });
   $("prev").addEventListener("click", ()=>{ const p=Math.max(1,(window.__page||1)-1); doSearch(p); });
   $("next").addEventListener("click", ()=>{ const p=(window.__page||1)+1; doSearch(p); });
   $("q").addEventListener("keydown",(e)=>{ if(e.key==="Enter"){ doSearch(1); } });
-  $("order").addEventListener("change", ()=>doSearch(1));
 
-  // 版表示 & ?q= 即時検索
-  (async ()=>{
-    try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{}
-    const usp=new URLSearchParams(location.search);
-    if(usp.get("q")){ $("q").value=usp.get("q"); doSearch(1); }
-  })();
+  (async ()=>{ try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{} })();
 </script>
 </body>
 </html>
