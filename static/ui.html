@@ -47,7 +47,16 @@
     display:inline-block;padding:10px 12px;border:1px solid var(--b);border-radius:10px;
     color:var(--link);text-decoration:none;-webkit-tap-highlight-color:transparent;
   }
+  .src a:focus-visible{ outline:2px solid #93c5fd; outline-offset:2px }
   .src .rawurl{display:block;margin-top:6px;word-break:break-all}
+
+  details summary{cursor:pointer;padding:12px 16px;border-bottom:1px solid var(--b)}
+  .json{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:#0b1020;color:#d1e7ff;border-radius:12px;padding:10px;overflow:auto}
+
+  .notice{background:var(--warn);border:1px solid var(--warn-b);border-radius:14px;padding:12px 14px;margin-top:16px}
+  .howto{background:var(--how);border:1px solid var(--how-b);border-radius:14px;padding:14px;margin-top:12px}
+  .howto h3{margin:0 0 8px}
+
   mark{background:var(--hl);padding:0 .15em;border-radius:3px}
 </style>
 </head>
@@ -90,6 +99,14 @@
       </div>
     </div>
 
+    <details class="section" style="margin-top:12px">
+      <summary>開発者向け：レスポンス（生のJSON）</summary>
+      <div class="body">
+        <div class="meta">※ タイトルと本文の<strong>ハイライト（薄い青）</strong>はサーバの <code>&lt;mark&gt;</code> をそのまま表示します。<span class="hit">（本文にヒット）</span> は本文に <code>&lt;mark&gt;</code> がある時に付与します。</div>
+        <div id="raw" class="json">（未取得）</div>
+      </div>
+    </details>
+
     <div class="notice">
       <strong>お知らせ</strong><br/>
       チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。
@@ -108,56 +125,170 @@
   </div>
 
 <script>
-  const PAGE_SIZE = 5;
+  /* ===== 仕様どおりの挙動 ===== */
+  const PAGE_SIZE = 5; // 常に5件固定
   const $ = (id) => document.getElementById(id);
   const asArray = (x) => Array.isArray(x) ? x : [];
+
+  /* ----- <mark> を壊さずにスニペットを切り出すユーティリティ ----- */
+  function htmlSlicePreserveMark(html, start, end){
+    const div = document.createElement("div");
+    div.innerHTML = html || "";
+    let pos = 0, out = "";
+    function walk(node, inMark=false){
+      if (pos >= end) return;
+      if (node.nodeType === 1){
+        const isMark = node.tagName && node.tagName.toLowerCase() === "mark";
+        const nowMark = inMark || isMark;
+        node.childNodes.forEach(n => walk(n, nowMark));
+      }else if (node.nodeType === 3){
+        const text = node.nodeValue || "";
+        const len = text.length;
+        if (pos + len <= start){ pos += len; return; }
+        const s = Math.max(0, start - pos);
+        const e = Math.min(len, end - pos);
+        const chunk = text.slice(s, e);
+        if (chunk){
+          out += inMark ? ("<mark>" + chunk + "</mark>") : chunk;
+        }
+        pos += len;
+      }
+    }
+    walk(div, false);
+    return out;
+  }
+  function firstNHTML(html, n){
+    const div = document.createElement("div");
+    div.innerHTML = html || "";
+    const total = (div.textContent || "").length;
+    const end = Math.min(n, total);
+    let s = htmlSlicePreserveMark(html, 0, end);
+    if (end < total) s += "…";
+    return s;
+  }
+  function aroundFirstMarkHTML(html, side=80, fallback=160){
+    const div = document.createElement("div");
+    div.innerHTML = html || "";
+    const total = (div.textContent || "").length;
+    let pos = 0, ms = null, me = null;
+    (function find(node){
+      if (node.nodeType === 1){
+        if (node.tagName && node.tagName.toLowerCase()==="mark"){
+          const t = node.textContent || "";
+          ms = pos; me = pos + t.length;
+        }
+        node.childNodes.forEach(find);
+      }else if (node.nodeType === 3){
+        pos += (node.nodeValue || "").length;
+      }
+    })(div);
+    if (ms==null){ return firstNHTML(html, fallback); }
+    const start = Math.max(0, ms - side);
+    const end   = Math.min(total, me + side);
+    return (start>0?"…":"") + htmlSlicePreserveMark(html, start, end) + (end<total?"…":"");
+  }
+  function hasMark(html){ return /<mark>/.test(html||""); }
 
   async function jget(url){
     const r = await fetch(url, {cache:"no-store", headers:{Accept:"application/json"}});
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     return await r.json();
   }
-
-  function hasMark(html){ return /<mark>/.test(html||""); }
+  function normalize(raw, page){
+    const items = asArray(raw?.items)||asArray(raw?.results)||[];
+    const norm = items.map(it=>{
+      const title = (it.title || "(無題)").replace(/<(?!\/?mark\b)[^>]+>/g,"");
+      const content = String(it.content || it.text || "");
+      const url = String(it.url || it.source || "");
+      const date = String(it.date || it.date_primary || "");
+      const rank = (typeof it.rank==="number") ? it.rank : null;
+      return {title,content,url,date,rank};
+    });
+    return {
+      items:norm,
+      total:(typeof raw?.total_hits==="number")?raw.total_hits:norm.length,
+      has_more:!!raw?.has_more,
+      order_used: raw?.order_used || null,
+      page
+    };
+  }
+  function metaText(total,page,shown,order_used){
+    const start=(page-1)*PAGE_SIZE+1, end=Math.min(total,start+shown-1);
+    return `${total} 件中 ${start}–${end} 件を表示　/　order_used: ${order_used||"unknown"}`;
+  }
+  function rowFirst(it){
+    // 先に「本文にヒット」判定（<mark> を壊す前に！）
+    const hit = hasMark(it.content) ? '<span class="hit">（本文にヒット）</span>' : '';
+    const snippet = firstNHTML(it.content, 300); // 先頭は約300字（<mark>保持）
+    const urlBlock = it.url
+      ? `<div class="src">
+           <a href="${it.url}" target="_blank" rel="noopener">本文表示（クリックして下さい。）</a>
+           <a class="rawurl" href="${it.url}" target="_blank" rel="noopener">${it.url}</a>
+         </div>` : "";
+    return `
+      <div class="result">
+        <div class="title">${it.title}${hit}</div>
+        <div class="snippet">${snippet}</div>
+        ${urlBlock}
+      </div>`;
+  }
+  function rowRest(it){
+    const hit = hasMark(it.content) ? '<span class="hit">（本文にヒット）</span>' : '';
+    const snippet = aroundFirstMarkHTML(it.content, 80, 160); // 2〜5件はヒット近辺
+    const urlBlock = it.url
+      ? `<div class="src">
+           <a href="${it.url}" target="_blank" rel="noopener">本文表示（クリックして下さい。）</a>
+           <a class="rawurl" href="${it.url}" target="_blank" rel="noopener">${it.url}</a>
+         </div>` : "";
+    return `
+      <div class="result">
+        <div class="title">${it.title}${hit}</div>
+        <div class="snippet">${snippet}</div>
+        ${urlBlock}
+      </div>`;
+  }
 
   async function doSearch(page){
     const q=$("q").value.trim(); if(!q){
-      $("results").innerHTML=""; $("meta").textContent="（未取得）";
+      $("results").innerHTML=""; $("meta").textContent="（未取得）"; $("raw").textContent="（未取得）";
       $("prev").disabled=true; $("next").disabled=true; return;
     }
-    $("btnSearch").disabled=true; $("meta").textContent="検索中…"; $("results").innerHTML="";
+    $("btnSearch").disabled=true; $("prev").disabled=true; $("next").disabled=true;
+    $("meta").textContent="検索中…"; $("results").innerHTML="";
     try{
-      const ord="latest"; // ✅ 常に最新順で検索
+      // ✅ 常に最新順をサーバへ要求（UI側で並べ替えはしない）
+      const ord="latest";
       const url=`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(ord)}`;
-      const raw=await jget(url);
-      const items=asArray(raw?.items)||[];
+      const raw=await jget(url); $("raw").textContent=JSON.stringify(raw,null,2);
+      const data=normalize(raw,page);
+
+      const items=data.items;
       if(!items.length){ $("meta").textContent="該当なし"; return; }
 
-      $("results").innerHTML=items.map((it,i)=>{
-        const title = it.title || "(無題)";
-        const content = it.content || "";
-        const url = it.url || "";
-        const snippet = (i===0) ? content.slice(0,300)+"…" : content.slice(0,160)+"…";
-        const hit = hasMark(content) ? '<span class="hit">（本文にヒット）</span>' : '';
-        const link = url ? `<div class="src"><a href="${url}" target="_blank">本文表示（クリックして下さい。）</a></div>` : "";
-        return `<div class="result"><div class="title">${title}${hit}</div><div class="snippet">${snippet}</div>${link}</div>`;
-      }).join("");
-
-      $("meta").textContent=`${raw.total_hits||items.length} 件中 ${(page-1)*PAGE_SIZE+1}–${Math.min((page)*PAGE_SIZE,raw.total_hits||items.length)} 件を表示`;
-      $("prev").disabled = page<=1; $("next").disabled=!raw.has_more;
-      window.__page=page;
+      // サーバの順序をそのまま描画（クライアントでソートしない）
+      $("results").innerHTML = rowFirst(items[0]) + items.slice(1).map(rowRest).join("");
+      $("meta").textContent = metaText(data.total,data.page,items.length,data.order_used);
+      $("prev").disabled = page<=1; $("next").disabled=!data.has_more; window.__page=page;
     }catch(e){
       $("meta").textContent=`エラー：${String(e.message||e)}`;
     }finally{ $("btnSearch").disabled=false; }
   }
 
-  $("btnSearch").addEventListener("click", ()=>doSearch(1));
-  $("btnClear").addEventListener("click", ()=>{ $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; });
+  // イベント
+  document.getElementById("btnSearch")?.addEventListener("click", ()=>doSearch(1));
+  document.getElementById("doSearch") ?.addEventListener("click", ()=>doSearch(1));
+  $("btnClear").addEventListener("click", ()=>{ $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; $("raw").textContent="（未取得）"; $("prev").disabled=true; $("next").disabled=true; });
   $("prev").addEventListener("click", ()=>{ const p=Math.max(1,(window.__page||1)-1); doSearch(p); });
   $("next").addEventListener("click", ()=>{ const p=(window.__page||1)+1; doSearch(p); });
   $("q").addEventListener("keydown",(e)=>{ if(e.key==="Enter"){ doSearch(1); } });
+  $("order").addEventListener("change", ()=>doSearch(1)); // プルダウンは見た目だけ。常に latest を送信
 
-  (async ()=>{ try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{} })();
+  // 版表示 & ?q= 即時検索
+  (async ()=>{
+    try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{}
+    const usp=new URLSearchParams(location.search);
+    if(usp.get("q")){ $("q").value=usp.get("q"); doSearch(1); }
+  })();
 </script>
 </body>
 </html>
