@@ -1,9 +1,11 @@
-# app.py — 一般的な検索ロジック準拠（決定的ソート＋ページング前dedupe＋表示加工は最後）版 v4.1
-# 目的:
-# - 「次へ」を押しても同じ文書が再出現しない
-# - 特別な検索ロジックは使わない。一般の定石のみ：
-#   ①スナップショット作成 → ②完全順序（score↓, date↓, doc_id↑）→ ③dedupe（doc_id）→ ④ページ切り出し → ⑤表示加工（ハイライト等）
-# - 既存API（/api/search）の出力形式は維持。UI変更不要。
+# app.py — 一般的な検索ロジック準拠（決定的ソート＋ページング前dedupe＋表示加工は最後）版 v4.2
+# 方針（“特別な検索ロジック”は使わない一般解）：
+#  ①スナップショット固定 → ②完全順序（score↓, date↓, doc_id↑）→ ③dedupe（doc_id）→ ④ページ切り出し → ⑤表示加工のみ最後
+#  これで「次へ」で同じ文書が再出現しない／ページ間の交わりゼロを保証。
+#
+# API互換：
+#   GET /api/search?q=...&page=1&page_size=5&order=(relevance|latest)&refresh=0
+#   応答：{ items: [{title, content, url, rank, date}], total_hits, page, page_size, has_more, next_page, error, order_used }
 
 import os, io, re, json, hashlib, unicodedata
 from datetime import datetime
@@ -22,9 +24,9 @@ except Exception:
 # ==================== 基本設定 ====================
 KB_URL   = (os.getenv("KB_URL", "") or "").strip()
 KB_PATH  = os.path.normpath((os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip())
-VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-21-v4.1")
+VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-22-v4.2")
 
-app = FastAPI(title="mini-rose-search-jsonl (general-logic v4.1)")
+app = FastAPI(title="mini-rose-search-jsonl (general-logic v4.2)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=False,
@@ -147,15 +149,12 @@ TEXT_KEYS  = ["content","text","body","本文","内容","記事","description","
 DATE_KEYS  = ["date","Date","published_at","published","created_at","更新日","作成日","日付","開催日","発行日"]
 URL_KEYS   = ["url","URL","link","permalink","出典URL","公開URL","source"]
 ID_KEYS    = ["id","doc_id","record_id","ページID"]
+AUTH_KEYS  = ["author","Author","writer","posted_by","著者","講師"]
 
 def record_as_text(rec: Dict[str, Any], field: str) -> str:
     key_map = {
-        "title": TITLE_KEYS,
-        "text":  TEXT_KEYS,
-        "date":  DATE_KEYS,
-        "url":   URL_KEYS,
-        "id":    ID_KEYS,
-        "author": ["author","Author","writer","posted_by","著者","講師"],
+        "title": TITLE_KEYS, "text": TEXT_KEYS, "date": DATE_KEYS,
+        "url": URL_KEYS, "id": ID_KEYS, "author": AUTH_KEYS
     }
     keys = key_map.get(field, [field])
     for k in keys:
@@ -236,7 +235,6 @@ def _record_years(rec: Dict[str, Any]) -> List[int]:
     ys = set()
     d = record_date(rec)
     if d: ys.add(d.year)
-    # タイトル等に年が含まれている場合も拾う（簡易）
     for field in ("title","text","url","author"):
         v = record_as_text(rec, field)
         for y in re.findall(r"(19\d{2}|20\d{2}|21\d{2})", _nfkc(v)):
@@ -294,7 +292,10 @@ def build_item(rec: Dict[str, Any], q_base: str, is_first_in_page: bool) -> Dict
     body  = record_as_text(rec, "text") or ""
     # ざっくりハイライト（表示専用）
     esc = lambda s: (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-    title_h = esc(title).replace(esc(q_base), f"<mark>{esc(q_base)}</mark>") if q_base else esc(title)
+    qb = esc(q_base)
+    def mark(s: str) -> str:
+        return esc(s).replace(qb, f"<mark>{qb}</mark>") if q_base else esc(s)
+
     if is_first_in_page:
         snippet_src = body[:300]
     else:
@@ -304,10 +305,9 @@ def build_item(rec: Dict[str, Any], q_base: str, is_first_in_page: bool) -> Dict
         else:
             start = max(0, pos - 80); end = min(len(body), pos + 80)
             snippet_src = ("…" if start>0 else "") + body[start:end] + ("…" if end<len(body) else "")
-    content_h = esc(snippet_src).replace(esc(q_base), f"<mark>{esc(q_base)}</mark>") if q_base else esc(snippet_src)
     return {
-        "title": title_h,
-        "content": content_h,
+        "title": mark(title),
+        "content": mark(snippet_src),
         "url": record_as_text(rec, "url"),
         "rank": None,
         "date": record_as_text(rec, "date"),
@@ -453,5 +453,4 @@ def api_search(
 # ==================== ローカル実行 ====================
 if __name__ == "__main__":
     import uvicorn
-    # PORT 環境変数があれば尊重
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
