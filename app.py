@@ -1,15 +1,24 @@
-# app.py — 一般的な検索ロジック準拠（決定的ソート＋ページング前dedupe＋表示加工は最後）版 v4.2
-# 方針（“特別な検索ロジック”は使わない一般解）：
-#  ①スナップショット固定 → ②完全順序（score↓, date↓, doc_id↑）→ ③dedupe（doc_id）→ ④ページ切り出し → ⑤表示加工のみ最後
-#  これで「次へ」で同じ文書が再出現しない／ページ間の交わりゼロを保証。
+# app.py — かなフォールディング＋軽量ファジー＋同義語CSV対応 / 日付ソート対応版 v5.0
+# 目的：
+#  1) 一般的な検索の“多層のゆれ吸収”のうち、辞書いらずで効く２点を内蔵
+#     - かなフォールディング（カタカナ⇔ひらがな/小書き→標準/長音→母音/濁点・半濁点の吸収）
+#     - 軽量ファジー（編集距離≤1 を加点）
+#  2) ドメイン固有の同義語は CSV（canonical,variant）で外部管理（任意）
+#     - 環境変数 SYNONYM_CSV でパス指定（未設定でも動作）
+#  3) ソートは relevance と latest（開催日/発行日など日付降順）を選択可能
+#     - UI側で order=latest を指定すれば「開催日/発行日」降順で並びます
 #
 # API互換：
 #   GET /api/search?q=...&page=1&page_size=5&order=(relevance|latest)&refresh=0
 #   応答：{ items: [{title, content, url, rank, date}], total_hits, page, page_size, has_more, next_page, error, order_used }
+#
+# 注意：
+#  - 検索用データは不変。ハイライトは表示直前のみ（検索順位に影響しない）
+#  - doc_id でページング前に dedupe（完全順序：score↓,date↓,doc_id↑ / または date↓,score↓,doc_id↑）
 
-import os, io, re, json, hashlib, unicodedata
+import os, io, re, csv, json, hashlib, unicodedata
 from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 from urllib.parse import urlparse, urlunparse, parse_qsl
 
 from fastapi import FastAPI, Query
@@ -22,11 +31,12 @@ except Exception:
     requests = None
 
 # ==================== 基本設定 ====================
-KB_URL   = (os.getenv("KB_URL", "") or "").strip()
-KB_PATH  = os.path.normpath((os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip())
-VERSION  = os.getenv("APP_VERSION", "jsonl-2025-10-22-v4.2")
+KB_URL    = (os.getenv("KB_URL", "") or "").strip()
+KB_PATH   = os.path.normpath((os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip())
+VERSION   = os.getenv("APP_VERSION", "jsonl-2025-10-22-v5.0")
+SYN_CSV   = (os.getenv("SYNONYM_CSV", "") or "").strip()  # 例: "./synonyms.csv"
 
-app = FastAPI(title="mini-rose-search-jsonl (general-logic v4.2)")
+app = FastAPI(title="mini-rose-search-jsonl (kana-fold + fuzzy + synonym-csv)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=False,
@@ -34,12 +44,12 @@ app.add_middleware(
 )
 
 KB_LINES: int = 0
-KB_HASH: str = ""
+KB_HASH:  str = ""
 LAST_ERROR: str = ""
 LAST_EVENT: str = ""
 _KB_ROWS: Optional[List[Dict[str, Any]]] = None  # メモリ常駐
 
-# ==================== 文字・正規化ユーティリティ ====================
+# ==================== 正規化ユーティリティ ====================
 def _nfkc(s: Optional[str]) -> str:
     return unicodedata.normalize("NFKC", s or "")
 
@@ -58,6 +68,123 @@ def textify(x: Any) -> str:
         return json.dumps(x, ensure_ascii=False)
     except Exception:
         return str(x)
+
+# ==================== かなフォールディング（辞書不要で揺れ吸収） ====================
+# 目的：カタ→ひら、小書き→標準、長音→母音、濁点/半濁点を吸収して比較強化
+KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
+HIRA_SMALL2NORM = {
+    "ぁ":"あ","ぃ":"い","ぅ":"う","ぇ":"え","ぉ":"お",
+    "ゃ":"や","ゅ":"ゆ","ょ":"よ","っ":"つ","ゎ":"わ",
+}
+DAKUTEN = "\u3099"; HANDAKUTEN = "\u309A"  # 結合文字（濁点・半濁点）
+VOWELS = {"あ","い","う","え","お"}
+
+def _strip_diacritics(hira: str) -> str:
+    # 濁点・半濁点を除去（NFD→結合記号除去→NFC）
+    nfkd = unicodedata.normalize("NFD", hira)
+    no_marks = "".join(ch for ch in nfkd if ch not in (DAKUTEN, HANDAKUTEN))
+    return unicodedata.normalize("NFC", no_marks)
+
+def _long_vowel_to_vowel(hira: str) -> str:
+    # 長音「ー」を直前の母音に変換（直前が母音でない場合はそのまま）
+    out = []
+    prev = ""
+    for ch in hira:
+        if ch == "ー" and prev in VOWELS:
+            out.append(prev)
+        else:
+            out.append(ch)
+            prev = ch
+    return "".join(out)
+
+def fold_kana(s: str) -> str:
+    if not s: return ""
+    t = _nfkc(s)
+    # カタカナ→ひらがな
+    t = t.translate(KATA_TO_HIRA)
+    # 小書き→標準
+    t = "".join(HIRA_SMALL2NORM.get(ch, ch) for ch in t)
+    # 長音→母音
+    t = _long_vowel_to_vowel(t)
+    # 濁点/半濁点を吸収（除去）
+    t = _strip_diacritics(t)
+    return t
+
+# ==================== 軽量ファジー（編集距離≤1） ====================
+def _lev1_match(term: str, hay: str) -> bool:
+    """編集距離<=1 を高速近似。長さ差>1ならFalse。"""
+    if not term or not hay: return False
+    n, m = len(term), len(hay)
+    if abs(n - m) > 1:
+        return False
+    # 1) 同長：1文字まで相違OK
+    if n == m:
+        diff = 0
+        for a, b in zip(term, hay):
+            if a != b:
+                diff += 1
+                if diff > 1: return False
+        return True
+    # 2) 長さ差=1：片方に1文字挿入で一致
+    # ポインタで1回だけスキップ許容
+    if n > m: term, hay = hay, term; n, m = m, n
+    i = j = diff = 0
+    while i < n and j < m:
+        if term[i] == hay[j]:
+            i += 1; j += 1
+        else:
+            diff += 1
+            if diff > 1: return False
+            j += 1
+    return True  # 末尾1文字差はOK
+
+def fuzzy_contains(term: str, text: str) -> bool:
+    """text 内に、term と編集距離<=1の部分が存在するか。"""
+    if not term or not text: return False
+    n, m = len(term), len(text)
+    if n == 1:
+        return term in text
+    if m < n - 1:
+        return False
+    lo = max(1, n - 1); hi = n + 1
+    for L in (n, lo, hi):
+        if L <= 0: continue
+        if L > m: continue
+        for i in range(0, m - L + 1):
+            if _lev1_match(term, text[i:i+L]):
+                return True
+    return False
+
+# ==================== 同義語CSVの読み込み（任意） ====================
+# 形式：canonical,variant
+# 例:
+# canonical,variant
+# 苔,こけ
+# 苔,コケ
+# 剪定,せん定
+# ...
+_syn_variant2canon: Dict[str, Set[str]] = {}
+_syn_canon2variant: Dict[str, Set[str]] = {}
+
+def _load_synonyms_from_csv(path: str):
+    global _syn_variant2canon, _syn_canon2variant
+    _syn_variant2canon = {}; _syn_canon2variant = {}
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with io.open(path, "r", encoding="utf-8") as f:
+            rdr = csv.reader(f)
+            header = next(rdr, None)
+            for row in rdr:
+                if len(row) < 2: continue
+                canon = normalize_text(row[0])
+                vari  = normalize_text(row[1])
+                if not canon or not vari: continue
+                _syn_canon2variant.setdefault(canon, set()).add(vari)
+                _syn_variant2canon.setdefault(vari, set()).add(canon)
+    except Exception:
+        # CSVが壊れていても致命傷にはしない
+        pass
 
 # ==================== kb.jsonl 読み込み ====================
 def _bytes_to_jsonl(blob: bytes) -> bytes:
@@ -118,6 +245,8 @@ def ensure_kb() -> Tuple[int, str]:
         try:
             lines, sha = _compute_lines_and_hash(KB_PATH)
             _KB_ROWS = _load_rows_into_memory(KB_PATH)
+            # 同義語CSVも読み込む
+            _load_synonyms_from_csv(SYN_CSV)
             return lines, sha
         except Exception as e:
             LAST_ERROR = f"hash_failed: {type(e).__name__}: {e}"
@@ -143,10 +272,11 @@ def _startup():
         KB_LINES, KB_HASH = 0, ""
         LAST_ERROR = f"startup_failed: {type(e).__name__}: {e}"
 
-# ==================== フィールド抽出（必要最低限） ====================
+# ==================== フィールド抽出 ====================
 TITLE_KEYS = ["title","Title","名前","タイトル","題名","見出し","subject","headline"]
 TEXT_KEYS  = ["content","text","body","本文","内容","記事","description","summary","excerpt"]
-DATE_KEYS  = ["date","Date","published_at","published","created_at","更新日","作成日","日付","開催日","発行日"]
+# 「開催日/発行日」を最優先で拾うよう、キー順序を工夫
+DATE_KEYS  = ["開催日/発行日","date","Date","published_at","published","created_at","更新日","作成日","日付","開催日","発行日"]
 URL_KEYS   = ["url","URL","link","permalink","出典URL","公開URL","source"]
 ID_KEYS    = ["id","doc_id","record_id","ページID"]
 AUTH_KEYS  = ["author","Author","writer","posted_by","著者","講師"]
@@ -242,24 +372,28 @@ def _record_years(rec: Dict[str, Any]) -> List[int]:
     return sorted(ys)
 
 def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
+    # 日本語日付も拾う
+    s_raw = None
     for k in DATE_KEYS:
         v = rec.get(k)
         if not v: continue
-        s = normalize_text(textify(v))
+        s_raw = normalize_text(textify(v))
+        # まずISO等
         for fmt in ("%Y-%m-%d","%Y/%m/%d","%Y.%m.%d","%Y-%m","%Y/%m","%Y.%m","%Y"):
             try:
-                return datetime.strptime(s[:len(fmt)], fmt)
+                return datetime.strptime(s_raw[:len(fmt)], fmt)
             except Exception:
                 continue
-        m = re.match(r"^(\d{4})年(\d{1,2})月(\d{1,2})日?$", s)
+        # 日本語
+        m = re.match(r"^(\d{4})年(\d{1,2})月(\d{1,2})日?$", s_raw)
         if m:
             try: return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             except Exception: pass
-        m = re.match(r"^(\d{4})年(\d{1,2})月$", s)
+        m = re.match(r"^(\d{4})年(\d{1,2})月$", s_raw)
         if m:
             try: return datetime(int(m.group(1)), int(m.group(2)), 1)
             except Exception: pass
-        m = re.match(r"^(\d{4})年$", s)
+        m = re.match(r"^(\d{4})年$", s_raw)
         if m:
             try: return datetime(int(m.group(1)), 1, 1)
             except Exception: pass
@@ -273,56 +407,124 @@ def _matches_year(rec: Dict[str, Any], year: Optional[int], yr: Optional[Tuple[i
     lo, hi = yr
     return any(lo <= y <= hi for y in ys)
 
-# ==================== 検索（一般解：簡易スコア＋完全順序） ====================
-def _score(rec: Dict[str, Any], q_base: str) -> int:
-    """最小の関連度：タイトル部分一致3点＋本文部分一致1点×出現回数"""
-    if not q_base: return 0
-    t = normalize_text(record_as_text(rec, "title"))
-    b = normalize_text(record_as_text(rec, "text"))
-    s = 0
-    if t:
-        s += 3 * t.count(q_base)
-    if b:
-        s += 1 * b.count(q_base)
-    return s
+# ==================== 同義語展開ヘルパ ====================
+def expand_with_synonyms(term: str) -> Set[str]:
+    """term に対して、CSVで与えられた同義語をふくめた候補集合を返す。"""
+    t = normalize_text(term)
+    out: Set[str] = {t}
+    # variant→canon
+    for canon in _syn_variant2canon.get(t, set()):
+        out.add(canon)
+        out.update(_syn_canon2variant.get(canon, set()))
+    # 直接canonだった場合
+    if t in _syn_canon2variant:
+        out.update(_syn_canon2variant[t])
+    return out
 
-def build_item(rec: Dict[str, Any], q_base: str, is_first_in_page: bool) -> Dict[str, Any]:
-    # 表示用（最後にだけ加工）——検索用データは汚さない
+# ==================== 検索（スコア：プレーン＋フォールド＋ファジー） ====================
+def _score_record(rec: Dict[str, Any], tokens: List[str]) -> int:
+    """
+    最小だが実用的なスコア：
+      - タイトル一致：3点/ヒット
+      - 本文一致    ：1点/ヒット
+      - ひらがなフォールド一致：同上加点
+      - 軽量ファジー（編集距離≤1）一致：0.5点相当（整数化のため +1 だが重みを抑える）
+    """
+    title = normalize_text(record_as_text(rec, "title"))
+    text  = normalize_text(record_as_text(rec, "text"))
+    ftit  = fold_kana(title)
+    ftxt  = fold_kana(text)
+
+    score = 0
+    for raw in tokens:
+        if not raw: continue
+        # 同義語展開
+        exts = expand_with_synonyms(raw) or {raw}
+        for t in exts:
+            ft = fold_kana(t)
+            # プレーン一致
+            if t and title.count(t) > 0: score += 3 * title.count(t)
+            if t and text.count(t)  > 0: score += 1 * text.count(t)
+            # フォールド一致（ひらがな化等）
+            if ft and ftit.count(ft) > 0: score += 3 * ftit.count(ft)
+            if ft and ftxt.count(ft) > 0: score += 1 * ftxt.count(ft)
+            # 低コストファジー（編集距離<=1）
+            # タイトル
+            if len(t) >= 2 and fuzzy_contains(fold_kana(t), ftit):
+                score += 1  # 0.5点相当（整数で表現）
+            # 本文
+            if len(t) >= 2 and fuzzy_contains(fold_kana(t), ftxt):
+                score += 1
+    return score
+
+# ==================== ハイライト（表示専用） ====================
+def html_escape(s: str) -> str:
+    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+def highlight_simple(text: str, terms: List[str]) -> str:
+    if not text: return ""
+    esc = html_escape(text)
+    # オリジナル語＋同義語をハイライト（見栄え目的。フォールディングまではやり過ぎない）
+    hlset: Set[str] = set()
+    for t in terms:
+        hlset.add(normalize_text(t))
+        hlset |= expand_with_synonyms(t)
+    # 長い語から置換
+    for t in sorted(hlset, key=len, reverse=True):
+        if not t: continue
+        et = html_escape(t)
+        esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
+    return esc
+
+def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool) -> Dict[str, Any]:
     title = record_as_text(rec, "title") or "(無題)"
     body  = record_as_text(rec, "text") or ""
-    # ざっくりハイライト（表示専用）
-    esc = lambda s: (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-    qb = esc(q_base)
-    def mark(s: str) -> str:
-        return esc(s).replace(qb, f"<mark>{qb}</mark>") if q_base else esc(s)
-
+    # スニペット
     if is_first_in_page:
         snippet_src = body[:300]
     else:
-        pos = body.find(q_base) if q_base else -1
+        # 最初のヒット近傍（簡易）：最初の語で探す
+        pos = -1
+        base = None
+        for t in terms:
+            t = normalize_text(t)
+            if t:
+                p = body.find(t)
+                if p >= 0:
+                    pos = p; base = t; break
         if pos < 0:
             snippet_src = body[:160]
         else:
             start = max(0, pos - 80); end = min(len(body), pos + 80)
             snippet_src = ("…" if start>0 else "") + body[start:end] + ("…" if end<len(body) else "")
     return {
-        "title": mark(title),
-        "content": mark(snippet_src),
-        "url": record_as_text(rec, "url"),
-        "rank": None,
-        "date": record_as_text(rec, "date"),
+        "title":   highlight_simple(title, terms),
+        "content": highlight_simple(snippet_src, terms),
+        "url":     record_as_text(rec, "url"),
+        "rank":    None,
+        "date":    record_as_text(rec, "date"),  # 「開催日/発行日」を優先抽出済み
     }
 
+# ==================== クエリ処理 ====================
+def tokenize_query(q: str) -> List[str]:
+    # シンプル：ダブルクオート内はそのまま、それ以外は空白で分割
+    TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')
+    out: List[str] = []
+    for m in TOKEN_RE.finditer(normalize_text(q)):
+        tok = m.group(1) if m.group(1) is not None else m.group(2)
+        if tok:
+            out.append(tok)
+    return out
+
+# ==================== 並び（完全順序） ====================
 def sort_key_relevance(entry: Tuple[int, Optional[datetime], str, Dict[str, Any]]) -> Tuple:
     score, d, did, _ = entry
     date_key = d or datetime.min
-    # 完全順序：score↓, date↓, doc_id↑
     return (-int(score), -int(date_key.strftime("%Y%m%d%H%M%S")), did)
 
 def sort_key_latest(entry: Tuple[int, Optional[datetime], str, Dict[str, Any]]) -> Tuple:
     score, d, did, _ = entry
     date_key = d or datetime.min
-    # 完全順序：date↓, score↓, doc_id↑
     return (-int(date_key.strftime("%Y%m%d%H%M%S")), -int(score), did)
 
 # ==================== 共通レスポンスヘルパ ====================
@@ -363,7 +565,7 @@ def api_search(
     page: int = Query(1, ge=1),
     page_size: int = Query(5, ge=1, le=50),
     order: str = Query("relevance", pattern="^(relevance|latest)$"),
-    refresh: int = Query(0, description="1=kb.jsonl を再取得・再読み込み"),
+    refresh: int = Query(0, description="1=kb.jsonl / 同義語CSV を再取得・再読み込み"),
 ):
     try:
         if refresh == 1:
@@ -373,28 +575,31 @@ def api_search(
             return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
                               "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order})
 
-        # 1) クエリ処理（年末尾抽出／ベース語）
+        # クエリ解析（年尾抽出）
         base_q, y_tail, yr_tail = _parse_year_from_query(q)
-        q_base = normalize_text(base_q)
+        tokens = tokenize_query(base_q)
+        if not tokens:
+            return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                              "has_more": False, "next_page": None, "error": None, "order_used": order})
 
-        # 2) スナップショット（同一クエリで固定の母集団）
+        # スナップショット（同一クエリ内の母集団固定）
         snapshot: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
         for rec in (_KB_ROWS or []):
             if y_tail is not None or yr_tail is not None:
                 if not _matches_year(rec, y_tail, yr_tail):
                     continue
-            sc = _score(rec, q_base)
+            sc = _score_record(rec, tokens)
             if sc <= 0:
                 continue
             d = record_date(rec)
-            did = doc_id_for(rec)  # 完全順序＆dedupeの核
+            did = doc_id_for(rec)
             snapshot.append((sc, d, did, rec))
 
         if not snapshot:
             return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
                               "has_more": False, "next_page": None, "error": None, "order_used": order})
 
-        # 3) ページング前 dedupe（doc_idで1件化：score高→同点はdate新しい方）
+        # ページング前 dedupe（doc_id単位で最良1件）
         best_by_id: Dict[str, Tuple[int, Optional[datetime], str, Dict[str, Any]]] = {}
         for entry in snapshot:
             sc, d, did, rec = entry
@@ -405,10 +610,9 @@ def api_search(
                 psc, pd, _, _ = prev
                 if (sc > psc) or (sc == psc and (d or datetime.min) > (pd or datetime.min)):
                     best_by_id[did] = entry
-
         deduped = list(best_by_id.values())
 
-        # 4) 決定的ソート（完全順序）：score↓,date↓,doc_id↑ or date↓,score↓,doc_id↑
+        # 決定的ソート
         if order == "latest":
             deduped.sort(key=sort_key_latest)
             order_used = "latest"
@@ -418,19 +622,19 @@ def api_search(
 
         total = len(deduped)
 
-        # 5) ページ切り出し（同じ配列からスライス）
+        # ページ切り出し
         start = (page - 1) * page_size
         end   = start + page_size
         page_slice = deduped[start:end]
         has_more = end < total
         next_page = page + 1 if has_more else None
 
-        # 6) 表示加工（最後にだけ、検索用データは変更しない）
+        # 表示加工（最後）
         items: List[Dict[str, Any]] = []
         for i, (_sc, _d, _did, rec) in enumerate(page_slice):
-            items.append(build_item(rec, q_base, is_first_in_page=(i == 0)))
+            items.append(build_item(rec, tokens, is_first_in_page=(i == 0)))
 
-        # ランク（全体順位 1始まり）
+        # ランク（全体順位）
         for idx, _ in enumerate(deduped, start=1):
             if start < idx <= end:
                 items[idx - start - 1]["rank"] = idx
