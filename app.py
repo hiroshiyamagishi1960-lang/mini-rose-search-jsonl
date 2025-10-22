@@ -1,14 +1,15 @@
-# app.py — かなフォールディング＋軽量ファジー＋同義語CSV対応 / 日付ソート対応版 v5.1
-# 変更概要（最小）:
-#  1) 日付抽出の強化：開催日/発行日から最初の有効日付を抽出（注記・括弧・和暦の一部に対応）。年/年月は1日に補完。
-#  2) 年フィルタのソース優先度：開催日＞本文/タイトル＞URL（本文/タイトル/URLは最“新”年を採用）。
-#  3) 起動時KB取得の非同期化：Render再開を阻害しない（前回kb.jsonlを優先採用、外部取得はバックグラウンド）。
-#  4) レスポンス仕様と既存スコアロジックは変更なし（UIは order=latest 固定のまま）。
+# app.py — v5.2
+# 目的（UI変更なし・レスポンス形式不変）
+#  - ダブルクオート不要で「フレーズ一致ボーナス」を全語に適用
+#  - プリ計算＋段階的評価（A:軽い → B:中 → C:重）で高速化（ファジーは後段のみ）
+#  - LRUキャッシュで同一クエリの再検索・ページ送りを高速化
+#  - v5.1の「起動時KB取得は非同期」「日付抽出強化」「年フィルタ優先度」も維持
 
 import os, io, re, csv, json, hashlib, unicodedata, threading
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional, Set
 from urllib.parse import urlparse, urlunparse, parse_qsl
+from collections import OrderedDict
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse
@@ -22,10 +23,26 @@ except Exception:
 # ==================== 基本設定 ====================
 KB_URL    = (os.getenv("KB_URL", "") or "").strip()
 KB_PATH   = os.path.normpath((os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip())
-VERSION   = os.getenv("APP_VERSION", "jsonl-2025-10-22-v5.1")
-SYN_CSV   = (os.getenv("SYNONYM_CSV", "") or "").strip()  # 例: "./synonyms.csv"
+VERSION   = os.getenv("APP_VERSION", "jsonl-2025-10-22-v5.2")
+SYN_CSV   = (os.getenv("SYNONYM_CSV", "") or "").strip()
 
-app = FastAPI(title="mini-rose-search-jsonl (v5.1)")
+# 検索チューニング（必要に応じて調整）
+TOP_K_A   = int(os.getenv("TOP_K_A", "160"))   # StageA→B へ進める件数
+TOP_K_B   = int(os.getenv("TOP_K_B", "70"))    # StageB→C へ進める件数
+NEAR_WIN  = int(os.getenv("NEAR_WIN", "24"))   # 近接ボーナスの許容距離（文字数）
+
+# フレーズ加点（タイトル＞本文）
+BONUS_PHRASE_TTL      = int(os.getenv("BONUS_PHRASE_TTL", "8"))   # 連続一致（タイトル）
+BONUS_PHRASE_BODY     = int(os.getenv("BONUS_PHRASE_BODY", "4"))   # 連続一致（本文）
+BONUS_FLEXPH_TTL      = int(os.getenv("BONUS_FLEXPH_TTL", "6"))   # 柔軟一致（タイトル）
+BONUS_FLEXPH_BODY     = int(os.getenv("BONUS_FLEXPH_BODY", "3"))   # 柔軟一致（本文）
+BONUS_NEAR_TTL        = int(os.getenv("BONUS_NEAR_TTL", "3"))     # 近接（タイトル）
+BONUS_NEAR_BODY       = int(os.getenv("BONUS_NEAR_BODY", "2"))     # 近接（本文）
+
+# LRUキャッシュ設定
+CACHE_SIZE = int(os.getenv("CACHE_SIZE", "128"))
+
+app = FastAPI(title="mini-rose-search-jsonl (v5.2)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=False,
@@ -36,7 +53,7 @@ KB_LINES: int = 0
 KB_HASH:  str = ""
 LAST_ERROR: str = ""
 LAST_EVENT: str = ""
-_KB_ROWS: Optional[List[Dict[str, Any]]] = None  # メモリ常駐
+_KB_ROWS: Optional[List[Dict[str, Any]]] = None  # オリジナル行（拡張フィールド付与）
 
 # ==================== 正規化ユーティリティ ====================
 def _nfkc(s: Optional[str]) -> str:
@@ -60,10 +77,7 @@ def textify(x: Any) -> str:
 
 # ==================== かなフォールディング ====================
 KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
-HIRA_SMALL2NORM = {
-    "ぁ":"あ","ぃ":"い","ぅ":"う","ぇ":"え","ぉ":"お",
-    "ゃ":"や","ゅ":"ゆ","ょ":"よ","っ":"つ","ゎ":"わ",
-}
+HIRA_SMALL2NORM = {"ぁ":"あ","ぃ":"い","ぅ":"う","ぇ":"え","ぉ":"お","ゃ":"や","ゅ":"ゆ","ょ":"よ","っ":"つ","ゎ":"わ"}
 DAKUTEN = "\u3099"; HANDAKUTEN = "\u309A"
 VOWELS = {"あ","い","う","え","お"}
 
@@ -90,7 +104,7 @@ def fold_kana(s: str) -> str:
     t = _strip_diacritics(t)
     return t
 
-# ==================== 軽量ファジー（編集距離≤1） ====================
+# ==================== 軽量ファジー ====================
 def _lev1_match(term: str, hay: str) -> bool:
     if not term or not hay: return False
     n, m = len(term), len(hay)
@@ -146,99 +160,7 @@ def _load_synonyms_from_csv(path: str):
     except Exception:
         pass
 
-# ==================== KB 読み込み ====================
-def _bytes_to_jsonl(blob: bytes) -> bytes:
-    if not blob: return b""
-    s = blob.decode("utf-8", errors="replace").strip()
-    if not s: return b""
-    if s.startswith("["):
-        try:
-            data = json.loads(s)
-            if isinstance(data, list):
-                lines = [json.dumps(obj, ensure_ascii=False, separators=(",", ":")) for obj in data]
-                return ("\n".join(lines) + "\n").encode("utf-8")
-        except Exception:
-            return blob
-    return blob
-
-def _compute_lines_and_hash(path: str) -> Tuple[int, str]:
-    cnt = 0; sha = hashlib.sha256()
-    with open(path, "rb") as f:
-        for line in f:
-            sha.update(line)
-            if line.strip(): cnt += 1
-    return cnt, sha.hexdigest()
-
-def _load_rows_into_memory(path: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    if not os.path.exists(path): return rows
-    with io.open(path, "r", encoding="utf-8") as f:
-        for ln in f:
-            ln = ln.strip()
-            if not ln: continue
-            try:
-                rows.append(json.loads(ln))
-            except Exception:
-                continue
-    return rows
-
-def ensure_kb(fetch_now: bool = False) -> Tuple[int, str]:
-    """fetch_now=False のときは外部取得を行わずローカル優先で読み込む。"""
-    global LAST_ERROR, LAST_EVENT, _KB_ROWS
-    LAST_ERROR = ""; LAST_EVENT = ""
-    if fetch_now and KB_URL and requests is not None:
-        try:
-            r = requests.get(KB_URL, timeout=5)  # 短めのタイムアウト
-            r.raise_for_status()
-            blob = _bytes_to_jsonl(r.content)
-            tmp = KB_PATH + ".tmp"
-            os.makedirs(os.path.dirname(KB_PATH), exist_ok=True) if os.path.dirname(KB_PATH) else None
-            with open(tmp, "wb") as wf: wf.write(blob)
-            os.replace(tmp, KB_PATH)
-            LAST_EVENT = "fetched"
-        except Exception as e:
-            LAST_ERROR = f"fetch_or_save_failed: {type(e).__name__}: {e}"
-    if os.path.exists(KB_PATH):
-        try:
-            lines, sha = _compute_lines_and_hash(KB_PATH)
-            _KB_ROWS = _load_rows_into_memory(KB_PATH)
-            _load_synonyms_from_csv(SYN_CSV)
-            return lines, sha
-        except Exception as e:
-            LAST_ERROR = f"hash_failed: {type(e).__name__}: {e}"
-            _KB_ROWS = []
-            return 0, ""
-    else:
-        LAST_EVENT = LAST_EVENT or "no_file"
-        _KB_ROWS = []
-        return 0, ""
-
-def _refresh_kb_globals(fetch_now: bool = False):
-    global KB_LINES, KB_HASH
-    lines, sha = ensure_kb(fetch_now=fetch_now)
-    KB_LINES, KB_HASH = lines, sha
-    return lines, sha
-
-def _bg_fetch_kb():
-    """バックグラウンドでKBを取得して更新（起動直後のブロック回避）。"""
-    try:
-        _refresh_kb_globals(fetch_now=True)
-    except Exception as e:
-        pass  # 失敗しても静かに継続
-
-@app.on_event("startup")
-def _startup():
-    # 起動は即応答：まずローカルKBを採用（外部取得はしない）
-    try:
-        _refresh_kb_globals(fetch_now=False)
-    except Exception as e:
-        pass
-    # 起動後に非同期で外部取得（成功時のみ上書き）
-    if KB_URL and requests is not None:
-        th = threading.Thread(target=_bg_fetch_kb, daemon=True)
-        th.start()
-
-# ==================== フィールド抽出 ====================
+# ==================== KB 読み込み・プリ計算 ====================
 TITLE_KEYS = ["title","Title","名前","タイトル","題名","見出し","subject","headline"]
 TEXT_KEYS  = ["content","text","body","本文","内容","記事","description","summary","excerpt"]
 DATE_KEYS  = ["開催日/発行日","date","Date","published_at","published","created_at","更新日","作成日","日付","開催日","発行日"]
@@ -258,7 +180,7 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
             return textify(v)
     return ""
 
-# ==================== URL正規化 & doc_id ====================
+# URL 正規化 & doc_id
 _DROP_QS = {"source","utm_source","utm_medium","utm_campaign","utm_term","utm_content"}
 _NOTION_PAGEID_RE = re.compile(r"[0-9a-f]{32}", re.IGNORECASE)
 
@@ -300,13 +222,9 @@ def doc_id_for(rec: Dict[str, Any]) -> str:
     auth_n  = normalize_text(record_as_text(rec, "author"))
     return f"hash://{stable_hash(title_n, date_n, auth_n)}"
 
-# ==================== 日付抽出（強化版） ====================
-_DATE_RE = re.compile(
-    r"(?P<y>(?:19|20|21)\d{2})[./\-年]?(?:(?P<m>0?[1-9]|1[0-2])[./\-月]?(?:(?P<d>0?[1-9]|[12]\d|3[01])日?)?)?",
-    re.UNICODE
-)
-# 和暦の極小対応（令和/平成/昭和 → 西暦換算、月日任意）
-_ERA_RE = re.compile(r"(令和|平成|昭和)\s*(\d{1,2})\s*年(?:\s*(\d{1,2})\s*月(?:\s*(\d{1,2})\s*日)?)?")
+# 日付抽出（v5.1強化版を維持）
+_DATE_RE = re.compile(r"(?P<y>(?:19|20|21)\d{2})[./\-年]?(?:(?P<m>0?[1-9]|1[0-2])[./\-月]?(?:(?P<d>0?[1-9]|[12]\d|3[01])日?)?)?", re.UNICODE)
+_ERA_RE  = re.compile(r"(令和|平成|昭和)\s*(\d{1,2})\s*年(?:\s*(\d{1,2})\s*月(?:\s*(\d{1,2})\s*日)?)?")
 
 def _era_to_seireki(era: str, nen: int) -> int:
     base = {"令和":2018, "平成":1988, "昭和":1925}.get(era, None)
@@ -314,10 +232,8 @@ def _era_to_seireki(era: str, nen: int) -> int:
     return base + nen
 
 def _first_valid_date_from_string(s: str) -> Optional[datetime]:
-    """テキストから最初の“有効”日付を抽出。年/年月のみは 1日補完。注記・括弧は無視。"""
     if not s: return None
     t = _nfkc(s)
-    # 和暦（簡易）
     m = _ERA_RE.search(t)
     if m:
         try:
@@ -327,7 +243,6 @@ def _first_valid_date_from_string(s: str) -> Optional[datetime]:
             return datetime(y, mm, dd)
         except Exception:
             pass
-    # 西暦（最初の一致）
     m2 = _DATE_RE.search(t)
     if m2:
         y = int(m2.group("y"))
@@ -340,13 +255,11 @@ def _first_valid_date_from_string(s: str) -> Optional[datetime]:
     return None
 
 def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
-    # 1) 開催日/発行日など（最優先）
     for k in DATE_KEYS:
         v = rec.get(k)
         if not v: continue
         dt = _first_valid_date_from_string(textify(v))
         if dt: return dt
-    # 2) 本文・タイトルから最“新”年（補助）
     cand_year = None
     for field in ("text","title"):
         v = record_as_text(rec, field)
@@ -354,7 +267,6 @@ def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
             cand_year = max(int(y), cand_year or 0)
     if cand_year:
         return datetime(cand_year, 1, 1)
-    # 3) URLから年（最終補助）
     u = record_as_text(rec, "url")
     if u:
         y_url = None
@@ -365,7 +277,116 @@ def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
             return datetime(y_url, 1, 1)
     return None
 
-# ==================== 年フィルタ（末尾年/範囲） ====================
+# JSONL読み込み
+def _bytes_to_jsonl(blob: bytes) -> bytes:
+    if not blob: return b""
+    s = blob.decode("utf-8", errors="replace").strip()
+    if not s: return b""
+    if s.startswith("["):
+        try:
+            data = json.loads(s)
+            if isinstance(data, list):
+                lines = [json.dumps(obj, ensure_ascii=False, separators=(",", ":")) for obj in data]
+                return ("\n".join(lines) + "\n").encode("utf-8")
+        except Exception:
+            return blob
+    return blob
+
+def _compute_lines_and_hash(path: str) -> Tuple[int, str]:
+    cnt = 0; sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for line in f:
+            sha.update(line)
+            if line.strip(): cnt += 1
+    return cnt, sha.hexdigest()
+
+def _load_rows_into_memory(path: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not os.path.exists(path): return rows
+    with io.open(path, "r", encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln: continue
+            try:
+                rows.append(json.loads(ln))
+            except Exception:
+                continue
+    return rows
+
+# プリ計算（fold済みフィールド、長さなど）
+PREVIEW_LIMIT = 120000  # フォールド対象の本文上限（極端な長文の負荷抑制）
+
+def _attach_precomputed_fields(rows: List[Dict[str, Any]]):
+    for rec in rows:
+        title = record_as_text(rec, "title") or ""
+        text  = record_as_text(rec, "text") or ""
+        rec["__ttl_norm"]  = normalize_text(title)
+        rec["__txt_norm"]  = normalize_text(text)
+        rec["__ttl_fold"]  = fold_kana(rec["__ttl_norm"]) if rec["__ttl_norm"] else ""
+        txt_for_fold = rec["__txt_norm"][:PREVIEW_LIMIT]
+        rec["__txt_fold"]  = fold_kana(txt_for_fold) if txt_for_fold else ""
+        rec["__doc_id"]    = doc_id_for(rec)
+        rec["__date_obj"]  = record_date(rec)
+
+# KB確保／非同期取得（v5.1相当）
+KB_LINES = 0; KB_HASH = ""; LAST_ERROR = ""; LAST_EVENT = ""
+
+def ensure_kb(fetch_now: bool = False) -> Tuple[int, str]:
+    global LAST_ERROR, LAST_EVENT, _KB_ROWS
+    LAST_ERROR = ""; LAST_EVENT = ""
+    if fetch_now and KB_URL and requests is not None:
+        try:
+            r = requests.get(KB_URL, timeout=5)
+            r.raise_for_status()
+            blob = _bytes_to_jsonl(r.content)
+            tmp = KB_PATH + ".tmp"
+            os.makedirs(os.path.dirname(KB_PATH), exist_ok=True) if os.path.dirname(KB_PATH) else None
+            with open(tmp, "wb") as wf: wf.write(blob)
+            os.replace(tmp, KB_PATH)
+            LAST_EVENT = "fetched"
+        except Exception as e:
+            LAST_ERROR = f"fetch_or_save_failed: {type(e).__name__}: {e}"
+    if os.path.exists(KB_PATH):
+        try:
+            lines, sha = _compute_lines_and_hash(KB_PATH)
+            rows = _load_rows_into_memory(KB_PATH)
+            _attach_precomputed_fields(rows)
+            _load_synonyms_from_csv(SYN_CSV)
+            _KB_ROWS = rows
+            return lines, sha
+        except Exception as e:
+            LAST_ERROR = f"hash_failed: {type(e).__name__}: {e}"
+            _KB_ROWS = []
+            return 0, ""
+    else:
+        LAST_EVENT = LAST_EVENT or "no_file"
+        _KB_ROWS = []
+        return 0, ""
+
+def _refresh_kb_globals(fetch_now: bool = False):
+    global KB_LINES, KB_HASH
+    lines, sha = ensure_kb(fetch_now=fetch_now)
+    KB_LINES, KB_HASH = lines, sha
+    _cache.clear()  # KB更新時はキャッシュ破棄
+    return lines, sha
+
+def _bg_fetch_kb():
+    try:
+        _refresh_kb_globals(fetch_now=True)
+    except Exception:
+        pass
+
+@app.on_event("startup")
+def _startup():
+    try:
+        _refresh_kb_globals(fetch_now=False)
+    except Exception:
+        pass
+    if KB_URL and requests is not None:
+        th = threading.Thread(target=_bg_fetch_kb, daemon=True)
+        th.start()
+
+# ==================== 年フィルタ ====================
 RANGE_SEP = r"(?:-|–|—|~|〜|～|\.{2})"
 
 def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tuple[int,int]]]:
@@ -387,7 +408,7 @@ def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tup
 
 def _record_years(rec: Dict[str, Any]) -> List[int]:
     ys = set()
-    d = record_date(rec)
+    d = rec.get("__date_obj") or record_date(rec)
     if d: ys.add(d.year)
     for field in ("title","text","url","author"):
         v = record_as_text(rec, field)
@@ -413,25 +434,44 @@ def expand_with_synonyms(term: str) -> Set[str]:
         out.update(_syn_canon2variant[t])
     return out
 
-# ==================== スコア・ハイライト ====================
-def _score_record(rec: Dict[str, Any], tokens: List[str]) -> int:
-    title = normalize_text(record_as_text(rec, "title"))
-    text  = normalize_text(record_as_text(rec, "text"))
-    ftit  = fold_kana(title); ftxt = fold_kana(text)
-    score = 0
-    for raw in tokens:
-        if not raw: continue
-        exts = expand_with_synonyms(raw) or {raw}
-        for t in exts:
-            ft = fold_kana(t)
-            if t and title.count(t) > 0: score += 3 * title.count(t)
-            if t and text.count(t)  > 0: score += 1 * text.count(t)
-            if ft and ftit.count(ft) > 0: score += 3 * ftit.count(ft)
-            if ft and ftxt.count(ft) > 0: score += 1 * ftxt.count(ft)
-            if len(t) >= 2 and fuzzy_contains(ft, ftit): score += 1
-            if len(t) >= 2 and fuzzy_contains(ft, ftxt): score += 1
-    return score
+# ==================== フレーズ支援（n-gram, 柔軟一致, 近接） ====================
+CONNECTOR = r"[\s\u3000]*(?:の|・|／|/|_|\-|–|—)?[\s\u3000]*"  # 語間に許容
 
+def gen_ngrams(tokens: List[str], nmax: int = 3) -> List[List[str]]:
+    toks = [t for t in tokens if t]
+    out: List[List[str]] = []
+    for n in range(2, min(nmax, len(toks)) + 1):
+        for i in range(len(toks)-n+1):
+            out.append(toks[i:i+n])
+    return out
+
+def phrase_contiguous_present(text: str, phrase: List[str]) -> bool:
+    joined = "".join(phrase)
+    return joined in text
+
+def phrase_flexible_present(text: str, phrase: List[str]) -> bool:
+    # 例: A CONNECTOR B CONNECTOR C
+    if not phrase: return False
+    pat = re.escape(phrase[0])
+    for w in phrase[1:]:
+        pat += CONNECTOR + re.escape(w)
+    return re.search(pat, text) is not None
+
+def min_token_distance(text: str, a: str, b: str) -> Optional[int]:
+    # 文字ベースの最小距離（先頭位置の差の絶対値）
+    pos_a = [m.start() for m in re.finditer(re.escape(a), text)]
+    pos_b = [m.start() for m in re.finditer(re.escape(b), text)]
+    if not pos_a or not pos_b: return None
+    i=j=0; best=None
+    while i<len(pos_a) and j<len(pos_b):
+        da = pos_a[i]; db = pos_b[j]
+        d = abs(da - db)
+        if best is None or d < best: best = d
+        if da < db: i += 1
+        else: j += 1
+    return best
+
+# ==================== スコア・ハイライト ====================
 def html_escape(s: str) -> str:
     return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
@@ -474,15 +514,68 @@ def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool) ->
     }
 
 # ==================== クエリ処理 ====================
+TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')  # クォートは解析するが挙動は変えない
+
 def tokenize_query(q: str) -> List[str]:
-    TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')
     out: List[str] = []
     for m in TOKEN_RE.finditer(normalize_text(q)):
         tok = m.group(1) if m.group(1) is not None else m.group(2)
-        if tok: out.append(tok)
+        if tok:
+            out.append(tok)
     return out
 
+# ==================== 段階的評価 ====================
+
+def _score_stage_a(rec: Dict[str, Any], tokens: List[str]) -> int:
+    # プレーン一致（同義語拡張）＋ 連続フレーズのプレーン一致
+    ttl = rec.get("__ttl_norm", ""); txt = rec.get("__txt_norm", "")
+    score = 0
+    # 単語一致
+    for raw in tokens:
+        exts = expand_with_synonyms(raw) or {raw}
+        for t in exts:
+            if t and ttl.count(t) > 0: score += 3 * ttl.count(t)
+            if t and txt.count(t) > 0: score += 1 * txt.count(t)
+    # フレーズ（連続）
+    for phr in gen_ngrams(tokens, 3):
+        if phrase_contiguous_present(ttl, phr): score += BONUS_PHRASE_TTL
+        if phrase_contiguous_present(txt, phr): score += BONUS_PHRASE_BODY
+    return score
+
+def _score_stage_b(rec: Dict[str, Any], tokens: List[str]) -> int:
+    # かなフォールド一致＋ フレーズ柔軟一致 ＋ 近接ボーナス
+    ttl = rec.get("__ttl_norm", ""); txt = rec.get("__txt_norm", "")
+    ftt = rec.get("__ttl_fold", ""); ftx = rec.get("__txt_fold", "")
+    score = 0
+    # かなフォールド（単語）
+    for raw in tokens:
+        fr = fold_kana(normalize_text(raw))
+        if fr and ftt.count(fr) > 0: score += 3 * ftt.count(fr)
+        if fr and ftx.count(fr) > 0: score += 1 * ftx.count(fr)
+    # フレーズ柔軟一致 & 近接
+    for phr in gen_ngrams(tokens, 3):
+        if phrase_flexible_present(ttl, phr): score += BONUS_FLEXPH_TTL
+        if phrase_flexible_present(txt, phr): score += BONUS_FLEXPH_BODY
+        # 近接（bi-gramのみ評価）
+        if len(phr) == 2:
+            d1 = min_token_distance(ttl, phr[0], phr[1])
+            if d1 is not None and d1 <= NEAR_WIN: score += BONUS_NEAR_TTL
+            d2 = min_token_distance(txt, phr[0], phr[1])
+            if d2 is not None and d2 <= NEAR_WIN: score += BONUS_NEAR_BODY
+    return score
+
+def _score_stage_c(rec: Dict[str, Any], tokens: List[str]) -> int:
+    # ファジー（編集距離<=1）※fold済みに対してのみ、2文字以上の語
+    ftt = rec.get("__ttl_fold", ""); ftx = rec.get("__txt_fold", "")
+    score = 0
+    for raw in tokens:
+        fr = fold_kana(normalize_text(raw))
+        if len(fr) >= 2 and fuzzy_contains(fr, ftt): score += 1
+        if len(fr) >= 2 and fuzzy_contains(fr, ftx): score += 1
+    return score
+
 # ==================== 並び ====================
+
 def sort_key_relevance(entry: Tuple[int, Optional[datetime], str, Dict[str, Any]]) -> Tuple:
     score, d, did, _ = entry
     date_key = d or datetime.min
@@ -494,6 +587,7 @@ def sort_key_latest(entry: Tuple[int, Optional[datetime], str, Dict[str, Any]]) 
     return (-int(date_key.strftime("%Y%m%d%H%M%S")), -int(score), did)
 
 # ==================== 共通レスポンス ====================
+
 def json_utf8(payload: Dict[str, Any], status: int = 200) -> JSONResponse:
     return JSONResponse(
         payload,
@@ -501,6 +595,33 @@ def json_utf8(payload: Dict[str, Any], status: int = 200) -> JSONResponse:
         media_type="application/json; charset=utf-8",
         headers={"Cache-Control":"no-store","Content-Type":"application/json; charset=utf-8"},
     )
+
+# ==================== LRUキャッシュ ====================
+class LRU:
+    def __init__(self, cap: int):
+        self.cap = cap
+        self._d: OrderedDict[Tuple, Dict[str, Any]] = OrderedDict()
+        self._ver: str = ""  # KB_HASH に追随
+    def clear(self):
+        self._d.clear()
+        self._ver = KB_HASH
+    def get(self, key: Tuple):
+        if self._ver != KB_HASH:
+            self.clear()
+            return None
+        v = self._d.get(key)
+        if v is None: return None
+        self._d.move_to_end(key)
+        return v
+    def set(self, key: Tuple, val: Dict[str, Any]):
+        if self._ver != KB_HASH:
+            self.clear()
+        self._d[key] = val
+        self._d.move_to_end(key)
+        if len(self._d) > self.cap:
+            self._d.popitem(last=False)
+
+_cache = LRU(CACHE_SIZE)
 
 # ==================== エンドポイント ====================
 @app.get("/health")
@@ -536,35 +657,62 @@ def api_search(
     try:
         if refresh == 1:
             _refresh_kb_globals(fetch_now=True)
+            _cache.clear()
 
         if not os.path.exists(KB_PATH) or KB_LINES <= 0:
             return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
                               "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order})
 
+        # キャッシュ（page_sizeもキーに含める）
+        cache_key = (q, order, page, page_size)
+        cached = _cache.get(cache_key)
+        if cached is not None:
+            return json_utf8(cached)
+
         base_q, y_tail, yr_tail = _parse_year_from_query(q)
         tokens = tokenize_query(base_q)
         if not tokens:
-            return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
-                              "has_more": False, "next_page": None, "error": None, "order_used": order})
+            payload = {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                       "has_more": False, "next_page": None, "error": None, "order_used": order}
+            _cache.set(cache_key, payload)
+            return json_utf8(payload)
 
-        snapshot: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
-        for rec in (_KB_ROWS or []):
+        rows = _KB_ROWS or []
+
+        # -------- Stage A: 軽い評価 --------
+        stage_a: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
+        for rec in rows:
             if y_tail is not None or yr_tail is not None:
                 if not _matches_year(rec, y_tail, yr_tail):
                     continue
-            sc = _score_record(rec, tokens)
+            sc = _score_stage_a(rec, tokens)
             if sc <= 0: continue
-            d = record_date(rec)
-            did = doc_id_for(rec)
-            snapshot.append((sc, d, did, rec))
+            stage_a.append((sc, rec.get("__date_obj"), rec.get("__doc_id"), rec))
+        if not stage_a:
+            payload = {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                       "has_more": False, "next_page": None, "error": None, "order_used": order}
+            _cache.set(cache_key, payload)
+            return json_utf8(payload)
+        stage_a.sort(key=sort_key_relevance)
+        stage_b_candidates = stage_a[:TOP_K_A]
 
-        if not snapshot:
-            return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
-                              "has_more": False, "next_page": None, "error": None, "order_used": order})
+        # -------- Stage B: 中コスト評価 --------
+        stage_b: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
+        for sc_a, d, did, rec in stage_b_candidates:
+            sc = sc_a + _score_stage_b(rec, tokens)
+            stage_b.append((sc, d, did, rec))
+        stage_b.sort(key=sort_key_relevance)
+        stage_c_candidates = stage_b[:TOP_K_B]
 
-        # doc_idでdedupe（ベストのみ）
+        # -------- Stage C: 重い評価（ファジー） --------
+        final_list: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
+        for sc_b, d, did, rec in stage_c_candidates:
+            sc = sc_b + _score_stage_c(rec, tokens)
+            final_list.append((sc, d, did, rec))
+
+        # dedupe（doc_idで最良を保持）
         best_by_id: Dict[str, Tuple[int, Optional[datetime], str, Dict[str, Any]]] = {}
-        for entry in snapshot:
+        for entry in final_list:
             sc, d, did, rec = entry
             prev = best_by_id.get(did)
             if prev is None:
@@ -575,12 +723,11 @@ def api_search(
                     best_by_id[did] = entry
         deduped = list(best_by_id.values())
 
+        # 並び替え
         if order == "latest":
-            deduped.sort(key=sort_key_latest)
-            order_used = "latest"
+            deduped.sort(key=sort_key_latest); order_used = "latest"
         else:
-            deduped.sort(key=sort_key_relevance)
-            order_used = "relevance"
+            deduped.sort(key=sort_key_relevance); order_used = "relevance"
 
         total = len(deduped)
         start = (page - 1) * page_size
@@ -589,15 +736,15 @@ def api_search(
         has_more = end < total
         next_page = page + 1 if has_more else None
 
+        # 表示用アイテム
         items: List[Dict[str, Any]] = []
         for i, (_sc, _d, _did, rec) in enumerate(page_slice):
             items.append(build_item(rec, tokens, is_first_in_page=(i == 0)))
-
         for idx, _ in enumerate(deduped, start=1):
             if start < idx <= end:
                 items[idx - start - 1]["rank"] = idx
 
-        return json_utf8({
+        payload = {
             "items": items,
             "total_hits": total,
             "page": page,
@@ -606,7 +753,9 @@ def api_search(
             "next_page": next_page,
             "error": None,
             "order_used": order_used,
-        })
+        }
+        _cache.set(cache_key, payload)
+        return json_utf8(payload)
 
     except Exception as e:
         return json_utf8({"items": [], "total_hits": 0, "page": 1, "page_size": page_size,
