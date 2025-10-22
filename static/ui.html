@@ -1,294 +1,154 @@
 <!doctype html>
 <html lang="ja">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>ミニバラ盆栽愛好会 デジタル資料館｜検索（JSONL版）</title>
-<meta name="robots" content="noindex" />
-<style>
-  :root{
-    --bg:#fafafa; --card:#fff; --b:#e5e7eb; --muted:#64748b; --txt:#0f172a;
-    --link:#2563eb; --hl:#e6f3ff; --ink:#1e3a8a; --inbg:#eaf2ff;
-    --warn:#fff7cc; --warn-b:#fde68a; --how:#ffeff0; --how-b:#fecdd3;
-  }
-  html,body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;line-height:1.7}
-  html{font-size:20px}
-  @media (max-width:480px){ html{font-size:21px} }
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ミニバラ盆栽愛好会 デジタル資料館</title>
 
-  .container{max-width:1000px;margin:18px auto;padding:0 16px}
-  h1{margin:0 0 12px;font-size:28px}
+  <!-- PWA: manifest / theme-color / iOS用タイトルとアイコン -->
+  <link rel="manifest" href="/static/manifest.json" />
+  <meta name="theme-color" content="#ffffff" />
+  <link rel="apple-touch-icon" href="/static/icons/icon-192x192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="ミニバラ盆栽資料館" />
 
-  .toolbar{background:var(--card);border:1px solid var(--b);border-radius:16px;padding:16px}
-  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-  .api{font-size:12px;color:var(--muted)}
-
-  input[type="text"]{
-    flex:1 1 520px;min-width:260px;
-    padding:16px 18px;border-radius:12px;background:var(--inbg);
-    border:3px solid var(--ink); outline:none; font-size:20px;
-  }
-  select,button{border:1px solid var(--b);border-radius:10px;background:#fff;font-size:16px;line-height:1.2}
-  select{padding:10px 12px}
-  button{padding:12px 16px;cursor:pointer;min-height:44px;background:#f8fafc}
-  button.primary{background:#e7f0ff;border-color:#bfdbfe}
-  button[disabled]{opacity:.5;cursor:not-allowed}
-
-  .section{background:var(--card);border:1px solid var(--b);border-radius:16px;margin-top:16px}
-  .section h2{margin:0;padding:12px 16px;border-bottom:1px solid var(--b);font-size:16px}
-  .section .body{padding:12px 16px}
-
-  .meta{font-size:14px;margin-bottom:8px;color:var(--muted)}
-  .result{border:1px solid var(--b);border-radius:14px;padding:12px;background:#fff;margin-bottom:12px}
-  .title{font-weight:700;font-size:22px;margin-bottom:6px}
-  .snippet{white-space:pre-wrap;word-break:break-word}
-  .hit{display:inline-block;font-size:12px;color:#1d4ed8;background:#e0ecff;border:1px solid #bfdbfe;border-radius:999px;padding:2px 8px;margin-left:6px}
-  .src{font-size:15px;margin-top:10px}
-  .src a{
-    display:inline-block;padding:10px 12px;border:1px solid var(--b);border-radius:10px;
-    color:var(--link);text-decoration:none;-webkit-tap-highlight-color:transparent;
-  }
-  .src a:focus-visible{ outline:2px solid #93c5fd; outline-offset:2px }
-  .src .rawurl{display:block;margin-top:6px;word-break:break-all}
-
-  details summary{cursor:pointer;padding:12px 16px;border-bottom:1px solid var(--b)}
-  .json{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:#0b1020;color:#d1e7ff;border-radius:12px;padding:10px;overflow:auto}
-
-  .notice{background:var(--warn);border:1px solid var(--warn-b);border-radius:14px;padding:12px 14px;margin-top:16px}
-  .howto{background:var(--how);border:1px solid var(--how-b);border-radius:14px;padding:14px;margin-top:12px}
-  .howto h3{margin:0 0 8px}
-
-  mark{background:var(--hl);padding:0 .15em;border-radius:3px}
-</style>
+  <style>
+    body {
+      font-family: "Hiragino Kaku Gothic ProN", "Segoe UI", system-ui, sans-serif;
+      background: #f9fafb;
+      color: #111;
+      margin: 0;
+      padding: 1.5rem;
+    }
+    h1 { font-size: 1.6rem; margin-bottom: .5rem; }
+    #q {
+      width: 100%;
+      padding: .6rem;
+      font-size: 1rem;
+      border: 1px solid #ccc;
+      border-radius: .5rem;
+      margin-bottom: 1rem;
+    }
+    button {
+      padding: .5rem 1rem;
+      font-size: 1rem;
+      border: none;
+      border-radius: .5rem;
+      background: #4b5563;
+      color: white;
+      cursor: pointer;
+    }
+    button:hover { background: #374151; }
+    .result {
+      background: white;
+      border-radius: .5rem;
+      padding: 1rem;
+      margin-top: .8rem;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+    }
+    mark {
+      background: #fff59d;
+      padding: 0 2px;
+      border-radius: 2px;
+    }
+    .api {
+      font-size: 0.9rem;
+      color: #475569;
+    }
+    .footer {
+      font-size: 0.85rem;
+      color: #64748b;
+      margin-top: 2rem;
+      text-align: right;
+    }
+  </style>
 </head>
+
 <body>
-  <div class="container">
-    <h1>ミニバラ盆栽愛好会 デジタル資料館</h1>
+  <h1>ミニバラ盆栽愛好会 デジタル資料館</h1>
 
-    <div class="toolbar">
-      <div class="row" style="justify-content:space-between">
-        <div style="font-weight:700;color:#ef4444">検索システム</div>
-        <span style="display:inline-block;background:#fff7ed;border:1px solid #fed7aa;border-radius:999px;padding:4px 10px;font-size:12px;color:#92400e">年でしぼる＋ページ送り</span>
-      </div>
-
-      <div class="row" style="margin-top:8px">
-        <input id="q" type="text" placeholder="例） コンテスト結果　／　例） コンテスト 2023　／　例） 剪定 1999-2001" />
-        <select id="order" title="並び順">
-          <option value="relevance">関連順</option>
-          <option value="latest" selected>最新順</option>
-        </select>
-        <button class="primary" id="btnSearch">検索</button>
-        <button id="btnClear">クリア</button>
-      </div>
-
-      <div class="api" style="margin-top:6px">
-        API: <code>/api/search</code> ｜ 版: <span id="ver">…</span> ｜
-        <a href="/health" target="_blank" rel="noopener">/health</a> ・
-        <a href="/version" target="_blank" rel="noopener">/version</a>
-      </div>
-    </div>
-
-    <div class="section">
-      <h2>検索結果（整形表示）</h2>
-      <div class="body">
-        <div id="meta" class="meta">（未取得）</div>
-        <div id="results"></div>
-        <div class="row" style="gap:8px;margin-top:8px">
-          <button id="prev" disabled>前へ</button>
-          <button id="next" disabled>次へ</button>
-        </div>
-      </div>
-    </div>
-
-    <details class="section" style="margin-top:12px">
-      <summary>開発者向け：レスポンス（生のJSON）</summary>
-      <div class="body">
-        <div class="meta">※ タイトルと本文の<strong>ハイライト（薄い青）</strong>はサーバの <code>&lt;mark&gt;</code> をそのまま表示します。<span class="hit">（本文にヒット）</span> は本文に <code>&lt;mark&gt;</code> がある時に付与します。</div>
-        <div id="raw" class="json">（未取得）</div>
-      </div>
-    </details>
-
-    <div class="notice">
-      <strong>お知らせ</strong><br/>
-      チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。
-    </div>
-
-    <div class="howto">
-      <h3>使いかた</h3>
-      <ol style="margin:6px 0 0;padding-left:1.2em">
-        <li>ことばを入れて「検索」を押す。</li>
-        <li>1ページは<strong>常に5件</strong>。先頭だけ<strong>本文を約300字</strong>表示、2〜5件は<strong>ハイライト周辺</strong>のみ。</li>
-        <li>続きは次へ、戻るときは前へ（ページ送り）。</li>
-        <li>年でしぼるときは語尾に西暦4桁。<span style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px">例：コンテスト 2023</span></li>
-        <li>年の範囲はハイフン。<span style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px">例：剪定 1999-2001</span></li>
-      </ol>
-    </div>
+  <input id="q" type="text" placeholder="検索語を入力（例：剪定 苔 展示会...）" />
+  <div>
+    <button onclick="doSearch(1)">検索</button>
   </div>
 
-<script>
-  /* ===== 仕様どおりの挙動 ===== */
-  const PAGE_SIZE = 5; // 常に5件固定
-  const $ = (id) => document.getElementById(id);
-  const asArray = (x) => Array.isArray(x) ? x : [];
+  <div id="out"></div>
 
-  /* ----- <mark> を壊さずにスニペットを切り出すユーティリティ ----- */
-  function htmlSlicePreserveMark(html, start, end){
-    const div = document.createElement("div");
-    div.innerHTML = html || "";
-    let pos = 0, out = "";
-    function walk(node, inMark=false){
-      if (pos >= end) return;
-      if (node.nodeType === 1){
-        const isMark = node.tagName && node.tagName.toLowerCase() === "mark";
-        const nowMark = inMark || isMark;
-        node.childNodes.forEach(n => walk(n, nowMark));
-      }else if (node.nodeType === 3){
-        const text = node.nodeValue || "";
-        const len = text.length;
-        if (pos + len <= start){ pos += len; return; }
-        const s = Math.max(0, start - pos);
-        const e = Math.min(len, end - pos);
-        const chunk = text.slice(s, e);
-        if (chunk){
-          out += inMark ? ("<mark>" + chunk + "</mark>") : chunk;
-        }
-        pos += len;
+  <div class="api" style="margin-top:6px">
+    API: <code>/api/search</code> ｜ 版: <span id="ver">…</span> ｜
+    <a href="/health" target="_blank" rel="noopener">/health</a> ・
+    <a href="/version" target="_blank" rel="noopener">/version</a>
+    ・ <span id="readyState" style="color:#64748b">準備状態: 取得中…</span>
+  </div>
+
+  <div class="footer">
+    &copy; ミニバラ盆栽愛好会 / Hiroshi Yamagishi
+  </div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const api = "/api/search";
+
+    async function jget(url){
+      const r = await fetch(url, {cache:"no-store"});
+      if(!r.ok) throw new Error(r.status);
+      return await r.json();
+    }
+
+    async function doSearch(page){
+      const q = $("q").value.trim();
+      if(!q){ $("out").innerHTML="<p>検索語を入力してください。</p>"; return; }
+      $("out").innerHTML="<p>検索中...</p>";
+      try{
+        const url = `${api}?q=${encodeURIComponent(q)}&page=${page}&page_size=5&order=latest`;
+        const j = await jget(url);
+        render(j);
+      }catch(e){
+        $("out").innerHTML="<p>エラー: "+e+"</p>";
       }
     }
-    walk(div, false);
-    return out;
-  }
-  function firstNHTML(html, n){
-    const div = document.createElement("div");
-    div.innerHTML = html || "";
-    const total = (div.textContent || "").length;
-    const end = Math.min(n, total);
-    let s = htmlSlicePreserveMark(html, 0, end);
-    if (end < total) s += "…";
-    return s;
-  }
-  function aroundFirstMarkHTML(html, side=80, fallback=160){
-    const div = document.createElement("div");
-    div.innerHTML = html || "";
-    const total = (div.textContent || "").length;
-    let pos = 0, ms = null, me = null;
-    (function find(node){
-      if (node.nodeType === 1){
-        if (node.tagName && node.tagName.toLowerCase()==="mark"){
-          const t = node.textContent || "";
-          ms = pos; me = pos + t.length;
-        }
-        node.childNodes.forEach(find);
-      }else if (node.nodeType === 3){
-        pos += (node.nodeValue || "").length;
+
+    function render(j){
+      if(!j || !j.items){ $("out").innerHTML="<p>該当なし。</p>"; return; }
+      const out=[];
+      out.push(`<p>ヒット件数: ${j.total_hits} 件　（ページ ${j.page}）</p>`);
+      for(const it of j.items){
+        out.push(`<div class="result">
+          <div><strong>${it.title}</strong></div>
+          <div>${it.content||""}</div>
+          <div style="margin-top:4px;font-size:0.9rem;">
+            <a href="${it.url||'#'}" target="_blank" rel="noopener">本文表示（クリックしてください）</a>
+            ${it.date_primary ? "　📅 "+it.date_primary : "" }
+          </div>
+        </div>`);
       }
-    })(div);
-    if (ms==null){ return firstNHTML(html, fallback); }
-    const start = Math.max(0, ms - side);
-    const end   = Math.min(total, me + side);
-    return (start>0?"…":"") + htmlSlicePreserveMark(html, start, end) + (end<total?"…":"");
-  }
-  function hasMark(html){ return /<mark>/.test(html||""); }
-
-  async function jget(url){
-    const r = await fetch(url, {cache:"no-store", headers:{Accept:"application/json"}});
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    return await r.json();
-  }
-  function normalize(raw, page){
-    const items = asArray(raw?.items)||asArray(raw?.results)||[];
-    const norm = items.map(it=>{
-      const title = (it.title || "(無題)").replace(/<(?!\/?mark\b)[^>]+>/g,"");
-      const content = String(it.content || it.text || "");
-      const url = String(it.url || it.source || "");
-      const date = String(it.date || it.date_primary || "");
-      const rank = (typeof it.rank==="number") ? it.rank : null;
-      return {title,content,url,date,rank};
-    });
-    return {
-      items:norm,
-      total:(typeof raw?.total_hits==="number")?raw.total_hits:norm.length,
-      has_more:!!raw?.has_more,
-      order_used: raw?.order_used || null,
-      page
-    };
-  }
-  function metaText(total,page,shown,order_used){
-    const start=(page-1)*PAGE_SIZE+1, end=Math.min(total,start+shown-1);
-    return `${total} 件中 ${start}–${end} 件を表示　/　order_used: ${order_used||"unknown"}`;
-  }
-  function rowFirst(it){
-    // 先に「本文にヒット」判定（<mark> を壊す前に！）
-    const hit = hasMark(it.content) ? '<span class="hit">（本文にヒット）</span>' : '';
-    const snippet = firstNHTML(it.content, 300); // 先頭は約300字（<mark>保持）
-    const urlBlock = it.url
-      ? `<div class="src">
-           <a href="${it.url}" target="_blank" rel="noopener">本文表示（クリックして下さい。）</a>
-           <a class="rawurl" href="${it.url}" target="_blank" rel="noopener">${it.url}</a>
-         </div>` : "";
-    return `
-      <div class="result">
-        <div class="title">${it.title}${hit}</div>
-        <div class="snippet">${snippet}</div>
-        ${urlBlock}
-      </div>`;
-  }
-  function rowRest(it){
-    const hit = hasMark(it.content) ? '<span class="hit">（本文にヒット）</span>' : '';
-    const snippet = aroundFirstMarkHTML(it.content, 80, 160); // 2〜5件はヒット近辺
-    const urlBlock = it.url
-      ? `<div class="src">
-           <a href="${it.url}" target="_blank" rel="noopener">本文表示（クリックして下さい。）</a>
-           <a class="rawurl" href="${it.url}" target="_blank" rel="noopener">${it.url}</a>
-         </div>` : "";
-    return `
-      <div class="result">
-        <div class="title">${it.title}${hit}</div>
-        <div class="snippet">${snippet}</div>
-        ${urlBlock}
-      </div>`;
-  }
-
-  async function doSearch(page){
-    const q=$("q").value.trim(); if(!q){
-      $("results").innerHTML=""; $("meta").textContent="（未取得）"; $("raw").textContent="（未取得）";
-      $("prev").disabled=true; $("next").disabled=true; return;
+      $("out").innerHTML = out.join("");
     }
-    $("btnSearch").disabled=true; $("prev").disabled=true; $("next").disabled=true;
-    $("meta").textContent="検索中…"; $("results").innerHTML="";
-    try{
-      // ✅ 常に最新順をサーバへ要求（UI側で並べ替えはしない）
-      const ord="latest";
-      const url=`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(ord)}`;
-      const raw=await jget(url); $("raw").textContent=JSON.stringify(raw,null,2);
-      const data=normalize(raw,page);
 
-      const items=data.items;
-      if(!items.length){ $("meta").textContent="該当なし"; return; }
+    async function showReady(){
+      try{
+        const r = await fetch("/ready", {cache:"no-store"});
+        if(!r.ok) throw new Error("ready ng");
+        const j = await r.json();
+        const s = j?.ok ? "OK" : (j?.detail || "準備中");
+        const el = $("readyState");
+        if(el){ el.textContent = `準備状態: ${s}`; }
+      }catch{
+        const el = $("readyState");
+        if(el){ el.textContent = "準備状態: 不明"; }
+      }
+    }
 
-      // サーバの順序をそのまま描画（クライアントでソートしない）
-      $("results").innerHTML = rowFirst(items[0]) + items.slice(1).map(rowRest).join("");
-      $("meta").textContent = metaText(data.total,data.page,items.length,data.order_used);
-      $("prev").disabled = page<=1; $("next").disabled=!data.has_more; window.__page=page;
-    }catch(e){
-      $("meta").textContent=`エラー：${String(e.message||e)}`;
-    }finally{ $("btnSearch").disabled=false; }
-  }
-
-  // イベント
-  document.getElementById("btnSearch")?.addEventListener("click", ()=>doSearch(1));
-  document.getElementById("doSearch") ?.addEventListener("click", ()=>doSearch(1));
-  $("btnClear").addEventListener("click", ()=>{ $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; $("raw").textContent="（未取得）"; $("prev").disabled=true; $("next").disabled=true; });
-  $("prev").addEventListener("click", ()=>{ const p=Math.max(1,(window.__page||1)-1); doSearch(p); });
-  $("next").addEventListener("click", ()=>{ const p=(window.__page||1)+1; doSearch(p); });
-  $("q").addEventListener("keydown",(e)=>{ if(e.key==="Enter"){ doSearch(1); } });
-  $("order").addEventListener("change", ()=>doSearch(1)); // プルダウンは見た目だけ。常に latest を送信
-
-  // 版表示 & ?q= 即時検索
-  (async ()=>{
-    try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{}
-    const usp=new URLSearchParams(location.search);
-    if(usp.get("q")){ $("q").value=usp.get("q"); doSearch(1); }
-  })();
-</script>
+    (async ()=>{
+      try{
+        const v = await jget("/version");
+        $("ver").textContent = v.version || "—";
+      }catch{}
+      await showReady();
+      const usp=new URLSearchParams(location.search);
+      if(usp.get("q")){ $("q").value=usp.get("q"); doSearch(1); }
+    })();
+  </script>
 </body>
 </html>
