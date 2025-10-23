@@ -12,4 +12,4 @@ jobs:
     steps:
       - name: Ping Render /health
         run: |
-          curl -fsS https://mini-rose-search-jsonl.onrender.com/health || exit 1
+          curl -fsS https://mini-rose-search-jsonl.onrender.com/　|| exit 1
