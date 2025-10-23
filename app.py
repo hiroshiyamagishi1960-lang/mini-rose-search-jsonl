@@ -1,9 +1,10 @@
-# app.py — v5.2
+# app.py — v5.2 (static 公開対応)
 # 目的（UI変更なし・レスポンス形式不変）
 #  - ダブルクオート不要で「フレーズ一致ボーナス」を全語に適用
 #  - プリ計算＋段階的評価（A:軽い → B:中 → C:重）で高速化（ファジーは後段のみ）
 #  - LRUキャッシュで同一クエリの再検索・ページ送りを高速化
 #  - v5.1の「起動時KB取得は非同期」「日付抽出強化」「年フィルタ優先度」も維持
+#  - NEW: /static を公開マウント（manifest.json / icon-*.png 配信）
 
 import os, io, re, csv, json, hashlib, unicodedata, threading
 from datetime import datetime
@@ -14,6 +15,7 @@ from collections import OrderedDict
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles  # ★ 追加
 
 try:
     import requests
@@ -48,6 +50,9 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=False,
     allow_methods=["GET"], allow_headers=["*"],
 )
+
+# ★ 追加: /static を公開マウント（static/ 配下の manifest.json や icon を配信）
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 KB_LINES: int = 0
 KB_HASH:  str = ""
