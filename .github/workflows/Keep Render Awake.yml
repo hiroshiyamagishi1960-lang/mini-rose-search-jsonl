@@ -2,14 +2,19 @@ name: Keep Render Awake
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # 15分ごと（Freeプランのスリープ対策）
-  workflow_dispatch:         # 手動実行ボタンも付ける
+    - cron: '*/10 * * * *'   # 10分ごと（UTC）。Freeプランのスリープ(≈15分)より短く維持
+  workflow_dispatch:         # 手動実行ボタン
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Ping Render /health
+      - name: Ping UI (wake Render)
         run: |
-          curl -fsS https://mini-rose-search-jsonl.onrender.com/　|| exit 1
+          curl -fsS --retry 3 --retry-all-errors --max-time 30 \
+            https://mini-rose-search-jsonl.onrender.com/ui
+      - name: Ping Health (verify up)
+        run: |
+          curl -fsS --retry 3 --retry-all-errors --max-time 30 \
+            https://mini-rose-search-jsonl.onrender.com/health
