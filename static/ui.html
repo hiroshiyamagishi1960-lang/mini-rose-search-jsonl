@@ -37,7 +37,6 @@
   .btn.primary{ background:#e7f0ff; border-color:#bfdbfe; }
   .btn.ghost{ background:#fff; }
   .btn.small{ padding:8px 12px; font-size:14px; min-height:36px; }
-  .btn.hidden{ display:none; }
 
   .container{max-width:1000px;margin:12px auto;padding:0 16px}
   h1{margin:8px 0 12px;font-size:28px}
@@ -97,10 +96,13 @@
     padding:10px; border-top:1px solid var(--b); background:#fff; display:flex; gap:8px; justify-content:space-between; flex-wrap:wrap;
   }
 
-  /* モバイル用：画面下の大きい戻るボタン（親切UI） */
+  /* モバイル用：画面下の大きい戻る（常時表示に変更） */
   .floating-back{
     position:fixed; left:12px; right:12px; bottom:12px; z-index:1100;
-    display:none;
+    display:block;
+  }
+  @media (min-width:641px){
+    .floating-back{ display:none; }
   }
   .floating-back .btn{
     width:100%; justify-content:center; font-weight:700; background:#ffffff; border:2px solid var(--ink);
@@ -110,9 +112,10 @@
 <body>
   <!-- AppBar -->
   <div class="appbar">
-    <button id="appBack" class="btn small ghost hidden" type="button">← 検索に戻る</button>
+    <!-- 初期表示から見せる（hidden削除） -->
+    <button id="appBack" class="btn small ghost" type="button">← 戻る</button>
     <div class="title">ミニバラ盆栽愛好会 デジタル資料館</div>
-    <a id="openInSafari" class="btn small ghost hidden" href="#" rel="noopener">↗ Safariで開く</a>
+    <a id="openInSafari" class="btn small ghost" href="#" rel="noopener">↗ Safariで開く</a>
   </div>
 
   <div class="container" id="searchArea">
@@ -187,9 +190,9 @@
     </div>
   </div>
 
-  <!-- 画面下の大きな戻る（親切UI：モバイル時のみ表示） -->
+  <!-- 画面下の大きな戻る（モバイル常時表示） -->
   <div class="floating-back" id="floatingBack">
-    <button class="btn" id="floatingBackBtn" type="button">← 検索に戻る</button>
+    <button class="btn" id="floatingBackBtn" type="button">← 戻る</button>
   </div>
 
 <script>
@@ -235,14 +238,12 @@
         const content = it.content || "";
         const url = it.url || "";
         const hit = hasMark(content) ? '<span class="hit">（本文にヒット）</span>' : '';
-        // 重要：アプリ内表示用のボタン（data-url でURLを保持）
         const link = url
           ? `<div class="src">
                <a href="#" class="open-in-app" data-url="${encodeURIComponent(url)}">本文表示（アプリ内）</a>
                &nbsp; / &nbsp;
                <a href="${url}" target="_blank" rel="noopener noreferrer">↗ Safariで開く</a>
-             </div>`
-          : "";
+             </div>` : "";
         return `<div class="result"><div class="title">${title}${hit}</div><div class="snippet">${content}</div>${link}</div>`;
       }).join("");
 
@@ -276,46 +277,43 @@
 
   (async ()=>{ try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{} })();
 
-  // ====== アプリ内本文ビュー（戻る付き） ======
+  // ====== 詳細ビュー + 戻るの統一動作 ======
   function openDetail(url){
     $("detailFrame").src = url;
     $("detailOpenSafari").href = url;
     $("openInSafari").href = url;
-
     $("detailWrap").style.display = "block";
-    $("appBack").classList.remove("hidden");
-    $("openInSafari").classList.remove("hidden");
-    $("floatingBack").style.display = "block";
-
-    // 履歴を追加（PWAでも擬似戻るが効くことが多い）
+    // ハッシュを積み上げ（PWAでも戻るが効きやすい）
     try{ history.pushState({v:"detail"}, "", "#detail"); }catch{}
   }
   function closeDetail(){
     $("detailFrame").src = "about:blank";
     $("detailWrap").style.display = "none";
-    $("appBack").classList.add("hidden");
-    $("openInSafari").classList.add("hidden");
-    $("floatingBack").style.display = "none";
-    // 履歴を戻す（失敗しても無害）
     if(location.hash==="#detail"){
       try{ history.back(); }catch{}
     }
   }
+  function goBack(){
+    // 1) 詳細が開いていれば閉じる
+    if($("detailWrap").style.display === "block"){ closeDetail(); return; }
+    // 2) ブラウザ履歴で戻れるなら戻る
+    try{
+      if(history.length > 1){ history.back(); return; }
+    }catch{}
+    // 3) 最後の手段：検索欄へスクロール
+    try{ $("q").focus(); window.scrollTo({top:0,behavior:"smooth"}); }catch{}
+  }
 
   $("detailBack").addEventListener("click", closeDetail);
   $("detailClose").addEventListener("click", closeDetail);
-  $("appBack").addEventListener("click", closeDetail);
-  $("floatingBackBtn").addEventListener("click", closeDetail);
+  $("appBack").addEventListener("click", goBack);
+  $("floatingBackBtn").addEventListener("click", goBack);
 
   // 端末の戻る操作（ジェスチャ・ボタン）にも追随
   window.addEventListener("popstate", ()=>{
     if(location.hash !== "#detail"){
-      // detailが閉じられたとみなす
       $("detailFrame").src = "about:blank";
       $("detailWrap").style.display = "none";
-      $("appBack").classList.add("hidden");
-      $("openInSafari").classList.add("hidden");
-      $("floatingBack").style.display = "none";
     }
   });
 </script>
