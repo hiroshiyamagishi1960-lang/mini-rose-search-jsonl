@@ -12,36 +12,21 @@
   :root{
     --bg:#fafafa; --card:#fff; --b:#e5e7eb; --muted:#64748b; --txt:#0f172a;
     --link:#2563eb; --hl:#e6f3ff; --ink:#1e3a8a; --inbg:#eaf2ff;
-    --warn:#fff7cc; --warn-b:#fde68a; --how:#ffeff0; --how-b:#fecdd3;
-    --accent:#AEE6B8;
   }
-  html,body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;line-height:1.7}
+  html,body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;line-height:1.7}
   html{font-size:20px}
   @media (max-width:480px){ html{font-size:21px} }
 
-  /* App Bar（PWAでも常時表示） */
   .appbar{
-    position:sticky; top:0; z-index:1000;
+    position:sticky; top:0; z-index:10;
     display:flex; align-items:center; gap:8px;
     padding:10px 12px; background:#ffffffcc; backdrop-filter: blur(6px);
     border-bottom:1px solid var(--b);
   }
   .appbar .title{font-weight:800;font-size:18px;flex:1}
-  .btn{
-    display:inline-flex; align-items:center; gap:.4em;
-    padding:10px 14px; border:1px solid var(--b); border-radius:999px;
-    background:#fff; color:#111; text-decoration:none; cursor:pointer;
-    -webkit-tap-highlight-color:transparent; user-select:none;
-    min-height:42px; font-size:16px;
-  }
-  .btn.primary{ background:#e7f0ff; border-color:#bfdbfe; }
-  .btn.ghost{ background:#fff; }
-  .btn.small{ padding:8px 12px; font-size:14px; min-height:36px; }
-  .btn.hidden{ display:none; }
 
   .container{max-width:1000px;margin:12px auto;padding:0 16px}
-  h1{margin:8px 0 12px;font-size:28px}
-
   .toolbar{background:var(--card);border:1px solid var(--b);border-radius:16px;padding:16px}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .api{font-size:12px;color:var(--muted)}
@@ -71,51 +56,15 @@
     display:inline-block;padding:10px 12px;border:1px solid var(--b);border-radius:10px;
     color:var(--link);text-decoration:none;-webkit-tap-highlight-color:transparent;
   }
-  .src .rawurl{display:block;margin-top:6px;word-break:break-all}
   mark{background:var(--hl);padding:0 .15em;border-radius:3px}
-
-  .notice{margin-top:16px;background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:10px}
-  .howto{margin-top:16px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:12px;padding:10px}
-
-  /* ── アプリ内本文ビュー（PWA用） ───────────────── */
-  .detail-wrap{
-    position:fixed; inset:0; display:none; z-index:1200;
-    background:#00000088;
-  }
-  .detail{
-    position:absolute; inset:10px; background:#fff; border-radius:16px; overflow:hidden;
-    display:flex; flex-direction:column; border:1px solid var(--b);
-  }
-  .detail-head{
-    display:flex; align-items:center; gap:8px; padding:8px 10px;
-    background:var(--accent); border-bottom:1px solid var(--b);
-  }
-  .detail-head .ttl{font-weight:700; font-size:16px; flex:1}
-  .detail-body{flex:1; background:#fff}
-  .detail-body iframe{width:100%; height:100%; border:0}
-  .detail-foot{
-    padding:10px; border-top:1px solid var(--b); background:#fff; display:flex; gap:8px; justify-content:space-between; flex-wrap:wrap;
-  }
-
-  /* モバイル用：画面下の大きい戻る（親切UI） */
-  .floating-back{
-    position:fixed; left:12px; right:12px; bottom:12px; z-index:1100;
-    display:none;
-  }
-  .floating-back .btn{
-    width:100%; justify-content:center; font-weight:700; background:#ffffff; border:2px solid var(--ink);
-  }
 </style>
 </head>
 <body>
-  <!-- AppBar -->
   <div class="appbar">
-    <button id="appBack" class="btn small ghost hidden" type="button">← 検索に戻る</button>
     <div class="title">ミニバラ盆栽愛好会 デジタル資料館</div>
-    <a id="openInSafari" class="btn small ghost hidden" href="#" rel="noopener">↗ Safariで開く</a>
   </div>
 
-  <div class="container" id="searchArea">
+  <div class="container">
     <div class="toolbar">
       <div class="row" style="justify-content:space-between">
         <div style="font-weight:700;color:#ef4444">検索システム</div>
@@ -123,7 +72,7 @@
       </div>
 
       <div class="row" style="margin-top:8px">
-        <input id="q" type="text" placeholder="例） コンテスト結果　／　例） コンテスト 2023　／　例） 剪定 1999-2001" />
+        <input id="q" type="text" placeholder="例） コンテスト結果 ／ 例） コンテスト 2023 ／ 例） 剪定 1999-2001" />
         <select id="order" title="並び順" disabled>
           <option value="relevance">関連順</option>
           <option value="latest" selected>最新順</option>
@@ -136,7 +85,7 @@
         API: <code>/api/search</code> ｜ 版: <span id="ver">…</span> ｜
         <a href="/health" target="_blank" rel="noopener">/health</a> ・
         <a href="/version" target="_blank" rel="noopener">/version</a><br/>
-        ※ この画面の検索は <strong>常に「最新順（order=latest）」で表示</strong> します。
+        ※ この画面の検索は<strong>常に「最新順（order=latest）」</strong>で表示します。
       </div>
     </div>
 
@@ -152,44 +101,17 @@
       </div>
     </div>
 
-    <div class="notice">
-      <strong>お知らせ</strong><br/>
-      チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。
-    </div>
-
-    <div class="howto">
-      <h3>使いかた</h3>
-      <ol style="margin:6px 0 0;padding-left:1.2em">
-        <li>ことばを入れて「検索」を押す。</li>
-        <li>1ページは<strong>常に5件</strong>。先頭だけ<strong>本文を約300字</strong>表示、2〜5件は<strong>ハイライト周辺</strong>のみ。</li>
-        <li>続きは次へ、戻るときは前へ（ページ送り）。</li>
-        <li>年でしぼるときは語尾に西暦4桁。<span style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px">例：コンテスト 2023</span></li>
-        <li>年の範囲はハイフン。<span style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px">例：剪定 1999-2001</span></li>
-      </ol>
-    </div>
-  </div>
-
-  <!-- アプリ内本文ビュー（PWA用） -->
-  <div class="detail-wrap" id="detailWrap" aria-hidden="true">
-    <div class="detail" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
-      <div class="detail-head">
-        <button id="detailBack" class="btn small" type="button">← 検索に戻る</button>
-        <div id="detailTitle" class="ttl">本文表示</div>
-        <a id="detailOpenSafari" class="btn small ghost" href="#" target="_blank" rel="noopener">↗ Safariで開く</a>
-      </div>
-      <div class="detail-body">
-        <iframe id="detailFrame" src="about:blank" title="本文"></iframe>
-      </div>
-      <div class="detail-foot">
-        <div>※ 右上の「↗ Safariで開く」で外部ブラウザでも表示できます。</div>
-        <button id="detailClose" class="btn" type="button">閉じる</button>
+    <div class="section">
+      <h2>使いかた</h2>
+      <div class="body">
+        <ol style="margin:6px 0 0;padding-left:1.2em">
+          <li>ことばを入れて「検索」。</li>
+          <li>1ページは<strong>常に5件</strong>。先頭だけ<strong>本文を約300字</strong>表示、2〜5件は<strong>ハイライト周辺</strong>のみ。</li>
+          <li>年でしぼるときは語尾に西暦4桁（例：コンテスト 2023）。</li>
+          <li>年の範囲はハイフン（例：剪定 1999-2001）。</li>
+        </ol>
       </div>
     </div>
-  </div>
-
-  <!-- 画面下の大きな戻る（親切UI：モバイル時のみ表示） -->
-  <div class="floating-back" id="floatingBack">
-    <button class="btn" id="floatingBackBtn" type="button">← 検索に戻る</button>
   </div>
 
 <script>
@@ -197,63 +119,38 @@
   const $ = (id) => document.getElementById(id);
   const asArray = (x) => Array.isArray(x) ? x : [];
 
-  // ====== fetch helper ======
   async function jget(url){
     const r = await fetch(url, {cache:"no-store", headers:{Accept:"application/json"}});
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     return await r.json();
   }
-
   function hasMark(html){ return /<mark>/.test(html||""); }
   function setPagerDisabled(disabled){
-    $("prev").disabled = disabled;
-    $("next").disabled = disabled;
+    $("prev").disabled = disabled; $("next").disabled = disabled;
   }
 
-  // ====== 検索 ======
   async function doSearch(page){
     const q=$("q").value.trim(); if(!q){
       $("results").innerHTML=""; $("meta").textContent="（未取得）";
-      setPagerDisabled(true);
-      return;
+      setPagerDisabled(true); return;
     }
     $("btnSearch").disabled=true; $("meta").textContent="検索中…"; $("results").innerHTML="";
     try{
-      const ord="latest"; // 常に最新順
+      const ord="latest";
       const url=`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(ord)}`;
       const raw=await jget(url);
       const items=asArray(raw?.items)||[];
       if(!items.length){
-        $("meta").textContent="該当なし";
-        $("results").innerHTML="";
-        setPagerDisabled(true);
-        return;
+        $("meta").textContent="該当なし"; $("results").innerHTML=""; setPagerDisabled(true); return;
       }
-
       $("results").innerHTML=items.map((it,i)=>{
         const title = it.title || "(無題)";
         const content = it.content || "";
         const url = it.url || "";
         const hit = hasMark(content) ? '<span class="hit">（本文にヒット）</span>' : '';
-        // 重要：アプリ内表示用のボタン（data-url でURLを保持）
-        const link = url
-          ? `<div class="src">
-               <a href="#" class="open-in-app" data-url="${encodeURIComponent(url)}">本文表示（アプリ内）</a>
-               &nbsp; / &nbsp;
-               <a href="${url}" target="_blank" rel="noopener noreferrer">↗ Safariで開く</a>
-             </div>`
-          : "";
+        const link = url ? `<div class="src"><a href="${url}" target="_blank" rel="noopener">↗ 開く</a></div>` : "";
         return `<div class="result"><div class="title">${title}${hit}</div><div class="snippet">${content}</div>${link}</div>`;
       }).join("");
-
-      // クリック委任：アプリ内本文表示
-      document.querySelectorAll(".open-in-app").forEach(a=>{
-        a.addEventListener("click",(e)=>{
-          e.preventDefault();
-          const url = decodeURIComponent(a.getAttribute("data-url")||"");
-          if(url){ openDetail(url); }
-        });
-      });
 
       const total = raw.total_hits ?? items.length;
       const from = (page-1)*PAGE_SIZE + 1;
@@ -263,8 +160,7 @@
       $("next").disabled = !raw.has_more;
       window.__page=page;
     }catch(e){
-      $("meta").textContent=`エラー：${String(e.message||e)}`;
-      setPagerDisabled(true);
+      $("meta").textContent=`エラー：${String(e.message||e)}`; setPagerDisabled(true);
     }finally{ $("btnSearch").disabled=false; }
   }
 
@@ -275,49 +171,6 @@
   $("q").addEventListener("keydown",(e)=>{ if(e.key==="Enter"){ doSearch(1); } });
 
   (async ()=>{ try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{} })();
-
-  // ====== アプリ内本文ビュー（戻る付き） ======
-  function openDetail(url){
-    $("detailFrame").src = url;
-    $("detailOpenSafari").href = url;
-    $("openInSafari").href = url;
-
-    $("detailWrap").style.display = "block";
-    $("appBack").classList.remove("hidden");
-    $("openInSafari").classList.remove("hidden");
-    $("floatingBack").style.display = "block";
-
-    // 履歴を追加（PWAでも擬似戻るが効くことが多い）
-    try{ history.pushState({v:"detail"}, "", "#detail"); }catch{}
-  }
-  function closeDetail(){
-    $("detailFrame").src = "about:blank";
-    $("detailWrap").style.display = "none";
-    $("appBack").classList.add("hidden");
-    $("openInSafari").classList.add("hidden");
-    $("floatingBack").style.display = "none";
-    // 履歴を戻す（失敗しても無害）
-    if(location.hash==="#detail"){
-      try{ history.back(); }catch{}
-    }
-  }
-
-  $("detailBack").addEventListener("click", closeDetail);
-  $("detailClose").addEventListener("click", closeDetail);
-  $("appBack").addEventListener("click", closeDetail);
-  $("floatingBackBtn").addEventListener("click", closeDetail);
-
-  // 端末の戻る操作（ジェスチャ・ボタン）にも追随
-  window.addEventListener("popstate", ()=>{
-    if(location.hash !== "#detail"){
-      // detailが閉じられたとみなす
-      $("detailFrame").src = "about:blank";
-      $("detailWrap").style.display = "none";
-      $("appBack").classList.add("hidden");
-      $("openInSafari").classList.add("hidden");
-      $("floatingBack").style.display = "none";
-    }
-  });
 </script>
 </body>
 </html>
