@@ -4,8 +4,8 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>ミニバラ盆栽愛好会 デジタル資料館｜検索（JSONL版）</title>
-    <link rel="manifest" href="/static/manifest.json">
-  <meta name="theme-color" content="#AEE6B8">
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#AEE6B8">
 <meta name="robots" content="noindex" />
 <style>
   :root{
@@ -24,6 +24,7 @@
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .api{font-size:12px;color:var(--muted)}
 
+  /* ▼ 検索UI（変更禁止） */
   input[type="text"]{
     flex:1 1 520px;min-width:260px;
     padding:16px 18px;border-radius:12px;background:var(--inbg);
@@ -54,66 +55,102 @@
 
   .notice{margin-top:16px;background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:10px}
   .howto{margin-top:16px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:12px;padding:10px}
+
+  /* ▼ 追加：ビュー切替（検索ビュー／詳細ビュー） */
+  [hidden]{display:none !important;}
+  .detail-header{
+    display:flex; align-items:center; gap:10px; padding:12px 16px;
+    border-bottom:1px solid var(--b);
+  }
+  .detail-title{font-weight:700;font-size:22px;margin:0}
+  .detail-body{padding:12px 16px}
+  .detail-links{padding:0 16px 16px}
 </style>
 </head>
 <body>
   <div class="container">
+
     <h1>ミニバラ盆栽愛好会 デジタル資料館</h1>
 
-    <div class="toolbar">
-      <div class="row" style="justify-content:space-between">
-        <div style="font-weight:700;color:#ef4444">検索システム</div>
-        <span style="display:inline-block;background:#fff7ed;border:1px solid #fed7aa;border-radius:999px;padding:4px 10px;font-size:12px;color:#92400e">年でしぼる＋ページ送り</span>
+    <!-- ▼▼▼ 検索ビュー（既存 UI：変更なし） ▼▼▼ -->
+    <div id="viewSearch">
+      <div class="toolbar">
+        <div class="row" style="justify-content:space-between">
+          <div style="font-weight:700;color:#ef4444">検索システム</div>
+          <span style="display:inline-block;background:#fff7ed;border:1px solid #fed7aa;border-radius:999px;padding:4px 10px;font-size:12px;color:#92400e">年でしぼる＋ページ送り</span>
+        </div>
+
+        <div class="row" style="margin-top:8px">
+          <input id="q" type="text" placeholder="例） コンテスト結果　／　例） コンテスト 2023　／　例） 剪定 1999-2001" />
+          <select id="order" title="並び順" disabled>
+            <option value="relevance">関連順</option>
+            <option value="latest" selected>最新順</option>
+          </select>
+          <button class="primary" id="btnSearch">検索</button>
+          <button id="btnClear">クリア</button>
+        </div>
+
+        <div class="api" style="margin-top:6px">
+          API: <code>/api/search</code> ｜ 版: <span id="ver">…</span> ｜
+          <a href="/health" target="_blank" rel="noopener">/health</a> ・
+          <a href="/version" target="_blank" rel="noopener">/version</a><br/>
+          ※ この画面の検索は <strong>常に「最新順（order=latest）」で表示</strong> します。
+        </div>
       </div>
 
-      <div class="row" style="margin-top:8px">
-        <input id="q" type="text" placeholder="例） コンテスト結果　／　例） コンテスト 2023　／　例） 剪定 1999-2001" />
-        <select id="order" title="並び順" disabled>
-          <option value="relevance">関連順</option>
-          <option value="latest" selected>最新順</option>
-        </select>
-        <button class="primary" id="btnSearch">検索</button>
-        <button id="btnClear">クリア</button>
+      <div class="section">
+        <h2>検索結果（整形表示）</h2>
+        <div class="body">
+          <div id="meta" class="meta">（未取得）</div>
+          <div id="results"></div>
+          <div class="row" style="gap:8px;margin-top:8px">
+            <button id="prev" disabled>前へ</button>
+            <button id="next" disabled>次へ</button>
+          </div>
+        </div>
       </div>
 
-      <div class="api" style="margin-top:6px">
-        API: <code>/api/search</code> ｜ 版: <span id="ver">…</span> ｜
-        <a href="/health" target="_blank" rel="noopener">/health</a> ・
-        <a href="/version" target="_blank" rel="noopener">/version</a><br/>
-        ※ この画面の検索は <strong>常に「最新順（order=latest）」で表示</strong> します。
+      <div class="notice">
+        <strong>お知らせ</strong><br/>
+        チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。
+      </div>
+
+      <div class="howto">
+        <h3>使いかた</h3>
+        <ol style="margin:6px 0 0;padding-left:1.2em">
+          <li>ことばを入れて「検索」を押す。</li>
+          <li>1ページは<strong>常に5件</strong>。先頭だけ<strong>本文を約300字</strong>表示、2〜5件は<strong>ハイライト周辺</strong>のみ。</li>
+          <li>続きは次へ、戻るときは前へ（ページ送り）。</li>
+          <li>年でしぼるときは語尾に西暦4桁。<span style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px">例：コンテスト 2023</span></li>
+          <li>年の範囲はハイフン。<span style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px">例：剪定 1999-2001</span></li>
+        </ol>
       </div>
     </div>
+    <!-- ▲▲▲ 検索ビュー（既存 UI：変更なし） ▲▲▲ -->
 
-    <div class="section">
-      <h2>検索結果（整形表示）</h2>
-      <div class="body">
-        <div id="meta" class="meta">（未取得）</div>
-        <div id="results"></div>
-        <div class="row" style="gap:8px;margin-top:8px">
-          <button id="prev" disabled>前へ</button>
-          <button id="next" disabled>次へ</button>
+    <!-- ▼▼▼ 追加：詳細ビュー（新規。検索UIには非干渉） ▼▼▼ -->
+    <div id="viewDetail" class="section" hidden>
+      <div class="detail-header">
+        <button id="btnBack" aria-label="前の画面へ戻る">← 戻る</button>
+        <h2 class="detail-title" id="detailTitle">（タイトル）</h2>
+      </div>
+      <div class="detail-body">
+        <div id="detailMeta" class="meta"></div>
+        <div id="detailBody" class="snippet"></div>
+      </div>
+      <div class="detail-links">
+        <div class="src">
+          <a id="detailExternal" href="#" target="_blank" rel="noopener noreferrer">本文表示（クリックして下さい。）</a>
+          <div id="detailRawUrl" class="rawurl"></div>
         </div>
       </div>
     </div>
+    <!-- ▲▲▲ 追加：詳細ビュー ▲▲▲ -->
 
-    <div class="notice">
-      <strong>お知らせ</strong><br/>
-      チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。
-    </div>
-
-    <div class="howto">
-      <h3>使いかた</h3>
-      <ol style="margin:6px 0 0;padding-left:1.2em">
-        <li>ことばを入れて「検索」を押す。</li>
-        <li>1ページは<strong>常に5件</strong>。先頭だけ<strong>本文を約300字</strong>表示、2〜5件は<strong>ハイライト周辺</strong>のみ。</li>
-        <li>続きは次へ、戻るときは前へ（ページ送り）。</li>
-        <li>年でしぼるときは語尾に西暦4桁。<span style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px">例：コンテスト 2023</span></li>
-        <li>年の範囲はハイフン。<span style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px">例：剪定 1999-2001</span></li>
-      </ol>
-    </div>
   </div>
 
 <script>
+  /* ===== 既存検索JS（変更は“内部表示ボタンの追加”のみ） ===== */
   const PAGE_SIZE = 5;
   const $ = (id) => document.getElementById(id);
   const asArray = (x) => Array.isArray(x) ? x : [];
@@ -123,42 +160,66 @@
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     return await r.json();
   }
-
   function hasMark(html){ return /<mark>/.test(html||""); }
-
   function setPagerDisabled(disabled){
     $("prev").disabled = disabled;
     $("next").disabled = disabled;
   }
 
   async function doSearch(page){
-    const q=$("q").value.trim(); if(!q){
+    const q=$("q").value.trim();
+    if(!q){
       $("results").innerHTML=""; $("meta").textContent="（未取得）";
       setPagerDisabled(true);
+      window.__lastItems = []; window.__page = 1;
       return;
     }
+    // 状態保持（戻るで復元用）
+    sessionStorage.setItem("LAST_SEARCH", JSON.stringify({ q, page, order:"latest", scrollY: window.scrollY }));
+
     $("btnSearch").disabled=true; $("meta").textContent="検索中…"; $("results").innerHTML="";
     try{
-      const ord="latest"; // ✅ 常に最新順で検索（UIは固定）
+      const ord="latest"; // ✅ UIは常に最新順（変更なし）
       const url=`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(ord)}`;
       const raw=await jget(url);
       const items=asArray(raw?.items)||[];
+      window.__lastItems = items; // ▼ 詳細表示用に保持
       if(!items.length){
         $("meta").textContent="該当なし";
         $("results").innerHTML="";
-        setPagerDisabled(true); // ← 該当なし時は必ず無効化
+        setPagerDisabled(true);
         return;
       }
-
       $("results").innerHTML=items.map((it,i)=>{
         const title = it.title || "(無題)";
         const content = it.content || "";
         const url = it.url || "";
-        const snippet = (i===0) ? content : content; // API側でスニペット済み
         const hit = hasMark(content) ? '<span class="hit">（本文にヒット）</span>' : '';
         const link = url ? `<div class="src"><a href="${url}" target="_blank" rel="noopener noreferrer">本文表示（クリックして下さい。）</a></div>` : "";
-        return `<div class="result"><div class="title">${title}${hit}</div><div class="snippet">${snippet}</div>${link}</div>`;
+
+        // ▼ 追加：内部表示ボタン（検索UIは不変。結果カード内に小さく追加するだけ）
+        const internalBtn = `<div class="src" style="margin-top:8px">
+            <a href="#" data-idx="${i}" class="js-internal" style="display:inline-block;padding:10px 12px;border:1px solid var(--b);border-radius:10px;text-decoration:none;">この画面で詳細表示</a>
+          </div>`;
+
+        return `<div class="result">
+                  <div class="title">${title}${hit}</div>
+                  <div class="snippet">${content}</div>
+                  ${link}
+                  ${internalBtn}
+                </div>`;
       }).join("");
+
+      // 内部表示ボタンのイベント委譲
+      $("results").querySelectorAll(".js-internal").forEach(a=>{
+        a.addEventListener("click",(e)=>{
+          e.preventDefault();
+          const idx = Number(e.currentTarget.getAttribute("data-idx"))||0;
+          const state = { mode:"detail", idx, q, page, scrollY: window.scrollY };
+          history.pushState(state, "", location.pathname + location.search); // URLは変えない（最小変更）
+          openDetailByIndex(idx, { q, page, scrollY: window.scrollY });
+        }, {passive:false});
+      });
 
       const total = raw.total_hits ?? items.length;
       const from = (page-1)*PAGE_SIZE + 1;
@@ -174,12 +235,97 @@
   }
 
   $("btnSearch").addEventListener("click", ()=>doSearch(1));
-  $("btnClear").addEventListener("click", ()=>{ $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; setPagerDisabled(true); });
+  $("btnClear").addEventListener("click", ()=>{
+    $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; setPagerDisabled(true);
+    window.__lastItems = []; window.__page = 1;
+    sessionStorage.removeItem("LAST_SEARCH");
+  });
   $("prev").addEventListener("click", ()=>{ const p=Math.max(1,(window.__page||1)-1); doSearch(p); });
   $("next").addEventListener("click", ()=>{ const p=(window.__page||1)+1; doSearch(p); });
   $("q").addEventListener("keydown",(e)=>{ if(e.key==="Enter"){ doSearch(1); } });
 
   (async ()=>{ try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{} })();
+
+  /* ===== 追加：二画面切替（検索ビュー↔詳細ビュー）／History API ===== */
+
+  function switchView(mode){ // "search" | "detail"
+    const search = $("viewSearch");
+    const detail = $("viewDetail");
+    if(mode==="detail"){
+      search.hidden = true;
+      detail.hidden = false;
+      // 詳細へ遷移時、ページ先頭へ
+      window.scrollTo({top:0, behavior:"instant"});
+    }else{
+      detail.hidden = true;
+      search.hidden = false;
+    }
+  }
+
+  function openDetailByIndex(idx, lastState){
+    const items = window.__lastItems || [];
+    const it = items[idx];
+    if(!it){ // 安全フォールバック：検索ビューへ
+      switchView("search");
+      if(lastState?.q){ $("q").value = lastState.q; }
+      if(lastState?.page){ doSearch(lastState.page); }
+      return;
+    }
+    $("detailTitle").textContent = it.title || "(無題)";
+    $("detailMeta").textContent  = it.author ? `著者: ${it.author}` : "";
+    $("detailBody").innerHTML    = it.content || "";
+    const url = it.url || "";
+    $("detailExternal").href     = url || "#";
+    $("detailRawUrl").textContent= url ? url : "";
+    switchView("detail");
+  }
+
+  $("btnBack").addEventListener("click", ()=>{
+    // popstate を発火させる（履歴がなければ検索ビューに戻す）
+    if(history.length > 1){
+      history.back();
+    }else{
+      // 履歴なし：検索ビューへ復帰＋状態復元
+      const saved = JSON.parse(sessionStorage.getItem("LAST_SEARCH")||"null");
+      switchView("search");
+      if(saved?.q){ $("q").value = saved.q; doSearch(saved.page||1); }
+      else { $("q").value=""; $("results").innerHTML=""; $("meta").textContent="（未取得）"; setPagerDisabled(true); }
+    }
+  });
+
+  window.addEventListener("popstate",(ev)=>{
+    const st = ev.state;
+    if(st && st.mode==="detail"){
+      openDetailByIndex(st.idx, st);
+    }else{
+      // 検索ビューへ復帰＋状態復元
+      switchView("search");
+      const saved = st || JSON.parse(sessionStorage.getItem("LAST_SEARCH")||"null");
+      if(saved?.q){
+        $("q").value = saved.q;
+        // ページとスクロールも復元
+        const pg = saved.page || 1;
+        doSearch(pg).then(()=>{
+          if(typeof saved.scrollY === "number"){
+            setTimeout(()=>window.scrollTo(0, saved.scrollY||0), 0);
+          }
+        });
+      }
+    }
+  });
+
+  // 初期ロード：検索状態があれば復元
+  (function initFromSession(){
+    const saved = JSON.parse(sessionStorage.getItem("LAST_SEARCH")||"null");
+    if(saved?.q){
+      $("q").value = saved.q;
+      doSearch(saved.page||1).then(()=>{
+        if(typeof saved.scrollY === "number"){
+          setTimeout(()=>window.scrollTo(0, saved.scrollY||0), 0);
+        }
+      });
+    }
+  })();
 </script>
 </body>
 </html>
