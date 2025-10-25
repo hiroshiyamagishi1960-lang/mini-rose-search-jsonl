@@ -2,19 +2,45 @@ name: Keep Render Awake
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # 10分ごと（UTC）。Freeプランのスリープ(≈15分)より短く維持
-  workflow_dispatch:         # 手動実行ボタン
+    - cron: '*/10 * * * *'   # 10分ごと（UTC）
+  workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
+
+    env:
+      BASE_URL: https://mini-rose-search-jsonl.onrender.com
+      UA: "curl/keep-awake (GitHub Actions)"
+
     steps:
-      - name: Ping UI (wake Render)
+      - name: Show schedule (UTC)
+        run: date -u +"UTC %Y-%m-%d %H:%M:%S"
+
+      # 1) 起こす：最初の1発は長め（コールドスタート対策）
+      - name: Wake (long hit to /ui)
         run: |
-          curl -fsS --retry 3 --retry-all-errors --max-time 30 \
-            https://mini-rose-search-jsonl.onrender.com/ui
-      - name: Ping Health (verify up)
+          curl --location --show-error --fail \
+               --max-time 90 --connect-timeout 20 \
+               -H "User-Agent: $UA" -H "Accept: text/html" \
+               "$BASE_URL/ui"
+
+      # 2) 上がったか確認：/health を最大 12 回（2分）ポーリング
+      - name: Verify health (poll)
+        shell: bash
         run: |
-          curl -fsS --retry 3 --retry-all-errors --max-time 30 \
-            https://mini-rose-search-jsonl.onrender.com/health
+          for i in {1..12}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+                    -H "User-Agent: $UA" -H "Accept: application/json" \
+                    --max-time 10 --connect-timeout 5 \
+                    "$BASE_URL/health" || echo "000")
+            echo "[$i] /health -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "OK: service is up."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "NG: /health did not return 200 within 120s."
+          exit 1
