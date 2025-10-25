@@ -18,16 +18,16 @@ jobs:
       - name: Show schedule (UTC)
         run: date -u +"UTC %Y-%m-%d %H:%M:%S"
 
-      # 1) 起こす：最初の1発は長め（コールドスタート対策）
-      - name: Wake (long hit to /ui)
+      # 1) Wake: /health に長めヒット（ここでは失敗扱いにしない）
+      - name: Wake (hit /health, no-fail)
         run: |
-          curl --location --show-error --fail \
+          curl --location --show-error \
                --max-time 90 --connect-timeout 20 \
-               -H "User-Agent: $UA" -H "Accept: text/html" \
-               "$BASE_URL/ui"
+               -H "User-Agent: $UA" -H "Accept: application/json" \
+               "$BASE_URL/health" || true
 
-      # 2) 上がったか確認：/health を最大 12 回（2分）ポーリング
-      - name: Verify health (poll)
+      # 2) Verify: /health が 200 になるまで最大2分ポーリング
+      - name: Verify health (poll until 200)
         shell: bash
         run: |
           for i in {1..12}; do
@@ -44,3 +44,11 @@ jobs:
           done
           echo "NG: /health did not return 200 within 120s."
           exit 1
+
+      # 3)（任意）UIの到達性チェック：失敗してもワークフローを落とさない
+      - name: Check UI (no-fail)
+        run: |
+          curl -I --location --show-error \
+               --max-time 30 --connect-timeout 10 \
+               -H "User-Agent: $UA" -H "Accept: text/html" \
+               "$BASE_URL/ui" || true
