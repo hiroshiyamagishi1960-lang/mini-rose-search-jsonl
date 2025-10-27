@@ -1,0 +1,27 @@
+name: Keep Alive (Light)
+
+on:
+  schedule:
+    # 5分間隔＋2分ずらしの冗長スケジュール（GitHubの間引き対策）
+    - cron: '*/5 * * * *'        # 毎時 0,5,10,15,20,25,30,35,40,45,50,55（UTC）
+    - cron: '2-59/5 * * * *'     # 毎時 2,7,12,17,22,27,32,37,42,47,52,57（UTC）
+  workflow_dispatch:
+
+jobs:
+  keep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    env:
+      BASE_URL: https://mini-rose-search-jsonl.onrender.com
+      UA: "curl/keep-alive (GitHub Actions)"
+
+    steps:
+      - name: Ping /health (fast)
+        run: |
+          curl -fsS --retry 2 --retry-delay 3 --retry-connrefused \
+               -m 10 -A "$UA" "$BASE_URL/health" -o /dev/null || true
+
+      - name: Touch /ui (GET, no HEAD)  # 405回避のためGETで軽くヒット
+        run: |
+          curl -fsS -m 10 -A "$UA" "$BASE_URL/ui" -o /dev/null || true
