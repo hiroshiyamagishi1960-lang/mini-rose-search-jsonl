@@ -8,7 +8,7 @@ on:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     env:
       BASE_URL: https://mini-rose-search-jsonl.onrender.com
@@ -18,37 +18,47 @@ jobs:
       - name: Show schedule (UTC)
         run: date -u +"UTC %Y-%m-%d %H:%M:%S"
 
-      # 1) Wake: /health に長めヒット（ここでは失敗扱いにしない）
+      # 1) Wake: /health に軽くヒット（失敗扱いにしない）
       - name: Wake (hit /health, no-fail)
         run: |
-          curl --location --show-error \
-               --max-time 90 --connect-timeout 20 \
-               -H "User-Agent: $UA" -H "Accept: application/json" \
-               "$BASE_URL/health" || true
+          echo "[Wake] sending first gentle hit..."
+          curl -fsS -m 15 -o /dev/null -A "$UA" "$BASE_URL/health" || true
 
-      # 2) Verify: /health が 200 になるまで最大2分ポーリング
+      # 2) Warm-up: スリープ復帰を待機（最大2分）
+      - name: Warm-up phase (wait for Render cold start)
+        shell: bash
+        run: |
+          echo "[Warm-up] retrying /health for up to 2 minutes (connrefused tolerated)"
+          SECS=0
+          until curl -fsS --retry 12 --retry-delay 10 --retry-connrefused -m 10 -o /dev/null "$BASE_URL/health"; do
+            SECS=$((SECS+10))
+            echo "  still waking... (${SECS}s)"
+            if [ $SECS -ge 120 ]; then
+              echo "  warm-up timeout reached (120s)"
+              break
+            fi
+          done
+
+      # 3) Verify: /health が 200 になるまで最大6分ポーリング
       - name: Verify health (poll until 200)
         shell: bash
         run: |
-          for i in {1..12}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" \
-                    -H "User-Agent: $UA" -H "Accept: application/json" \
-                    --max-time 10 --connect-timeout 5 \
-                    "$BASE_URL/health" || echo "000")
-            echo "[$i] /health -> HTTP $code"
+          echo "[Poll] wait for HTTP 200 (max 6 minutes)"
+          ATTEMPTS=36
+          for i in $(seq 1 $ATTEMPTS); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -A "$UA" --max-time 10 "$BASE_URL/health" || echo "000")
+            echo "  [$i/$ATTEMPTS] /health -> HTTP $code"
             if [ "$code" = "200" ]; then
-              echo "OK: service is up."
+              echo "✅ OK: /health returned 200"
               exit 0
             fi
             sleep 10
           done
-          echo "NG: /health did not return 200 within 120s."
+          echo "❌ NG: /health did not return 200 within $((ATTEMPTS*10))s."
           exit 1
 
-      # 3)（任意）UIの到達性チェック：失敗してもワークフローを落とさない
+      # 4) UIチェック（失敗してもOK扱い）
       - name: Check UI (no-fail)
         run: |
-          curl -I --location --show-error \
-               --max-time 30 --connect-timeout 10 \
-               -H "User-Agent: $UA" -H "Accept: text/html" \
-               "$BASE_URL/ui" || true
+          echo "[UI check]"
+          curl -I -fsS -m 20 -A "$UA" "$BASE_URL/ui" || true
