@@ -1,8 +1,8 @@
-name: Keep Render Awake
+name: Verify Health (Deep)
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # 10分ごと（UTC）
+    - cron: '0 * * * *'      # 毎時00分に1回（UTC）
   workflow_dispatch:
 
 jobs:
@@ -12,53 +12,39 @@ jobs:
 
     env:
       BASE_URL: https://mini-rose-search-jsonl.onrender.com
-      UA: "curl/keep-awake (GitHub Actions)"
+      UA: "curl/verify (GitHub Actions)"
 
     steps:
       - name: Show schedule (UTC)
         run: date -u +"UTC %Y-%m-%d %H:%M:%S"
 
-      # 1) Wake: /health に軽くヒット（失敗扱いにしない）
-      - name: Wake (hit /health, no-fail)
+      - name: Wake (no-fail)
         run: |
-          echo "[Wake] sending first gentle hit..."
           curl -fsS -m 15 -o /dev/null -A "$UA" "$BASE_URL/health" || true
 
-      # 2) Warm-up: スリープ復帰を待機（最大2分）
-      - name: Warm-up phase (wait for Render cold start)
+      - name: Warm-up (<=120s)
         shell: bash
         run: |
-          echo "[Warm-up] retrying /health for up to 2 minutes (connrefused tolerated)"
           SECS=0
           until curl -fsS --retry 12 --retry-delay 10 --retry-connrefused -m 10 -o /dev/null "$BASE_URL/health"; do
             SECS=$((SECS+10))
-            echo "  still waking... (${SECS}s)"
-            if [ $SECS -ge 120 ]; then
-              echo "  warm-up timeout reached (120s)"
-              break
-            fi
+            echo "  waking... ${SECS}s"
+            [ $SECS -ge 120 ] && break
           done
 
-      # 3) Verify: /health が 200 になるまで最大6分ポーリング
-      - name: Verify health (poll until 200)
+      - name: Verify /health == 200 (<=6m)
         shell: bash
         run: |
-          echo "[Poll] wait for HTTP 200 (max 6 minutes)"
           ATTEMPTS=36
           for i in $(seq 1 $ATTEMPTS); do
             code=$(curl -s -o /dev/null -w "%{http_code}" -A "$UA" --max-time 10 "$BASE_URL/health" || echo "000")
-            echo "  [$i/$ATTEMPTS] /health -> HTTP $code"
-            if [ "$code" = "200" ]; then
-              echo "✅ OK: /health returned 200"
-              exit 0
-            fi
+            echo "  [$i/$ATTEMPTS] /health -> $code"
+            [ "$code" = "200" ] && exit 0
             sleep 10
           done
-          echo "❌ NG: /health did not return 200 within $((ATTEMPTS*10))s."
+          echo "NG: /health not 200 in $((ATTEMPTS*10))s"
           exit 1
 
-      # 4) UIチェック（失敗してもOK扱い）
       - name: Check UI (no-fail)
         run: |
-          echo "[UI check]"
-          curl -I -fsS -m 20 -A "$UA" "$BASE_URL/ui" || true
+          curl -fsS -m 20 -A "$UA" "$BASE_URL/ui" -o /dev/null || true
