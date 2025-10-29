@@ -1,21 +1,49 @@
-name: Monitor Render Sleep (Email via GitHub Notifications)
+name: Monitor & Wake Render (single file)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5分ごと（UTC）
-  workflow_dispatch:
+    - cron: "*/5 * * * *"   # 監視：5分ごと（UTC）
+    - cron: "*/12 * * * *"  # 起こし：12分ごと（UTC）
+  workflow_dispatch:        # 手動実行（監視ジョブのみ実行）
 
 permissions:
   contents: read
   issues: write
 
+# 同時実行を抑止（最新だけを残す）
+concurrency:
+  group: monitor-wake-render
+  cancel-in-progress: true
+
 jobs:
-  monitor:
+  # --- 起こし（Wake）ジョブ：12分ごとのスケジュールでのみ動く ---
+  wake:
+    if: github.event_name == 'schedule' && github.event.schedule == '*/12 * * * *'
     runs-on: ubuntu-latest
-    timeout-minutes: 20   # 3回試行（最大約15分）でも安全に収まる
+    timeout-minutes: 2
+    env:
+      BASE_URL: https://mini-rose-search-jsonl.onrender.com
+      UA: "curl/wake (GitHub Actions)"
+    steps:
+      - name: Ping /health (one shot)
+        run: |
+          set -euo pipefail
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                  -A "$UA" --max-time 15 --connect-timeout 5 \
+                  "$BASE_URL/health" || echo "000")
+          echo "Wake ping -> HTTP $CODE"
+          # 起こし目的なので成否に関わらず成功終了
+          exit 0
+
+  # --- 監視（Monitor）ジョブ：5分ごとのスケジュールと手動実行で動く ---
+  monitor:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '*/5 * * * *')
+    runs-on: ubuntu-latest
+    timeout-minutes: 8   # 約5〜6分で終わる設計
 
     env:
       BASE_URL: https://mini-rose-search-jsonl.onrender.com
+      HEALTH_PATH: /health
       UA: "curl/monitor-sleep (GitHub Actions)"
       LABEL: "render-sleep"
       ISSUE_TITLE: "ALERT: Render may be asleep (health check failed 3/3)"
@@ -24,27 +52,41 @@ jobs:
       - name: Show schedule (UTC)
         run: date -u +"UTC %Y-%m-%d %H:%M:%S"
 
-      - name: Check /health (3 attempts over ~15 min)
+      - name: Check /health (3 attempts over ~4-5 min)
         id: probe
         shell: bash
         run: |
           set -euo pipefail
           FAILS=0
           ATTEMPTS=3
-          INTERVAL=300   # 5分おきに確認（3回で約15分）
-          for i in $(seq 1 $ATTEMPTS); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-                    -A "$UA" --max-time 8 --connect-timeout 3 \
-                    "$BASE_URL/health" || echo "000")
-            echo "[$i/$ATTEMPTS] /health -> HTTP $CODE"
-            if [ "$CODE" != "200" ]; then
-              FAILS=$((FAILS+1))
+          INTERVAL=120   # 2分待機×2回＝約4分
+          URL="${BASE_URL}${HEALTH_PATH}"
+
+          for i in $(seq 1 "$ATTEMPTS"); do
+            CODE=$(curl -s -w "%{http_code}" -o /tmp/health.json \
+                    -A "$UA" --max-time 15 --connect-timeout 5 \
+                    "$URL" || echo "000")
+            echo "[$i/$ATTEMPTS] ${URL} -> HTTP $CODE"
+
+            # 200 かつ {"ok": true} を要求（本文も確認して誤検知を減らす）
+            OK_BODY="no"
+            if [ "$CODE" = "200" ] && grep -q '"ok"[[:space:]]*:[[:space:]]*true' /tmp/health.json 2>/dev/null; then
+              OK_BODY="yes"
             fi
+
+            if [ "$CODE" != "200" ] || [ "$OK_BODY" != "yes" ]; then
+              echo "  -> health check failed (body_ok=${OK_BODY})"
+              FAILS=$((FAILS+1))
+            else
+              echo "  -> health check passed"
+            fi
+
             # 最後の試行以外は待機
             if [ "$i" -lt "$ATTEMPTS" ]; then
               sleep "$INTERVAL"
             fi
           done
+
           echo "fails=$FAILS" >> "$GITHUB_OUTPUT"
 
       - name: Decide and summarize
@@ -52,13 +94,33 @@ jobs:
         run: |
           if [ "${{ steps.probe.outputs.fails }}" -ge 3 ]; then
             echo "alert=yes" >> "$GITHUB_OUTPUT"
-            echo "Render is likely asleep or unreachable (3/3 failed)."
+            echo "Render is likely asleep or unhealthy (failed 3/3)."
           else
             echo "alert=no" >> "$GITHUB_OUTPUT"
-            echo "Render responded at least once (no alert)."
+            echo "Render responded at least once with a healthy body (no alert)."
           fi
 
-      # 失敗3/3のときだけ Issue を作成/追記（＝GitHub通知メールが飛ぶ）
+      # アラート用ラベルを用意（無ければ作る）
+      - name: Ensure label exists
+        if: steps.decide.outputs.alert == 'yes'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const name = process.env.LABEL;
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name });
+              core.info(`Label "${name}" exists.`);
+            } catch (e) {
+              core.info(`Label "${name}" not found. Creating...`);
+              await github.rest.issues.createLabel({
+                owner, repo, name,
+                color: "d73a4a",
+                description: "Render sleep/unhealthy alerts"
+              });
+            }
+
+      # 失敗3/3のときだけ Issue を作成/追記（GitHubの通知メールが飛ぶ）
       - name: Create or update alert issue (email via GitHub notifications)
         if: steps.decide.outputs.alert == 'yes'
         uses: actions/github-script@v7
@@ -67,35 +129,32 @@ jobs:
             const { owner, repo } = context.repo;
             const label = process.env.LABEL;
             const title = process.env.ISSUE_TITLE;
+            const endpoint = `${process.env.BASE_URL}${process.env.HEALTH_PATH}`;
             const now = new Date().toISOString();
             const body = [
               `Time (UTC): ${now}`,
-              `Endpoint: ${process.env.BASE_URL}/health`,
-              `Result: failed 3/3 over ~15 min`,
+              `Endpoint: ${endpoint}`,
+              `Result: failed 3/3 over ~4-5 min`,
               `Runner: ${process.env.GITHUB_ACTION}`,
               `Note: This issue triggers GitHub email notifications.`,
             ].join('\n');
 
-            // 既存の未クローズIssue（同タイトル・同ラベル）を探す
             const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', labels: label
+              owner, repo, state: 'open', labels: label, per_page: 100
             });
 
             const existing = issues.find(i => i.title === title);
             if (existing) {
-              // 既存に追記して通知
               await github.rest.issues.createComment({
                 owner, repo, issue_number: existing.number, body
               });
               core.info(`Updated existing alert issue #${existing.number}`);
             } else {
-              // 新規作成
               const { data: created } = await github.rest.issues.create({
                 owner, repo, title, body, labels: [label]
               });
               core.info(`Created new alert issue #${created.number}`);
             }
 
-      # 常に success で終了（監視は“通知の有無”で判断）
       - name: Mark success
         run: echo "Done."
