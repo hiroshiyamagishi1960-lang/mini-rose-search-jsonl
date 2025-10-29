@@ -1,62 +1,47 @@
-name: Verify Health (No-Fail, Short)
+name: Verify Health (Light, No-Fail)
 
 on:
   schedule:
-    - cron: '0 * * * *'      # 毎時00分（UTC）
-  workflow_dispatch:
+    - cron: '0 * * * *'      # 毎時00分（UTC）＝ JSTで毎時09分
+  workflow_dispatch:          # 手動実行も可能
 
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 4   # 時間超過を防ぐ（必ず終わる）
+    timeout-minutes: 5        # 強制終了までの上限時間（短め）
 
     env:
       BASE_URL: https://mini-rose-search-jsonl.onrender.com
-      UA: "curl/verify-no-fail (GitHub Actions)"
+      UA: "curl/verify-health (GitHub Actions)"
 
     steps:
       - name: Show schedule (UTC)
         run: date -u +"UTC %Y-%m-%d %H:%M:%S"
 
-      # 単発・短時間のウォームアップ（最大25秒）
-      - name: Warm-up (short, single-attempt loop)
+      # 1回目〜3回目まで合計60秒ほど待ちつつ再試行（Render起動中を想定）
+      - name: Poll /health for 200 (max 3 attempts, <=60s)
         shell: bash
         continue-on-error: true
         run: |
-          echo "[Warm-up] short attempts (<=25s total)"
-          for i in $(seq 1 5); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" \
-                    -A "$UA" --max-time 5 --connect-timeout 2 \
+          echo "[Verify] Checking /health (<=3 tries)"
+          for i in 1 2 3; do
+            code=$(curl -4 -s -o /dev/null -w "%{http_code}" \
+                    -A "$UA" --max-time 10 --connect-timeout 3 \
                     "$BASE_URL/health" || echo "000")
-            echo "  [$i/5] /health -> $code"
-            [ "$code" = "200" ] && exit 0
-            sleep 5
+            echo "  [$i/3] HTTP $code"
+            [ "$code" = "200" ] && { echo "OK: 200 received"; exit 0; }
+            sleep 20
           done
-          echo "  warm-up finished (no 200 yet)."
+          echo "WARN: /health did not return 200 (no-fail)"
 
-      # 200到達待ち（最大60秒）— 失敗しても落とさない
-      - name: Poll /health for 200 (<=60s)
+      # UI到達確認（軽いGET、失敗してもOK）
+      - name: Check /ui (GET, no-fail)
         shell: bash
         continue-on-error: true
         run: |
-          echo "[Poll] wait for HTTP 200 (max 60s)"
-          for i in $(seq 1 12); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" \
-                    -A "$UA" --max-time 5 --connect-timeout 2 \
-                    "$BASE_URL/health" || echo "000")
-            echo "  [$i/12] /health -> $code"
-            [ "$code" = "200" ] && { echo "OK: 200"; exit 0; }
-            sleep 5
-          done
-          echo "WARN: /health did not reach 200 within 60s (no-fail)."
+          curl -4 -sS -m 8 --connect-timeout 3 -A "$UA" \
+               "$BASE_URL/ui" -o /dev/null || echo "WARN: /ui not reachable"
 
-      # UI到達性（GET）。失敗してもOK扱い
-      - name: Check UI (GET, no-fail)
-        continue-on-error: true
-        run: |
-          curl -fsS -m 5 --connect-timeout 2 -A "$UA" \
-               "$BASE_URL/ui" -o /dev/null || echo "WARN: /ui not reachable (no-fail)"
-
-      # 常にsuccessで終了
+      # すべて成功扱いで終了（通知メール防止）
       - name: Mark success (always)
-        run: echo "Done (no-fail)."
+        run: echo "Done (verify-health, no-fail)."
