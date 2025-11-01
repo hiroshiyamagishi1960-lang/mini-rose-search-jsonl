@@ -1,10 +1,4 @@
-# app.py — v5.3 (AND前提・除外語・診断debug、UI変更なし)
-# 目的：
-#  - スペース区切り＝AND（両語必須）を標準化（Google等と同じ体験）
-#  - `-語` の除外、`logic=or` の一時切替、`debug=1` のヒット内訳返却
-#  - v5.2 の高速・多段スコア（A/B/C）と fold/fuzzy/近接/フレーズ加点を継承
-#  - 既定 order は latest（新→古）。同日内は関連度：タイトル>タグ>本文+回数
-#  - /static 公開はそのまま
+# app.py — v5.3.1 (AND前提・除外語・診断debug、UI変更なし)
 
 import os, io, re, csv, json, hashlib, unicodedata, threading
 from datetime import datetime
@@ -22,10 +16,9 @@ try:
 except Exception:
     requests = None
 
-# ==================== 基本設定 ====================
 KB_URL    = (os.getenv("KB_URL", "") or "").strip()
 KB_PATH   = os.path.normpath((os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip())
-VERSION   = os.getenv("APP_VERSION", "jsonl-2025-11-01-v5.3")
+VERSION   = os.getenv("APP_VERSION", "jsonl-2025-11-01-v5.3.1")
 SYN_CSV   = (os.getenv("SYNONYM_CSV", "") or "").strip()
 
 TOP_K_A   = int(os.getenv("TOP_K_A", "160"))
@@ -41,7 +34,7 @@ BONUS_NEAR_BODY   = int(os.getenv("BONUS_NEAR_BODY", "2"))
 
 CACHE_SIZE = int(os.getenv("CACHE_SIZE", "128"))
 
-app = FastAPI(title="mini-rose-search-jsonl (v5.3)")
+app = FastAPI(title="mini-rose-search-jsonl (v5.3.1)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=False,
@@ -56,7 +49,6 @@ LAST_ERROR: str = ""
 LAST_EVENT: str = ""
 _KB_ROWS: Optional[List[Dict[str, Any]]] = None
 
-# ==================== 正規化ユーティリティ ====================
 def _nfkc(s: Optional[str]) -> str:
     return unicodedata.normalize("NFKC", s or "")
 
@@ -76,7 +68,6 @@ def textify(x: Any) -> str:
     except Exception:
         return str(x)
 
-# ==================== かなフォールディング ====================
 KATA_TO_HIRA = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ン") + 1)})
 HIRA_SMALL2NORM = {"ぁ":"あ","ぃ":"い","ぅ":"う","ぇ":"え","ぉ":"お","ゃ":"や","ゅ":"ゆ","ょ":"よ","っ":"つ","ゎ":"わ"}
 DAKUTEN = "\u3099"; HANDAKUTEN = "\u309A"
@@ -105,7 +96,6 @@ def fold_kana(s: str) -> str:
     t = _strip_diacritics(t)
     return t
 
-# ==================== 軽量ファジー ====================
 def _lev1_match(term: str, hay: str) -> bool:
     if not term or not hay: return False
     n, m = len(term), len(hay)
@@ -141,7 +131,6 @@ def fuzzy_contains(term: str, text: str) -> bool:
                 return True
     return False
 
-# ==================== 同義語CSV ====================
 _syn_variant2canon: Dict[str, Set[str]] = {}
 _syn_canon2variant: Dict[str, Set[str]] = {}
 
@@ -161,7 +150,6 @@ def _load_synonyms_from_csv(path: str):
     except Exception:
         pass
 
-# ==================== KB 読み込み・プリ計算 ====================
 TITLE_KEYS = ["title","Title","名前","タイトル","題名","見出し","subject","headline"]
 TEXT_KEYS  = ["content","text","body","本文","内容","記事","description","summary","excerpt"]
 DATE_KEYS  = ["開催日/発行日","date","Date","published_at","published","created_at","更新日","作成日","日付","開催日","発行日"]
@@ -183,7 +171,6 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
     return ""
 
 def record_as_tags(rec: Dict[str, Any]) -> str:
-    # タグ相当を文字列化
     for k in TAG_KEYS:
         if k in rec and rec[k]:
             return textify(rec[k])
@@ -336,8 +323,6 @@ def _attach_precomputed_fields(rows: List[Dict[str, Any]]):
         rec["__doc_id"]    = doc_id_for(rec)
         rec["__date_obj"]  = record_date(rec)
 
-KB_LINES = 0; KB_HASH = ""; LAST_ERROR = ""; LAST_EVENT = ""
-
 def ensure_kb(fetch_now: bool = False) -> Tuple[int, str]:
     global LAST_ERROR, LAST_EVENT, _KB_ROWS
     LAST_ERROR = ""; LAST_EVENT = ""
@@ -393,7 +378,6 @@ def _startup():
         th = threading.Thread(target=_bg_fetch_kb, daemon=True)
         th.start()
 
-# ==================== 年フィルタ ====================
 RANGE_SEP = r"(?:-|–|—|~|〜|～|\.{2})"
 
 def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tuple[int,int]]]:
@@ -431,7 +415,6 @@ def _matches_year(rec: Dict[str, Any], year: Optional[int], yr: Optional[Tuple[i
     lo, hi = yr
     return any(lo <= y <= hi for y in ys)
 
-# ==================== 同義語展開 ====================
 def expand_with_synonyms(term: str) -> Set[str]:
     t = normalize_text(term)
     out: Set[str] = {t}
@@ -441,7 +424,6 @@ def expand_with_synonyms(term: str) -> Set[str]:
         out.update(_syn_canon2variant[t])
     return out
 
-# ==================== フレーズ支援 ====================
 CONNECTOR = r"[\s\u3000]*(?:の|・|／|/|_|\-|–|—)?[\s\u3000]*"
 
 def gen_ngrams(tokens: List[str], nmax: int = 3) -> List[List[str]]:
@@ -476,7 +458,6 @@ def min_token_distance(text: str, a: str, b: str) -> Optional[int]:
         else: j += 1
     return best
 
-# ==================== スコア・ハイライト ====================
 def html_escape(s: str) -> str:
     return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
@@ -521,16 +502,9 @@ def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool, ma
         item["matches"] = matches
     return item
 
-# ==================== クエリ解析（AND/OR・除外・引用） ====================
 TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')
 
 def parse_query(q: str) -> Tuple[List[str], List[str], List[str]]:
-    """
-    returns: (must_terms, minus_terms, raw_terms_for_highlight)
-    - "語" は1トークンとして扱う
-    - -語 は除外
-    - スペースはAND（既定）
-    """
     must: List[str] = []
     minus: List[str] = []
     raw: List[str] = []
@@ -544,7 +518,6 @@ def parse_query(q: str) -> Tuple[List[str], List[str], List[str]]:
             must.append(tok)
     return must, minus, raw
 
-# ==================== 多段スコア ====================
 def _score_stage_a(rec: Dict[str, Any], tokens: List[str]) -> int:
     ttl = rec.get("__ttl_norm", ""); txt = rec.get("__txt_norm", ""); tag = rec.get("__tag_norm","")
     score = 0
@@ -591,7 +564,6 @@ def _score_stage_c(rec: Dict[str, Any], tokens: List[str]) -> int:
             if fuzzy_contains(fr, ftx): score += 1
     return score
 
-# ==================== 並びキー ====================
 def sort_key_relevance(entry: Tuple[int, Optional[datetime], str, Dict[str, Any]]) -> Tuple:
     score, d, did, _ = entry
     date_key = d or datetime.min
@@ -602,7 +574,6 @@ def sort_key_latest(entry: Tuple[int, Optional[datetime], str, Dict[str, Any]]) 
     date_key = d or datetime.min
     return (-int(date_key.strftime("%Y%m%d%H%M%S")), -int(score), did)
 
-# ==================== JSONレスポンス ====================
 def json_utf8(payload: Dict[str, Any], status: int = 200) -> JSONResponse:
     return JSONResponse(
         payload,
@@ -611,12 +582,11 @@ def json_utf8(payload: Dict[str, Any], status: int = 200) -> JSONResponse:
         headers={"Cache-Control":"no-store","Content-Type":"application/json; charset=utf-8"},
     )
 
-# ==================== LRUキャッシュ ====================
 class LRU:
     def __init__(self, cap: int):
         self.cap = cap
         self._d: OrderedDict[Tuple, Dict[str, Any]] = OrderedDict()
-        self._ver: str = ""  # KB_HASH に追随
+        self._ver: str = ""
     def clear(self):
         self._d.clear()
         self._ver = KB_HASH
@@ -638,7 +608,6 @@ class LRU:
 
 _cache = LRU(CACHE_SIZE)
 
-# ==================== エンドポイント ====================
 @app.get("/health")
 def health():
     ok = os.path.exists(KB_PATH) and KB_LINES > 0
@@ -669,4 +638,165 @@ def api_search(
     order: str = Query("latest", pattern="^(relevance|latest)$"),
     refresh: int = Query(0, description="1=kb.jsonl / 同義語CSV を再取得・再読み込み"),
     logic: str = Query("and", pattern="^(and|or)$", description="and=両語必須（既定）/ or=どれか一致"),
-    debug: int = Query(0, descripti
+    debug: int = Query(0, description="1で各件のヒット内訳を返す（診断用）"),
+):
+    try:
+        if refresh == 1:
+            _refresh_kb_globals(fetch_now=True)
+            _cache.clear()
+
+        if not os.path.exists(KB_PATH) or KB_LINES <= 0:
+            return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                              "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order})
+
+        cache_key = (q, order, page, page_size, logic, debug)
+        cached = _cache.get(cache_key)
+        if cached is not None:
+            return json_utf8(cached)
+
+        base_q, y_tail, yr_tail = _parse_year_from_query(q)
+        must_terms, minus_terms, raw_terms = parse_query(base_q)
+        if not must_terms and not minus_terms:
+            payload = {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                       "has_more": False, "next_page": None, "error": None, "order_used": order}
+            _cache.set(cache_key, payload)
+            return json_utf8(payload)
+
+        rows = _KB_ROWS or []
+
+        candidates: List[Dict[str, Any]] = []
+        for rec in rows:
+            if y_tail is not None or yr_tail is not None:
+                if not _matches_year(rec, y_tail, yr_tail):
+                    continue
+
+            ttl = rec.get("__ttl_norm",""); txt = rec.get("__txt_norm",""); tag = rec.get("__tag_norm","")
+            ftt = rec.get("__ttl_fold",""); ftx = rec.get("__txt_fold",""); ftg = rec.get("__tag_fold","")
+
+            def contains_any(term: str) -> bool:
+                exts = expand_with_synonyms(term) or {term}
+                for t in exts:
+                    if t and (t in ttl or t in txt or t in tag):
+                        return True
+                    ft = fold_kana(t)
+                    if ft and (ft in ftt or ft in ftx or ft in ftg):
+                        return True
+                return False
+
+            if minus_terms and any(contains_any(t) for t in minus_terms):
+                continue
+
+            if logic == "or":
+                if not must_terms or any(contains_any(t) for t in must_terms):
+                    candidates.append(rec)
+            else:
+                ok = True
+                for t in must_terms:
+                    if not contains_any(t):
+                        ok = False; break
+                if ok:
+                    candidates.append(rec)
+
+        if not candidates:
+            payload = {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                       "has_more": False, "next_page": None, "error": None, "order_used": order}
+            _cache.set(cache_key, payload)
+            return json_utf8(payload)
+
+        stage_a: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
+        for rec in candidates:
+            sc = _score_stage_a(rec, must_terms or raw_terms)
+            if sc <= 0: continue
+            stage_a.append((sc, rec.get("__date_obj"), rec.get("__doc_id"), rec))
+        if not stage_a:
+            payload = {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
+                       "has_more": False, "next_page": None, "error": None, "order_used": order}
+            _cache.set(cache_key, payload)
+            return json_utf8(payload)
+        stage_a.sort(key=sort_key_relevance)
+        stage_b_candidates = stage_a[:TOP_K_A]
+
+        stage_b: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
+        for sc_a, d, did, rec in stage_b_candidates:
+            sc = sc_a + _score_stage_b(rec, must_terms or raw_terms)
+            stage_b.append((sc, d, did, rec))
+        stage_b.sort(key=sort_key_relevance)
+        stage_c_candidates = stage_b[:TOP_K_B]
+
+        final_list: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
+        for sc_b, d, did, rec in stage_c_candidates:
+            sc = sc_b + _score_stage_c(rec, must_terms or raw_terms)
+            final_list.append((sc, d, did, rec))
+
+        best_by_id: Dict[str, Tuple[int, Optional[datetime], str, Dict[str, Any]]] = {}
+        for entry in final_list:
+            sc, d, did, rec = entry
+            prev = best_by_id.get(did)
+            if prev is None:
+                best_by_id[did] = entry
+            else:
+                psc, pd, _, _ = prev
+                if (sc > psc) or (sc == psc and (d or datetime.min) > (pd or datetime.min)):
+                    best_by_id[did] = entry
+        deduped = list(best_by_id.values())
+
+        if order == "latest":
+            deduped.sort(key=sort_key_latest); order_used = "latest"
+        else:
+            deduped.sort(key=sort_key_relevance); order_used = "relevance"
+
+        total = len(deduped)
+        start = (page - 1) * page_size
+        end   = start + page_size
+        page_slice = deduped[start:end]
+        has_more = end < total
+        next_page = page + 1 if has_more else None
+
+        def calc_matches(rec: Dict[str,Any], terms: List[str]) -> Dict[str,List[str]]:
+            if not terms: return {}
+            ttl = rec.get("__ttl_norm",""); txt = rec.get("__txt_norm",""); tag = rec.get("__tag_norm","")
+            hit_ttl: List[str] = []; hit_tag: List[str] = []; hit_txt: List[str] = []
+            for t in terms:
+                exts = expand_with_synonyms(t) or {t}
+                took = normalize_text(t)
+                ok_t = any((et in ttl) for et in exts)
+                ok_g = any((et in tag) for et in exts)
+                ok_b = any((et in txt) for et in exts)
+                if ok_t: hit_ttl.append(took)
+                if ok_g: hit_tag.append(took)
+                if ok_b: hit_txt.append(took)
+            out = {}
+            if hit_ttl: out["title"] = hit_ttl
+            if hit_tag: out["tags"]  = hit_tag
+            if hit_txt: out["body"]  = hit_txt
+            return out
+
+        items: List[Dict[str, Any]] = []
+        terms_for_hl = must_terms or raw_terms
+        for i, (_sc, _d, _did, rec) in enumerate(page_slice):
+            m = calc_matches(rec, terms_for_hl) if debug == 1 else None
+            items.append(build_item(rec, terms_for_hl, is_first_in_page=(i == 0), matches=m))
+        for idx, _ in enumerate(deduped, start=1):
+            if start < idx <= end:
+                items[idx - start - 1]["rank"] = idx
+
+        payload = {
+            "items": items,
+            "total_hits": total,
+            "page": page,
+            "page_size": page_size,
+            "has_more": has_more,
+            "next_page": next_page,
+            "error": None,
+            "order_used": order_used,
+        }
+        _cache.set(cache_key, payload)
+        return json_utf8(payload)
+
+    except Exception as e:
+        return json_utf8({"items": [], "total_hits": 0, "page": 1, "page_size": page_size,
+                          "has_more": False, "next_page": None, "error": "exception", "message": textify(e)})
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
