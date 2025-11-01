@@ -1,4 +1,4 @@
-# app.py — v5.3.1 (AND前提・除外語・診断debug、UI変更なし)
+# app.py — v5.3.2 (AND前提・除外語・診断debug、関連度バケット＋hit_field返却／UI変更なし)
 
 import os, io, re, csv, json, hashlib, unicodedata, threading
 from datetime import datetime
@@ -18,7 +18,7 @@ except Exception:
 
 KB_URL    = (os.getenv("KB_URL", "") or "").strip()
 KB_PATH   = os.path.normpath((os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip())
-VERSION   = os.getenv("APP_VERSION", "jsonl-2025-11-01-v5.3.1")
+VERSION   = os.getenv("APP_VERSION", "jsonl-2025-11-01-v5.3.2")  # ★ バージョン表記更新
 SYN_CSV   = (os.getenv("SYNONYM_CSV", "") or "").strip()
 
 TOP_K_A   = int(os.getenv("TOP_K_A", "160"))
@@ -34,7 +34,7 @@ BONUS_NEAR_BODY   = int(os.getenv("BONUS_NEAR_BODY", "2"))
 
 CACHE_SIZE = int(os.getenv("CACHE_SIZE", "128"))
 
-app = FastAPI(title="mini-rose-search-jsonl (v5.3.1)")
+app = FastAPI(title="mini-rose-search-jsonl (v5.3.2)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=False,
@@ -222,8 +222,7 @@ _ERA_RE  = re.compile(r"(令和|平成|昭和)\s*(\d{1,2})\s*年(?:\s*(\d{1,2})\
 
 def _era_to_seireki(era: str, nen: int) -> int:
     base = {"令和":2018, "平成":1988, "昭和":1925}.get(era, None)
-    if base is None: raise ValueError
-    return base + nen
+    return base + nen if base is not None else nen
 
 def _first_valid_date_from_string(s: str) -> Optional[datetime]:
     if not s: return None
@@ -474,7 +473,7 @@ def highlight_simple(text: str, terms: List[str]) -> str:
         esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
     return esc
 
-def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool, matches: Optional[Dict[str,List[str]]] = None) -> Dict[str, Any]:
+def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool, matches: Optional[Dict[str,List[str]]] = None, hit_field: Optional[str] = None) -> Dict[str, Any]:  # ★ 引数に hit_field を追加
     title = record_as_text(rec, "title") or "(無題)"
     body  = record_as_text(rec, "text") or ""
     if is_first_in_page:
@@ -498,6 +497,8 @@ def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool, ma
         "rank":    None,
         "date":    record_as_text(rec, "date"),
     }
+    if hit_field:  # ★ UI で（タイトル/タグ/本文にヒット）表示に使う
+        item["hit_field"] = hit_field
     if matches is not None:
         item["matches"] = matches
     return item
@@ -630,6 +631,45 @@ def admin_refresh():
     return json_utf8({"ok": lines>0, "kb_size": lines, "kb_fingerprint": sha,
                       "last_event": LAST_EVENT, "last_error": LAST_ERROR})
 
+# ★ 追加：ヒットフィールドの決定（title > tags > body）
+def _decide_hit_field(rec: Dict[str, Any], terms: List[str]) -> str:
+    if not terms: return ""
+    ttl = rec.get("__ttl_norm",""); txt = rec.get("__txt_norm",""); tag = rec.get("__tag_norm","")
+    ftt = rec.get("__ttl_fold",""); ftx = rec.get("__txt_fold",""); ftg = rec.get("__tag_fold","")
+
+    def present_in(s_norm: str, s_fold: str) -> bool:
+        for raw in terms:
+            exts = expand_with_synonyms(raw) or {raw}
+            for t in exts:
+                if not t: continue
+                t_n = normalize_text(t); t_f = fold_kana(t_n)
+                if (t_n and t_n in s_norm) or (t_f and t_f in s_fold):
+                    return True
+        return False
+
+    if present_in(ttl, ftt): return "title"
+    if present_in(tag, ftg): return "tag"
+    if present_in(txt, ftx): return "body"
+    return ""  # 想定外（AND 判定後なので通常到達しない）
+
+def _calc_matches_for_debug(rec: Dict[str,Any], terms: List[str]) -> Dict[str,List[str]]:
+    ttl = rec.get("__ttl_norm",""); txt = rec.get("__txt_norm",""); tag = rec.get("__tag_norm","")
+    hit_ttl: List[str] = []; hit_tag: List[str] = []; hit_txt: List[str] = []
+    for t in terms:
+        exts = expand_with_synonyms(t) or {t}
+        took = normalize_text(t)
+        ok_t = any((et in ttl) for et in exts)
+        ok_g = any((et in tag) for et in exts)
+        ok_b = any((et in txt) for et in exts)
+        if ok_t: hit_ttl.append(took)
+        if ok_g: hit_tag.append(took)
+        if ok_b: hit_txt.append(took)
+    out = {}
+    if hit_ttl: out["title"] = hit_ttl
+    if hit_tag: out["tags"]  = hit_tag
+    if hit_txt: out["body"]  = hit_txt
+    return out
+
 @app.get("/api/search")
 def api_search(
     q: str = Query("", description="検索クエリ（-語=除外、末尾年/範囲はフィルタ可）"),
@@ -703,9 +743,11 @@ def api_search(
             _cache.set(cache_key, payload)
             return json_utf8(payload)
 
+        # ---- スコアリング（既存3段階） ----
         stage_a: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
+        k_terms = must_terms or raw_terms
         for rec in candidates:
-            sc = _score_stage_a(rec, must_terms or raw_terms)
+            sc = _score_stage_a(rec, k_terms)
             if sc <= 0: continue
             stage_a.append((sc, rec.get("__date_obj"), rec.get("__doc_id"), rec))
         if not stage_a:
@@ -718,16 +760,17 @@ def api_search(
 
         stage_b: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
         for sc_a, d, did, rec in stage_b_candidates:
-            sc = sc_a + _score_stage_b(rec, must_terms or raw_terms)
+            sc = sc_a + _score_stage_b(rec, k_terms)
             stage_b.append((sc, d, did, rec))
         stage_b.sort(key=sort_key_relevance)
         stage_c_candidates = stage_b[:TOP_K_B]
 
         final_list: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
         for sc_b, d, did, rec in stage_c_candidates:
-            sc = sc_b + _score_stage_c(rec, must_terms or raw_terms)
+            sc = sc_b + _score_stage_c(rec, k_terms)
             final_list.append((sc, d, did, rec))
 
+        # ---- 同一ドキュメント統合（既存） ----
         best_by_id: Dict[str, Tuple[int, Optional[datetime], str, Dict[str, Any]]] = {}
         for entry in final_list:
             sc, d, did, rec = entry
@@ -740,43 +783,37 @@ def api_search(
                     best_by_id[did] = entry
         deduped = list(best_by_id.values())
 
-        if order == "latest":
-            deduped.sort(key=sort_key_latest); order_used = "latest"
-        else:
-            deduped.sort(key=sort_key_relevance); order_used = "relevance"
+        # ---- ★ 追加：hit_field を決定してデコレート ----
+        decorated: List[Tuple[int, Optional[datetime], str, Dict[str, Any], str]] = []
+        for sc, d, did, rec in deduped:
+            hf = _decide_hit_field(rec, k_terms) or "body"
+            decorated.append((sc, d, did, rec, hf))
 
-        total = len(deduped)
+        # ---- ★ 並び順：関連度バケット（title->tag->body）→ 日付降順 → スコア降順
+        if order == "latest":
+            bucket_order = {"title":0, "tag":1, "body":2}
+            decorated.sort(key=lambda x: (bucket_order.get(x[4], 9), -(x[1] or datetime.min).timestamp(), -x[0], x[2]))
+            order_used = "latest"
+        else:
+            # relevance 指定時は従来の「スコア→日付」だが、hit_field を同率時の第0優先に挿入
+            bucket_order = {"title":0, "tag":1, "body":2}
+            decorated.sort(key=lambda x: (bucket_order.get(x[4], 9), -x[0], -(x[1] or datetime.min).timestamp(), x[2]))
+            order_used = "relevance"
+
+        # ---- ページング
+        total = len(decorated)
         start = (page - 1) * page_size
         end   = start + page_size
-        page_slice = deduped[start:end]
+        page_slice = decorated[start:end]
         has_more = end < total
         next_page = page + 1 if has_more else None
 
-        def calc_matches(rec: Dict[str,Any], terms: List[str]) -> Dict[str,List[str]]:
-            if not terms: return {}
-            ttl = rec.get("__ttl_norm",""); txt = rec.get("__txt_norm",""); tag = rec.get("__tag_norm","")
-            hit_ttl: List[str] = []; hit_tag: List[str] = []; hit_txt: List[str] = []
-            for t in terms:
-                exts = expand_with_synonyms(t) or {t}
-                took = normalize_text(t)
-                ok_t = any((et in ttl) for et in exts)
-                ok_g = any((et in tag) for et in exts)
-                ok_b = any((et in txt) for et in exts)
-                if ok_t: hit_ttl.append(took)
-                if ok_g: hit_tag.append(took)
-                if ok_b: hit_txt.append(took)
-            out = {}
-            if hit_ttl: out["title"] = hit_ttl
-            if hit_tag: out["tags"]  = hit_tag
-            if hit_txt: out["body"]  = hit_txt
-            return out
-
+        # ---- items 生成（hit_field を返す）
         items: List[Dict[str, Any]] = []
-        terms_for_hl = must_terms or raw_terms
-        for i, (_sc, _d, _did, rec) in enumerate(page_slice):
-            m = calc_matches(rec, terms_for_hl) if debug == 1 else None
-            items.append(build_item(rec, terms_for_hl, is_first_in_page=(i == 0), matches=m))
-        for idx, _ in enumerate(deduped, start=1):
+        for i, (sc, d, did, rec, hf) in enumerate(page_slice):
+            m = _calc_matches_for_debug(rec, k_terms) if debug == 1 else None
+            items.append(build_item(rec, k_terms, is_first_in_page=(i == 0), matches=m, hit_field=hf))
+        for idx, _ in enumerate(decorated, start=1):
             if start < idx <= end:
                 items[idx - start - 1]["rank"] = idx
 
