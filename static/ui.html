@@ -6,38 +6,61 @@
 <title>ミニバラ盆栽愛好会 デジタル資料館｜検索（JSONL版）</title>
 
 <!-- ▼ PWA: 版付きで強制更新 -->
-<link rel="manifest" href="/static/manifest.json?v=2025-11-01-01">
-<link rel="apple-touch-icon" href="/static/icons/icon-180.png?v=2025-11-01-01" sizes="180x180">
-<link rel="icon" href="/static/icons/icon-192.png?v=2025-11-01-01" sizes="192x192" type="image/png">
+<link rel="manifest" href="/static/manifest.json?v=2025-10-24-01">
+<link rel="apple-touch-icon" href="/static/icons/icon-180.png?v=2025-10-24-01" sizes="180x180">
+<link rel="icon" href="/static/icons/icon-192.png?v=2025-10-24-01" sizes="192x192" type="image/png">
 <meta name="theme-color" content="#AEE6B8">
-<meta name="robots" content="noindex" />
 
+<meta name="robots" content="noindex" />
 <style>
-  :root{ --bg:#fafafa; --card:#fff; --b:#e5e7eb; --muted:#64748b; --txt:#0f172a;
-         --link:#2563eb; --hl:#e6f3ff; --ink:#1e3a8a; --inbg:#eaf2ff; }
+  :root{
+    --bg:#fafafa; --card:#fff; --b:#e5e7eb; --muted:#64748b; --txt:#0f172a;
+    --link:#2563eb; --hl:#e6f3ff; --ink:#1e3a8a; --inbg:#eaf2ff;
+    --warn:#fff7cc; --warn-b:#fde68a; --how:#ffeff0; --how-b:#fecdd3;
+  }
   html,body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;line-height:1.7}
-  html{font-size:20px} @media (max-width:480px){ html{font-size:21px} }
+  html{font-size:20px}
+  @media (max-width:480px){ html{font-size:21px} }
+
   .container{max-width:1000px;margin:18px auto;padding:0 16px}
   h1{margin:0 0 12px;font-size:28px}
+
   .toolbar{background:var(--card);border:1px solid var(--b);border-radius:16px;padding:16px}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .api{font-size:12px;color:var(--muted)}
-  input[type="text"]{flex:1 1 520px;min-width:260px;padding:16px 18px;border-radius:12px;background:var(--inbg);
-    border:3px solid var(--ink); outline:none; font-size:20px;}
+
+  input[type="text"]{
+    flex:1 1 520px;min-width:260px;
+    padding:16px 18px;border-radius:12px;background:var(--inbg);
+    border:3px solid var(--ink); outline:none; font-size:20px;
+  }
   select,button{border:1px solid var(--b);border-radius:10px;background:#fff;font-size:16px;line-height:1.2}
-  select{padding:10px 12px} button{padding:12px 16px;cursor:pointer;min-height:44px;background:#f8fafc}
-  button.primary{background:#e7f0ff;border-color:#bfdbfe} button[disabled]{opacity:.5;cursor:not-allowed}
+  select{padding:10px 12px}
+  button{padding:12px 16px;cursor:pointer;min-height:44px;background:#f8fafc}
+  button.primary{background:#e7f0ff;border-color:#bfdbfe}
+  button[disabled]{opacity:.5;cursor:not-allowed}
+
   .section{background:var(--card);border:1px solid var(--b);border-radius:16px;margin-top:16px}
   .section h2{margin:0;padding:12px 16px;border-bottom:1px solid var(--b);font-size:16px}
   .section .body{padding:12px 16px}
+
   .meta{font-size:14px;margin-bottom:8px;color:var(--muted)}
   .result{border:1px solid var(--b);border-radius:14px;padding:12px;background:#fff;margin-bottom:12px}
-  .title{font-weight:700;font-size:22px;margin-bottom:4px}
-  .hitinfo{font-size:14px;color:#1d4ed8;margin-bottom:6px}
+  .title{font-weight:700;font-size:22px;margin-bottom:6px}
   .snippet{white-space:pre-wrap;word-break:break-word}
+  .hit{display:inline-block;font-size:12px;color:#1d4ed8;background:#e0ecff;border:1px solid #bfdbfe;border-radius:999px;padding:2px 8px;margin-left:6px}
   .src{font-size:15px;margin-top:10px}
-  .src a{display:inline-block;padding:10px 12px;border:1px solid var(--b);border-radius:10px;color:var(--link);text-decoration:none}
+  .src a{
+    display:inline-block;padding:10px 12px;border:1px solid var(--b);border-radius:10px;
+    color:var(--link);text-decoration:none;-webkit-tap-highlight-color:transparent;
+  }
+  .src .rawurl{display:block;margin-top:6px;word-break:break-all}
   mark{background:var(--hl);padding:0 .15em;border-radius:3px}
+
+  .badge{display:inline-block;background:#fff7ed;border:1px solid #fed7aa;border-radius:999px;padding:4px 10px;font-size:12px;color:#92400e}
+  .notice{margin-top:16px;background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:10px}
+  .howto{margin-top:16px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:12px;padding:10px}
+  .date{font-size:14px;color:#374151;margin-top:2px}
 </style>
 </head>
 <body>
@@ -47,7 +70,7 @@
     <div class="toolbar">
       <div class="row" style="justify-content:space-between">
         <div style="font-weight:700;color:#ef4444">検索システム</div>
-        <span style="display:inline-block;background:#fff7ed;border:1px solid #fed7aa;border-radius:999px;padding:4px 10px;font-size:12px;color:#92400e">年でしぼる＋ページ送り</span>
+        <span class="badge">年でしぼる＋ページ送り</span>
       </div>
 
       <div class="row" style="margin-top:8px">
@@ -84,6 +107,17 @@
       <strong>お知らせ</strong><br/>
       チャット機能はメンテナンスのため一時停止中です。検索をご利用ください。
     </div>
+
+    <div class="howto">
+      <h3>使いかた</h3>
+      <ol style="margin:6px 0 0;padding-left:1.2em">
+        <li>ことばを入れて「検索」を押す。</li>
+        <li>1ページは<strong>常に5件</strong>。先頭だけ<strong>本文を約300字</strong>表示、2〜5件は<strong>ハイライト周辺</strong>のみ。</li>
+        <li>続きは次へ、戻るときは前へ（ページ送り）。</li>
+        <li>年でしぼるときは語尾に西暦4桁。<span style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px">例：コンテスト 2023</span></li>
+        <li>年の範囲はハイフン。<span style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px">例：剪定 1999-2001</span></li>
+      </ol>
+    </div>
   </div>
 
 <script>
@@ -98,41 +132,54 @@
   }
 
   function hasMark(html){ return /<mark>/.test(html||""); }
-  function setPagerDisabled(disabled){ $("prev").disabled = disabled; $("next").disabled = disabled; }
+
+  function setPagerDisabled(disabled){
+    $("prev").disabled = disabled;
+    $("next").disabled = disabled;
+  }
+
+  function whereHit(matches){
+    if(!matches) return "";
+    const labels = [];
+    if(matches.title && matches.title.length) labels.push("タイトルにヒット");
+    if(matches.tags  && matches.tags.length)  labels.push("タグにヒット");
+    if(matches.body  && matches.body.length)  labels.push("本文にヒット");
+    return labels.length ? `（${labels.join("・")}）` : "";
+  }
 
   async function doSearch(page){
     const q=$("q").value.trim(); if(!q){
-      $("results").innerHTML=""; $("meta").textContent="（未取得）"; setPagerDisabled(true); return;
+      $("results").innerHTML=""; $("meta").textContent="（未取得）";
+      setPagerDisabled(true);
+      return;
     }
     $("btnSearch").disabled=true; $("meta").textContent="検索中…"; $("results").innerHTML="";
     try{
-      const ord="latest";
-      const url=`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(ord)}`;
+      const ord="latest"; // ✅ 常に最新順で検索（UIは固定）
+      const url=`/api/search?q=${encodeURIComponent(q)}&page=${page}&page_size=${PAGE_SIZE}&order=${encodeURIComponent(ord)}&debug=1`;
       const raw=await jget(url);
       const items=asArray(raw?.items)||[];
-      if(!items.length){ $("meta").textContent="該当なし"; $("results").innerHTML=""; setPagerDisabled(true); return; }
+      if(!items.length){
+        $("meta").textContent="該当なし";
+        $("results").innerHTML="";
+        setPagerDisabled(true);
+        return;
+      }
 
-      $("results").innerHTML=items.map((it)=>{
+      $("results").innerHTML=items.map((it,i)=>{
         const title = it.title || "(無題)";
         const content = it.content || "";
-        const linkurl = it.url || "";
-        const date = it.date || it.date_str || "";
-        let hitLabel = "";
-        if (it.hit_field === "title") hitLabel = "（タイトルにヒット）";
-        else if (it.hit_field === "tag") hitLabel = "（タグにヒット）";
-        else if (it.hit_field === "body") hitLabel = "（本文にヒット）";
-        else if (hasMark(content)) hitLabel = "（本文にヒット）";
-        const datePart = date ? `｜発行日：${date}` : "";
-        const hitinfo = (hitLabel || date) ? `<div class="hitinfo">${hitLabel}${datePart}</div>` : "";
-        const link = linkurl ? `<div class="src"><a href="${linkurl}" target="_blank" rel="noopener noreferrer">本文表示（クリックして下さい。）</a></div>` : "";
-        return `<div class="result"><div class="title">${title}</div>${hitinfo}<div class="snippet">${content}</div>${link}</div>`;
+        const url = it.url || "";
+        const hitLabel = whereHit(it.matches) || (hasMark(content) ? "（本文にヒット）" : "");
+        const link = url ? `<div class="src"><a href="${url}" target="_blank" rel="noopener noreferrer">本文表示（クリックして下さい。）</a></div>` : "";
+        const date = it.date ? `<div class="date">発行日：${it.date}</div>` : "";
+        return `<div class="result"><div class="title">${title}<span class="hit">${hitLabel || "\u00A0"}</span></div><div class="snippet">${content}</div>${date}${link}</div>`;
       }).join("");
 
       const total = raw.total_hits ?? items.length;
       const from = (page-1)*PAGE_SIZE + 1;
       const to   = Math.min(page*PAGE_SIZE, total);
-      const orderUsed = raw.order_used || ord;
-      $("meta").textContent=`${total} 件中 ${from}–${to} 件を表示（${orderUsed}）`;
+      $("meta").textContent=`${total} 件中 ${from}–${to} 件を表示（${raw.order_used||ord}）`;
       $("prev").disabled = page<=1;
       $("next").disabled = !raw.has_more;
       window.__page=page;
@@ -150,9 +197,11 @@
 
   (async ()=>{ try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{} })();
 
+  // ▼ PWA: Service Worker 登録（数行のみ）
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", () => {
-      navigator.serviceWorker.register("/static/service-worker.js?ver=2025-11-01-01").catch(()=>{});
+      navigator.serviceWorker.register("/static/service-worker.js?ver=2025-10-24-01")
+        .catch(()=>{ /* 失敗時は何もしない（静かに）*/ });
     });
   }
 </script>
