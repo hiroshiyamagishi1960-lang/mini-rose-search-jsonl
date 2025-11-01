@@ -1,10 +1,10 @@
-# app.py — v5.2 (static 公開対応)
-# 目的（UI変更なし・レスポンス形式不変）
-#  - ダブルクオート不要で「フレーズ一致ボーナス」を全語に適用
-#  - プリ計算＋段階的評価（A:軽い → B:中 → C:重）で高速化（ファジーは後段のみ）
-#  - LRUキャッシュで同一クエリの再検索・ページ送りを高速化
-#  - v5.1の「起動時KB取得は非同期」「日付抽出強化」「年フィルタ優先度」も維持
-#  - NEW: /static を公開マウント（manifest.json / icon-*.png 配信）
+# app.py — v5.3 (AND前提・除外語・診断debug、UI変更なし)
+# 目的：
+#  - スペース区切り＝AND（両語必須）を標準化（Google等と同じ体験）
+#  - `-語` の除外、`logic=or` の一時切替、`debug=1` のヒット内訳返却
+#  - v5.2 の高速・多段スコア（A/B/C）と fold/fuzzy/近接/フレーズ加点を継承
+#  - 既定 order は latest（新→古）。同日内は関連度：タイトル>タグ>本文+回数
+#  - /static 公開はそのまま
 
 import os, io, re, csv, json, hashlib, unicodedata, threading
 from datetime import datetime
@@ -15,7 +15,7 @@ from collections import OrderedDict
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles  # ★ 追加
+from fastapi.staticfiles import StaticFiles
 
 try:
     import requests
@@ -25,40 +25,36 @@ except Exception:
 # ==================== 基本設定 ====================
 KB_URL    = (os.getenv("KB_URL", "") or "").strip()
 KB_PATH   = os.path.normpath((os.getenv("KB_PATH", "kb.jsonl") or "kb.jsonl").strip())
-VERSION   = os.getenv("APP_VERSION", "jsonl-2025-10-22-v5.2")
+VERSION   = os.getenv("APP_VERSION", "jsonl-2025-11-01-v5.3")
 SYN_CSV   = (os.getenv("SYNONYM_CSV", "") or "").strip()
 
-# 検索チューニング（必要に応じて調整）
-TOP_K_A   = int(os.getenv("TOP_K_A", "160"))   # StageA→B へ進める件数
-TOP_K_B   = int(os.getenv("TOP_K_B", "70"))    # StageB→C へ進める件数
-NEAR_WIN  = int(os.getenv("NEAR_WIN", "24"))   # 近接ボーナスの許容距離（文字数）
+TOP_K_A   = int(os.getenv("TOP_K_A", "160"))
+TOP_K_B   = int(os.getenv("TOP_K_B", "70"))
+NEAR_WIN  = int(os.getenv("NEAR_WIN", "24"))
 
-# フレーズ加点（タイトル＞本文）
-BONUS_PHRASE_TTL      = int(os.getenv("BONUS_PHRASE_TTL", "8"))   # 連続一致（タイトル）
-BONUS_PHRASE_BODY     = int(os.getenv("BONUS_PHRASE_BODY", "4"))   # 連続一致（本文）
-BONUS_FLEXPH_TTL      = int(os.getenv("BONUS_FLEXPH_TTL", "6"))   # 柔軟一致（タイトル）
-BONUS_FLEXPH_BODY     = int(os.getenv("BONUS_FLEXPH_BODY", "3"))   # 柔軟一致（本文）
-BONUS_NEAR_TTL        = int(os.getenv("BONUS_NEAR_TTL", "3"))     # 近接（タイトル）
-BONUS_NEAR_BODY       = int(os.getenv("BONUS_NEAR_BODY", "2"))     # 近接（本文）
+BONUS_PHRASE_TTL  = int(os.getenv("BONUS_PHRASE_TTL", "8"))
+BONUS_PHRASE_BODY = int(os.getenv("BONUS_PHRASE_BODY", "4"))
+BONUS_FLEXPH_TTL  = int(os.getenv("BONUS_FLEXPH_TTL", "6"))
+BONUS_FLEXPH_BODY = int(os.getenv("BONUS_FLEXPH_BODY", "3"))
+BONUS_NEAR_TTL    = int(os.getenv("BONUS_NEAR_TTL", "3"))
+BONUS_NEAR_BODY   = int(os.getenv("BONUS_NEAR_BODY", "2"))
 
-# LRUキャッシュ設定
 CACHE_SIZE = int(os.getenv("CACHE_SIZE", "128"))
 
-app = FastAPI(title="mini-rose-search-jsonl (v5.2)")
+app = FastAPI(title="mini-rose-search-jsonl (v5.3)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=False,
     allow_methods=["GET"], allow_headers=["*"],
 )
 
-# ★ 追加: /static を公開マウント（static/ 配下の manifest.json や icon を配信）
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 KB_LINES: int = 0
 KB_HASH:  str = ""
 LAST_ERROR: str = ""
 LAST_EVENT: str = ""
-_KB_ROWS: Optional[List[Dict[str, Any]]] = None  # オリジナル行（拡張フィールド付与）
+_KB_ROWS: Optional[List[Dict[str, Any]]] = None
 
 # ==================== 正規化ユーティリティ ====================
 def _nfkc(s: Optional[str]) -> str:
@@ -155,7 +151,7 @@ def _load_synonyms_from_csv(path: str):
     if not path or not os.path.exists(path): return
     try:
         with io.open(path, "r", encoding="utf-8") as f:
-            rdr = csv.reader(f); header = next(rdr, None)
+            rdr = csv.reader(f); _ = next(rdr, None)
             for row in rdr:
                 if len(row) < 2: continue
                 canon = normalize_text(row[0]); vari = normalize_text(row[1])
@@ -172,6 +168,7 @@ DATE_KEYS  = ["開催日/発行日","date","Date","published_at","published","cr
 URL_KEYS   = ["url","URL","link","permalink","出典URL","公開URL","source"]
 ID_KEYS    = ["id","doc_id","record_id","ページID"]
 AUTH_KEYS  = ["author","Author","writer","posted_by","著者","講師"]
+TAG_KEYS   = ["tags","tag","タグ","区分","分類","カテゴリ","category","categories","keywords","キーワード"]
 
 def record_as_text(rec: Dict[str, Any], field: str) -> str:
     key_map = {
@@ -185,7 +182,13 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
             return textify(v)
     return ""
 
-# URL 正規化 & doc_id
+def record_as_tags(rec: Dict[str, Any]) -> str:
+    # タグ相当を文字列化
+    for k in TAG_KEYS:
+        if k in rec and rec[k]:
+            return textify(rec[k])
+    return ""
+
 _DROP_QS = {"source","utm_source","utm_medium","utm_campaign","utm_term","utm_content"}
 _NOTION_PAGEID_RE = re.compile(r"[0-9a-f]{32}", re.IGNORECASE)
 
@@ -227,7 +230,6 @@ def doc_id_for(rec: Dict[str, Any]) -> str:
     auth_n  = normalize_text(record_as_text(rec, "author"))
     return f"hash://{stable_hash(title_n, date_n, auth_n)}"
 
-# 日付抽出（v5.1強化版を維持）
 _DATE_RE = re.compile(r"(?P<y>(?:19|20|21)\d{2})[./\-年]?(?:(?P<m>0?[1-9]|1[0-2])[./\-月]?(?:(?P<d>0?[1-9]|[12]\d|3[01])日?)?)?", re.UNICODE)
 _ERA_RE  = re.compile(r"(令和|平成|昭和)\s*(\d{1,2})\s*年(?:\s*(\d{1,2})\s*月(?:\s*(\d{1,2})\s*日)?)?")
 
@@ -282,7 +284,6 @@ def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
             return datetime(y_url, 1, 1)
     return None
 
-# JSONL読み込み
 def _bytes_to_jsonl(blob: bytes) -> bytes:
     if not blob: return b""
     s = blob.decode("utf-8", errors="replace").strip()
@@ -318,22 +319,23 @@ def _load_rows_into_memory(path: str) -> List[Dict[str, Any]]:
                 continue
     return rows
 
-# プリ計算（fold済みフィールド、長さなど）
-PREVIEW_LIMIT = 120000  # フォールド対象の本文上限（極端な長文の負荷抑制）
+PREVIEW_LIMIT = 120000
 
 def _attach_precomputed_fields(rows: List[Dict[str, Any]]):
     for rec in rows:
         title = record_as_text(rec, "title") or ""
         text  = record_as_text(rec, "text") or ""
+        tags  = record_as_tags(rec)
         rec["__ttl_norm"]  = normalize_text(title)
         rec["__txt_norm"]  = normalize_text(text)
+        rec["__tag_norm"]  = normalize_text(tags)
         rec["__ttl_fold"]  = fold_kana(rec["__ttl_norm"]) if rec["__ttl_norm"] else ""
         txt_for_fold = rec["__txt_norm"][:PREVIEW_LIMIT]
         rec["__txt_fold"]  = fold_kana(txt_for_fold) if txt_for_fold else ""
+        rec["__tag_fold"]  = fold_kana(rec["__tag_norm"]) if rec["__tag_norm"] else ""
         rec["__doc_id"]    = doc_id_for(rec)
         rec["__date_obj"]  = record_date(rec)
 
-# KB確保／非同期取得（v5.1相当）
 KB_LINES = 0; KB_HASH = ""; LAST_ERROR = ""; LAST_EVENT = ""
 
 def ensure_kb(fetch_now: bool = False) -> Tuple[int, str]:
@@ -372,7 +374,7 @@ def _refresh_kb_globals(fetch_now: bool = False):
     global KB_LINES, KB_HASH
     lines, sha = ensure_kb(fetch_now=fetch_now)
     KB_LINES, KB_HASH = lines, sha
-    _cache.clear()  # KB更新時はキャッシュ破棄
+    _cache.clear()
     return lines, sha
 
 def _bg_fetch_kb():
@@ -415,7 +417,7 @@ def _record_years(rec: Dict[str, Any]) -> List[int]:
     ys = set()
     d = rec.get("__date_obj") or record_date(rec)
     if d: ys.add(d.year)
-    for field in ("title","text","url","author"):
+    for field in ("text","title","url","author"):
         v = record_as_text(rec, field)
         for y in re.findall(r"(19\d{2}|20\d{2}|21\d{2})", _nfkc(v)):
             ys.add(int(y))
@@ -439,8 +441,8 @@ def expand_with_synonyms(term: str) -> Set[str]:
         out.update(_syn_canon2variant[t])
     return out
 
-# ==================== フレーズ支援（n-gram, 柔軟一致, 近接） ====================
-CONNECTOR = r"[\s\u3000]*(?:の|・|／|/|_|\-|–|—)?[\s\u3000]*"  # 語間に許容
+# ==================== フレーズ支援 ====================
+CONNECTOR = r"[\s\u3000]*(?:の|・|／|/|_|\-|–|—)?[\s\u3000]*"
 
 def gen_ngrams(tokens: List[str], nmax: int = 3) -> List[List[str]]:
     toks = [t for t in tokens if t]
@@ -455,7 +457,6 @@ def phrase_contiguous_present(text: str, phrase: List[str]) -> bool:
     return joined in text
 
 def phrase_flexible_present(text: str, phrase: List[str]) -> bool:
-    # 例: A CONNECTOR B CONNECTOR C
     if not phrase: return False
     pat = re.escape(phrase[0])
     for w in phrase[1:]:
@@ -463,7 +464,6 @@ def phrase_flexible_present(text: str, phrase: List[str]) -> bool:
     return re.search(pat, text) is not None
 
 def min_token_distance(text: str, a: str, b: str) -> Optional[int]:
-    # 文字ベースの最小距離（先頭位置の差の絶対値）
     pos_a = [m.start() for m in re.finditer(re.escape(a), text)]
     pos_b = [m.start() for m in re.finditer(re.escape(b), text)]
     if not pos_a or not pos_b: return None
@@ -493,7 +493,7 @@ def highlight_simple(text: str, terms: List[str]) -> str:
         esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
     return esc
 
-def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool) -> Dict[str, Any]:
+def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool, matches: Optional[Dict[str,List[str]]] = None) -> Dict[str, Any]:
     title = record_as_text(rec, "title") or "(無題)"
     body  = record_as_text(rec, "text") or ""
     if is_first_in_page:
@@ -510,58 +510,69 @@ def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool) ->
         else:
             start = max(0, pos - 80); end = min(len(body), pos + 80)
             snippet_src = ("…" if start>0 else "") + body[start:end] + ("…" if end<len(body) else "")
-    return {
+    item = {
         "title":   highlight_simple(title, terms),
         "content": highlight_simple(snippet_src, terms),
         "url":     record_as_text(rec, "url"),
         "rank":    None,
         "date":    record_as_text(rec, "date"),
     }
+    if matches is not None:
+        item["matches"] = matches
+    return item
 
-# ==================== クエリ処理 ====================
-TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')  # クォートは解析するが挙動は変えない
+# ==================== クエリ解析（AND/OR・除外・引用） ====================
+TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')
 
-def tokenize_query(q: str) -> List[str]:
-    out: List[str] = []
+def parse_query(q: str) -> Tuple[List[str], List[str], List[str]]:
+    """
+    returns: (must_terms, minus_terms, raw_terms_for_highlight)
+    - "語" は1トークンとして扱う
+    - -語 は除外
+    - スペースはAND（既定）
+    """
+    must: List[str] = []
+    minus: List[str] = []
+    raw: List[str] = []
     for m in TOKEN_RE.finditer(normalize_text(q)):
         tok = m.group(1) if m.group(1) is not None else m.group(2)
-        if tok:
-            out.append(tok)
-    return out
+        if not tok: continue
+        raw.append(tok)
+        if tok.startswith("-") and len(tok) > 1:
+            minus.append(tok[1:])
+        else:
+            must.append(tok)
+    return must, minus, raw
 
-# ==================== 段階的評価 ====================
-
+# ==================== 多段スコア ====================
 def _score_stage_a(rec: Dict[str, Any], tokens: List[str]) -> int:
-    # プレーン一致（同義語拡張）＋ 連続フレーズのプレーン一致
-    ttl = rec.get("__ttl_norm", ""); txt = rec.get("__txt_norm", "")
+    ttl = rec.get("__ttl_norm", ""); txt = rec.get("__txt_norm", ""); tag = rec.get("__tag_norm","")
     score = 0
-    # 単語一致
     for raw in tokens:
         exts = expand_with_synonyms(raw) or {raw}
         for t in exts:
-            if t and ttl.count(t) > 0: score += 3 * ttl.count(t)
-            if t and txt.count(t) > 0: score += 1 * txt.count(t)
-    # フレーズ（連続）
+            if t:
+                if ttl.count(t) > 0: score += 3 * ttl.count(t)
+                if tag.count(t) > 0: score += 2 * tag.count(t)
+                if txt.count(t) > 0: score += 1 * txt.count(t)
     for phr in gen_ngrams(tokens, 3):
         if phrase_contiguous_present(ttl, phr): score += BONUS_PHRASE_TTL
         if phrase_contiguous_present(txt, phr): score += BONUS_PHRASE_BODY
     return score
 
 def _score_stage_b(rec: Dict[str, Any], tokens: List[str]) -> int:
-    # かなフォールド一致＋ フレーズ柔軟一致 ＋ 近接ボーナス
-    ttl = rec.get("__ttl_norm", ""); txt = rec.get("__txt_norm", "")
-    ftt = rec.get("__ttl_fold", ""); ftx = rec.get("__txt_fold", "")
+    ttl = rec.get("__ttl_norm", ""); txt = rec.get("__txt_norm", ""); tag = rec.get("__tag_norm","")
+    ftt = rec.get("__ttl_fold", ""); ftx = rec.get("__txt_fold", ""); ftg = rec.get("__tag_fold","")
     score = 0
-    # かなフォールド（単語）
     for raw in tokens:
         fr = fold_kana(normalize_text(raw))
-        if fr and ftt.count(fr) > 0: score += 3 * ftt.count(fr)
-        if fr and ftx.count(fr) > 0: score += 1 * ftx.count(fr)
-    # フレーズ柔軟一致 & 近接
+        if fr:
+            if ftt.count(fr) > 0: score += 3 * ftt.count(fr)
+            if ftg.count(fr) > 0: score += 2 * ftg.count(fr)
+            if ftx.count(fr) > 0: score += 1 * ftx.count(fr)
     for phr in gen_ngrams(tokens, 3):
         if phrase_flexible_present(ttl, phr): score += BONUS_FLEXPH_TTL
         if phrase_flexible_present(txt, phr): score += BONUS_FLEXPH_BODY
-        # 近接（bi-gramのみ評価）
         if len(phr) == 2:
             d1 = min_token_distance(ttl, phr[0], phr[1])
             if d1 is not None and d1 <= NEAR_WIN: score += BONUS_NEAR_TTL
@@ -570,17 +581,17 @@ def _score_stage_b(rec: Dict[str, Any], tokens: List[str]) -> int:
     return score
 
 def _score_stage_c(rec: Dict[str, Any], tokens: List[str]) -> int:
-    # ファジー（編集距離<=1）※fold済みに対してのみ、2文字以上の語
-    ftt = rec.get("__ttl_fold", ""); ftx = rec.get("__txt_fold", "")
+    ftt = rec.get("__ttl_fold", ""); ftx = rec.get("__txt_fold", ""); ftg = rec.get("__tag_fold","")
     score = 0
     for raw in tokens:
         fr = fold_kana(normalize_text(raw))
-        if len(fr) >= 2 and fuzzy_contains(fr, ftt): score += 1
-        if len(fr) >= 2 and fuzzy_contains(fr, ftx): score += 1
+        if len(fr) >= 2:
+            if fuzzy_contains(fr, ftt): score += 1
+            if fuzzy_contains(fr, ftg): score += 1
+            if fuzzy_contains(fr, ftx): score += 1
     return score
 
-# ==================== 並び ====================
-
+# ==================== 並びキー ====================
 def sort_key_relevance(entry: Tuple[int, Optional[datetime], str, Dict[str, Any]]) -> Tuple:
     score, d, did, _ = entry
     date_key = d or datetime.min
@@ -591,8 +602,7 @@ def sort_key_latest(entry: Tuple[int, Optional[datetime], str, Dict[str, Any]]) 
     date_key = d or datetime.min
     return (-int(date_key.strftime("%Y%m%d%H%M%S")), -int(score), did)
 
-# ==================== 共通レスポンス ====================
-
+# ==================== JSONレスポンス ====================
 def json_utf8(payload: Dict[str, Any], status: int = 200) -> JSONResponse:
     return JSONResponse(
         payload,
@@ -653,120 +663,10 @@ def admin_refresh():
 
 @app.get("/api/search")
 def api_search(
-    q: str = Query("", description="検索クエリ（末尾年/年範囲はフィルタ可：例『コンテスト2024』『剪定 1999〜2001』）"),
+    q: str = Query("", description="検索クエリ（-語=除外、末尾年/範囲はフィルタ可）"),
     page: int = Query(1, ge=1),
     page_size: int = Query(5, ge=1, le=50),
-    order: str = Query("relevance", pattern="^(relevance|latest)$"),
+    order: str = Query("latest", pattern="^(relevance|latest)$"),
     refresh: int = Query(0, description="1=kb.jsonl / 同義語CSV を再取得・再読み込み"),
-):
-    try:
-        if refresh == 1:
-            _refresh_kb_globals(fetch_now=True)
-            _cache.clear()
-
-        if not os.path.exists(KB_PATH) or KB_LINES <= 0:
-            return json_utf8({"items": [], "total_hits": 0, "page": page, "page_size": page_size,
-                              "has_more": False, "next_page": None, "error": "kb_missing", "order_used": order})
-
-        # キャッシュ（page_sizeもキーに含める）
-        cache_key = (q, order, page, page_size)
-        cached = _cache.get(cache_key)
-        if cached is not None:
-            return json_utf8(cached)
-
-        base_q, y_tail, yr_tail = _parse_year_from_query(q)
-        tokens = tokenize_query(base_q)
-        if not tokens:
-            payload = {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
-                       "has_more": False, "next_page": None, "error": None, "order_used": order}
-            _cache.set(cache_key, payload)
-            return json_utf8(payload)
-
-        rows = _KB_ROWS or []
-
-        # -------- Stage A: 軽い評価 --------
-        stage_a: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
-        for rec in rows:
-            if y_tail is not None or yr_tail is not None:
-                if not _matches_year(rec, y_tail, yr_tail):
-                    continue
-            sc = _score_stage_a(rec, tokens)
-            if sc <= 0: continue
-            stage_a.append((sc, rec.get("__date_obj"), rec.get("__doc_id"), rec))
-        if not stage_a:
-            payload = {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
-                       "has_more": False, "next_page": None, "error": None, "order_used": order}
-            _cache.set(cache_key, payload)
-            return json_utf8(payload)
-        stage_a.sort(key=sort_key_relevance)
-        stage_b_candidates = stage_a[:TOP_K_A]
-
-        # -------- Stage B: 中コスト評価 --------
-        stage_b: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
-        for sc_a, d, did, rec in stage_b_candidates:
-            sc = sc_a + _score_stage_b(rec, tokens)
-            stage_b.append((sc, d, did, rec))
-        stage_b.sort(key=sort_key_relevance)
-        stage_c_candidates = stage_b[:TOP_K_B]
-
-        # -------- Stage C: 重い評価（ファジー） --------
-        final_list: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
-        for sc_b, d, did, rec in stage_c_candidates:
-            sc = sc_b + _score_stage_c(rec, tokens)
-            final_list.append((sc, d, did, rec))
-
-        # dedupe（doc_idで最良を保持）
-        best_by_id: Dict[str, Tuple[int, Optional[datetime], str, Dict[str, Any]]] = {}
-        for entry in final_list:
-            sc, d, did, rec = entry
-            prev = best_by_id.get(did)
-            if prev is None:
-                best_by_id[did] = entry
-            else:
-                psc, pd, _, _ = prev
-                if (sc > psc) or (sc == psc and (d or datetime.min) > (pd or datetime.min)):
-                    best_by_id[did] = entry
-        deduped = list(best_by_id.values())
-
-        # 並び替え
-        if order == "latest":
-            deduped.sort(key=sort_key_latest); order_used = "latest"
-        else:
-            deduped.sort(key=sort_key_relevance); order_used = "relevance"
-
-        total = len(deduped)
-        start = (page - 1) * page_size
-        end   = start + page_size
-        page_slice = deduped[start:end]
-        has_more = end < total
-        next_page = page + 1 if has_more else None
-
-        # 表示用アイテム
-        items: List[Dict[str, Any]] = []
-        for i, (_sc, _d, _did, rec) in enumerate(page_slice):
-            items.append(build_item(rec, tokens, is_first_in_page=(i == 0)))
-        for idx, _ in enumerate(deduped, start=1):
-            if start < idx <= end:
-                items[idx - start - 1]["rank"] = idx
-
-        payload = {
-            "items": items,
-            "total_hits": total,
-            "page": page,
-            "page_size": page_size,
-            "has_more": has_more,
-            "next_page": next_page,
-            "error": None,
-            "order_used": order_used,
-        }
-        _cache.set(cache_key, payload)
-        return json_utf8(payload)
-
-    except Exception as e:
-        return json_utf8({"items": [], "total_hits": 0, "page": 1, "page_size": page_size,
-                          "has_more": False, "next_page": None, "error": "exception", "message": textify(e)})
-
-# ==================== ローカル実行 ====================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    logic: str = Query("and", pattern="^(and|or)$", description="and=両語必須（既定）/ or=どれか一致"),
+    debug: int = Query(0, descripti
