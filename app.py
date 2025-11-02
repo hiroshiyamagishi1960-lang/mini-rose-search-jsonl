@@ -833,7 +833,32 @@ def api_search(
     except Exception as e:
         return json_utf8({"items": [], "total_hits": 0, "page": 1, "page_size": page_size,
                           "has_more": False, "next_page": None, "error": "exception", "message": textify(e)})
+# === ここから追記 ===
 
+from fastapi.responses import FileResponse, PlainTextResponse, Response
+import os
+
+@app.get("/service-worker.js")
+async def service_worker():
+    sw_path = os.path.join("static", "service-worker.js")
+    if not os.path.exists(sw_path):
+        return Response("service-worker.js not found under /static/", status_code=404)
+    return FileResponse(
+        sw_path,
+        media_type="application/javascript; charset=utf-8",
+        headers={"Cache-Control": "no-cache, must-revalidate"}
+    )
+
+@app.get("/_diag/sw")
+async def service_worker_text():
+    sw_path = os.path.join("static", "service-worker.js")
+    if not os.path.exists(sw_path):
+        return PlainTextResponse("service-worker.js not found under /static/", status_code=404)
+    with open(sw_path, "r", encoding="utf-8") as f:
+        txt = f.read()
+    return PlainTextResponse(txt, headers={"Cache-Control": "no-store"})
+
+# === ここまで追記　＝＝＝
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
