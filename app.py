@@ -859,6 +859,10 @@ async def service_worker_text():
     return PlainTextResponse(txt, headers={"Cache-Control": "no-store"})
 
 # === ここまで追記　＝＝＝
+@app.get("/service-worker.js")
+def get_sw():
+    return FileResponse("static/service-worker.js", media_type="application/javascript")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))# === SW配信用エンドポイント（方式B：static/service-worker.js をそのまま使う）===
