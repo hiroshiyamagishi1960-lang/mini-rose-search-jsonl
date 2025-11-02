@@ -125,6 +125,53 @@
   </div>
 
 <script>
+(function () {
+  // PWA（スタンドアロン）判定
+  const isStandalone = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+                    || (window.navigator.standalone === true);
+
+  // --- B: /health /version を外部ブラウザ(新規タブ)で開く ---
+  function patchExternalOpen() {
+    const selector = 'a[href="/health"], a[href="/version"], a[href^="/health?"], a[href^="/version?"]';
+    document.querySelectorAll(selector).forEach(a => {
+      a.setAttribute('target', '_blank');
+      a.setAttribute('rel', 'noopener');
+      if (isStandalone) {
+        a.addEventListener('click', function (e) {
+          e.preventDefault();
+          try { window.open(a.href, '_blank', 'noopener'); } catch(_) {}
+        }, {capture:true});
+      }
+    });
+  }
+
+  // --- A: 右下に「🏠 ホーム」ボタンを挿入（/uiへ） ---
+  function injectHomeButton() {
+    if (document.getElementById('mr-home-fab')) return;
+    const btn = document.createElement('button');
+    btn.id='mr-home-fab'; btn.type='button'; btn.textContent='🏠 ホーム';
+    btn.title='ホームに戻る（/ui）';
+    Object.assign(btn.style,{
+      position:'fixed', right:'16px', bottom:'16px', zIndex:'2147483647',
+      padding:'10px 14px', border:'1px solid rgba(0,0,0,.1)', borderRadius:'999px',
+      background:'#fff', boxShadow:'0 4px 12px rgba(0,0,0,.12)',
+      color:'#111827', fontSize:'14px', lineHeight:'1', cursor:'pointer',
+      WebkitTapHighlightColor:'transparent'
+    });
+    btn.addEventListener('click', () => { try{ location.assign('/ui'); }catch(_){ location.href='/ui'; } });
+    document.body.appendChild(btn);
+  }
+
+  function onReady(fn){ document.readyState!=='loading' ? fn() : document.addEventListener('DOMContentLoaded', fn); }
+  onReady(() => {
+    patchExternalOpen();
+    injectHomeButton();
+    // 後からリンクが増えるケースに備え、軽く再適用（最大60回＝約1分）
+    let n=0; const iv=setInterval(()=>{ patchExternalOpen(); if(++n>60) clearInterval(iv); },1000);
+  });
+})();
+</script>
+
   const PAGE_SIZE = 5;
   const $ = (id) => document.getElementById(id);
   const asArray = (x) => Array.isArray(x) ? x : [];
