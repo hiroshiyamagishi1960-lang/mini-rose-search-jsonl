@@ -861,4 +861,39 @@ async def service_worker_text():
 # === ここまで追記　＝＝＝
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))# === SW配信用エンドポイント（方式B：static/service-worker.js をそのまま使う）===
+from fastapi.responses import FileResponse, Response
+import os
+
+@app.get("/static/service-worker.js")
+async def sw_static():
+    """static/service-worker.js をヘッダ付きで配信（スコープを / に拡張）"""
+    sw_path = os.path.join("static", "service-worker.js")
+    if not os.path.exists(sw_path):
+        return Response("service-worker.js not found under /static/", status_code=404)
+    return FileResponse(
+        sw_path,
+        media_type="application/javascript; charset=utf-8",
+        headers={
+            # 会員端末が毎回サーバ確認して最新版を取る
+            "Cache-Control": "no-cache, must-revalidate",
+            # 登録URLが /static/... でもスコープをルート（/）まで許可
+            "Service-Worker-Allowed": "/",
+        },
+    )
+
+# （任意：/service-worker.js でも同内容を配る。使わなければ無視されます）
+@app.get("/service-worker.js")
+async def sw_root():
+    sw_path = os.path.join("static", "service-worker.js")
+    if not os.path.exists(sw_path):
+        return Response("service-worker.js not found under /static/", status_code=404)
+    return FileResponse(
+        sw_path,
+        media_type="application/javascript; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache, must-revalidate",
+            "Service-Worker-Allowed": "/",
+        },
+    )
+# === ここまで追記 ===
