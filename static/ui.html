@@ -202,7 +202,7 @@
 
   (async ()=>{ try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{} })();
 
-  // --- PWA: Service Worker 登録（即時反映版を版付きで）
+  // --- PWA: Service Worker 登録（方式B：登録URLは /static/... のまま）
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", () => {
       const sw = `/static/service-worker.js?v=${encodeURIComponent(window.VER)}`;
@@ -210,28 +210,14 @@
     });
   }
 
-  // --- PWA判定（display-mode: standalone の時は /health /version を外部ブラウザへ）
-  function isStandalone(){
-    return window.matchMedia("(display-mode: standalone)").matches
-        || window.navigator.standalone === true; // iOS Safari PWA
-  }
-  function openExternal(e, url){
-    e.preventDefault();
-    try{ window.open(url, "_blank", "noopener"); }catch(_){ location.href = url; }
-  }
+  // --- /health /version リンク：アプリ内で開く（SWのラッパーを効かせる）
   const lH = $("lnkHealth"), lV = $("lnkVersion");
   if (lH && lV) {
     const verQ = (u)=> `${u}${u.includes("?")?"&":"?"}v=${encodeURIComponent(window.VER)}`;
     lH.href = verQ("/health");
     lV.href = verQ("/version");
-    if (isStandalone()){
-      lH.addEventListener("click",(e)=>openExternal(e,lH.href));
-      lV.addEventListener("click",(e)=>openExternal(e,lV.href));
-    } else {
-      lH.setAttribute("target","_blank"); lH.setAttribute("rel","noopener");
-      lV.setAttribute("target","_blank"); lV.setAttribute("rel","noopener");
-    }
+    // ※ ここでは何もしません（外部ブラウザへ飛ばさない）
+    // そのまま通常のリンク遷移にすることで、SWが /health /version をラップし、
+    // 「← 検索画面に戻る」付きHTMLを返します。
   }
 </script>
-</body>
-</html>
