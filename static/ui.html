@@ -202,11 +202,11 @@
 
   (async ()=>{ try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{} })();
 
-  // --- PWA: Service Worker 登録（方式B：登録URLは /static/... のまま）
+   // --- PWA: Service Worker 登録（Safari対応：直下 /service-worker.js を登録）
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", () => {
-      const sw = `/static/service-worker.js?v=${encodeURIComponent(window.VER)}`;
-      navigator.serviceWorker.register(sw).catch(()=>{});
+      const sw = `/service-worker.js?v=${encodeURIComponent(window.VER)}`;
+      navigator.serviceWorker.register(sw, { scope: "/" }).catch(()=>{});
     });
   }
 
