@@ -5,13 +5,13 @@
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>ミニバラ盆栽愛好会 デジタル資料館｜検索（JSONL版）</title>
 
-<!-- ▼ UI版（キャッシュ識別）※必要なら日付だけ変更可 -->
+<!-- UI版（キャッシュ識別：必要に応じて日付だけ変更） -->
 <script>window.VER = "2025-11-02";</script>
 
-<!-- ▼ PWA（必要なら manifest / icons を運用に合わせて） -->
-<link rel="manifest" href="/static/manifest.json">
-<link rel="apple-touch-icon" href="/static/icons/icon-180.png" sizes="180x180">
-<link rel="icon" href="/static/icons/icon-192.png" sizes="192x192" type="image/png">
+<!-- PWA関連（?v=VER を付与して確実に更新） -->
+<link rel="manifest" href="/static/manifest.json?v=<script>document.write(window.VER)</script>">
+<link rel="apple-touch-icon" href="/static/icons/icon-180.png?v=<script>document.write(window.VER)</script>" sizes="180x180">
+<link rel="icon" href="/static/icons/icon-192.png?v=<script>document.write(window.VER)</script>" sizes="192x192" type="image/png">
 <meta name="theme-color" content="#AEE6B8">
 <meta name="robots" content="noindex" />
 
@@ -88,8 +88,9 @@
 
       <div class="api" style="margin-top:6px">
         API: <code>/api/search</code> ｜ 版: <span id="ver">…</span> ｜
-        <a id="lnkHealth" href="/health">/health</a> ・
-        <a id="lnkVersion" href="/version">/version</a><br/>
+        <!-- ★ 別タブ固定（戻る問題 根絶） -->
+        <a id="lnkHealth" href="/health" target="_blank" rel="noopener">/health（別タブ）</a> ・
+        <a id="lnkVersion" href="/version" target="_blank" rel="noopener">/version（別タブ）</a><br/>
         ※ この画面の検索は <strong>常に「最新順（order=latest）」で表示</strong> します。
       </div>
     </div>
@@ -123,7 +124,7 @@
     </div>
   </div>
 
-<!-- === Main Script (既存の検索UIロジック) === -->
+<!-- === Main Script === -->
 <script>
   const PAGE_SIZE = 5;
   const $ = (id) => document.getElementById(id);
@@ -202,72 +203,23 @@
 
   (async ()=>{ try{ const r=await jget("/version"); $("ver").textContent=r.version||"—"; }catch{} })();
 
-  // --- PWA: Service Worker 登録（Safari対応）
+  // --- Service Worker 登録（Safari/PWA）---
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", () => {
-      const sw = `/service-worker.js?v=${encodeURIComponent(window.VER||"")}`;
+      const sw = `/service-worker.js?v=${encodeURIComponent(window.VER)}`;
       navigator.serviceWorker.register(sw, { scope: "/" }).catch(()=>{});
     });
   }
 
-  // --- 既定：/health /version のリンクは一旦そのまま（後段の補強で外部タブ化）
+  // --- /health /version の ?v= を付与（別タブ固定は a 属性で済）
   const lH = $("lnkHealth"), lV = $("lnkVersion");
   if (lH && lV) {
-    const verQ = (u)=> `${u}${u.includes("?")?"&":"?"}v=${encodeURIComponent(window.VER||"")}`;
-    lH.href = verQ("/health");
-    lV.href = verQ("/version");
+    const verQ = (u)=> `${u}${u.includes("?")?"&":"?"}v=${encodeURIComponent(window.VER)}`;
+    lH.href = verQ(lH.getAttribute("href"));
+    lV.href = verQ(lV.getAttribute("href"));
   }
 </script>
 <!-- === /Main Script === -->
-
-<!-- === A+B Enhancer（右下「🏠 ホーム」＋ /health,/version を外部タブ）=== -->
-<script>
-(function () {
-  const isStandalone = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
-                    || (window.navigator.standalone === true);
-
-  // B: /health /version を外部ブラウザ（新規タブ）で開く
-  function patchExternalOpen() {
-    const selector = 'a[href="/health"], a[href="/version"], a[href^="/health?"], a[href^="/version?"]';
-    document.querySelectorAll(selector).forEach(a => {
-      a.setAttribute('target', '_blank');
-      a.setAttribute('rel', 'noopener');
-      if (isStandalone) {
-        a.addEventListener('click', function (e) {
-          e.preventDefault();
-          try { window.open(a.href, '_blank', 'noopener'); } catch (_) {}
-        }, { capture:true });
-      }
-    });
-  }
-
-  // A: 右下に「🏠 ホーム」ボタン（/uiへ）
-  function injectHomeButton() {
-    if (document.getElementById('mr-home-fab')) return;
-    const btn = document.createElement('button');
-    btn.id='mr-home-fab'; btn.type='button'; btn.textContent='🏠 ホーム';
-    btn.title='ホームに戻る（/ui）';
-    Object.assign(btn.style,{
-      position:'fixed', right:'16px', bottom:'16px', zIndex:'2147483647',
-      padding:'10px 14px', border:'1px solid rgba(0,0,0,.1)', borderRadius:'999px',
-      background:'#fff', boxShadow:'0 4px 12px rgba(0,0,0,.12)',
-      color:'#111827', fontSize:'14px', lineHeight:'1', cursor:'pointer',
-      WebkitTapHighlightColor:'transparent'
-    });
-    btn.addEventListener('click', ()=>{ try{ location.assign('/ui'); }catch(_){ location.href='/ui'; } });
-    document.body.appendChild(btn);
-  }
-
-  function onReady(fn){ document.readyState!=='loading' ? fn() : document.addEventListener('DOMContentLoaded', fn); }
-  onReady(() => {
-    patchExternalOpen();
-    injectHomeButton();
-    // SPA的な遅延生成に備え軽く再適用（最大60回＝約1分）
-    let n=0; const iv=setInterval(()=>{ patchExternalOpen(); if(++n>60) clearInterval(iv); },1000);
-  });
-})();
-</script>
-<!-- === /A+B Enhancer === -->
 
 </body>
 </html>
