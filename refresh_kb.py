@@ -13,7 +13,7 @@ refresh_kb.py — Notion DB → kb.jsonl 生成（インラインDB/フルペー
   FIELD_TITLE             : 任意（既定：自動検出 "type=title"）
   FIELD_URL               : 任意（候補: 出典URL, URL 等）※type=url優先
   FIELD_DATE_PRIMARY      : 任意（候補: 発行日, 開催日 等）※type=date優先
-  FIELD_DATE_SECONDARY    : 任意（あれば補助日付）
+  FIELD_DATE_SECONDARY    : 任意（候補: あれば補助日付）
   FIELD_BODY              : 任意（候補: 本文, メモ, 内容 等）※rich_text優先
   FIELD_TAGS              : 任意（候補: タグ 等）※multi_select/select優先
   FIELD_ISSUE             : 任意（候補: 号, 会報号 等）※number/text両対応
@@ -22,7 +22,7 @@ refresh_kb.py — Notion DB → kb.jsonl 生成（インラインDB/フルペー
   kb.jsonl / kb_integrity.txt（行数とsha256）
 """
 
-import os, sys, json, time, hashlib, datetime as dt
+import os, sys, json, time, hashlib, datetime as dt, re
 import requests
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -295,13 +295,20 @@ def normalize_record(page: Dict[str, Any],
                     rich_all.append(s)
         body = "\n".join(rich_all).strip()
 
-    # ★ ここが今回のポイント ★
-    # もし本文の先頭行が「タイトル：◯◯」になっていたら、
-    # Notionページのタイトルで必ず上書きする。
-    if body.startswith("タイトル："):
+    # ★ タイトル行の補正ロジック ★
+    # 本文のどこかに「タイトル：〜」という行があれば、
+    # 先頭の・などの記号を残したまま、ページタイトルで必ず上書きする。
+    if body:
         lines = body.splitlines()
-        if lines:
-            lines[0] = f"タイトル：{title}"
+        fixed = False
+        for i, line in enumerate(lines):
+            m = re.match(r'^(\s*[・･*●◆]?\s*)タイトル：.*', line)
+            if m:
+                prefix = m.group(1) or ""
+                lines[i] = f"{prefix}タイトル：{title}"
+                fixed = True
+                break
+        if fixed:
             body = "\n".join(lines)
 
     date_iso = extract_date_iso(props,
