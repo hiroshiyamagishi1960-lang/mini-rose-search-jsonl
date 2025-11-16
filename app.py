@@ -547,36 +547,231 @@ def min_token_distance(text: str, a: str, b: str) -> Optional[int]:
 def html_escape(s: str) -> str:
     return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
+
 def highlight_simple(text: str, terms: List[str]) -> str:
-    if not text: return ""
+    """本文やタイトルに <mark> をつけるだけ（ロジックは既存どおり）"""
+    if not text:
+        return ""
     esc = html_escape(text)
+
+    # ハイライト候補を集める
     hlset: Set[str] = set()
     for t in terms:
+        if not t:
+            continue
         hlset.add(normalize_text(t))
         hlset |= expand_with_synonyms(t)
+
+    # 長い語から順に <mark> で囲む
     for t in sorted(hlset, key=len, reverse=True):
-        if not t: continue
+        if not t:
+            continue
         et = html_escape(t)
         esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
+
     return esc
 
-def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool, matches: Optional[Dict[str,List[str]]] = None, hit_field: Optional[str] = None) -> Dict[str, Any]:
+
+# ====== 本文スニペット生成（1件目=300文字 / 2件目以降=160文字） ======
+
+_SAFE_FRONT = "。．！？!?、，；：\n\r　 "  # 前側境界を探すときの区切り
+_SAFE_BACK  = "。．！？!?、，；：\n\r　 "  # 後ろ側の区切り
+
+
+def _find_hit_pos(body: str, terms: List[str]) -> Optional[int]:
+    """本文中で最初にヒットした位置（単純な部分一致）を探す"""
+    if not body:
+        return None
+    best: Optional[int] = None
+    for raw in terms:
+        if not raw:
+            continue
+        t = normalize_text(raw)
+        if not t:
+            continue
+        pos = body.find(t)
+        if pos == -1:
+            continue
+        if best is None or pos < best:
+            best = pos
+    return best
+
+
+def _adjust_front(body: str, start: int) -> int:
+    """
+    前側の“安全な境界”を探す。
+    - 「。！？、」などの直後
+    - 改行の直後
+    なにも見つからなければそのまま。
+    """
+    if start <= 0:
+        return 0
+    i = start
+    while i > 0:
+        ch = body[i]
+        if ch in _SAFE_FRONT:
+            return i + 1
+        i -= 1
+    return 0
+
+
+def _adjust_back(body: str, end: int) -> int:
+    """
+    後側の“安全な境界”を探す。
+    - 「。！？、」や改行の直前
+    - なければそのまま
+    """
+    n = len(body)
+    if end >= n:
+        return n
+    i = end
+    while i < n:
+        ch = body[i]
+        if ch in _SAFE_BACK:
+            return i
+        i += 1
+    return n
+
+
+def _protect_bullet_line(body: str, start: int, max_len: int) -> Tuple[int, Optional[int]]:
+    """
+    箇条書き行「・…」の途中から始まらないように調整する。
+    - start が「bullet 行の途中」なら、その行頭（・の位置）まで戻す
+    - その行が max_len を超える場合は「保護しない」ために (元のstart, None) を返す
+    戻り値: (new_start, bullet_end or None)
+    """
+    if start >= len(body):
+        return start, None
+
+    # 行頭を探す
+    line_start = body.rfind("\n", 0, start)
+    if line_start == -1:
+        line_start = 0
+    else:
+        line_start += 1  # 改行の次の位置からが行頭
+
+    if line_start >= len(body):
+        return start, None
+
+    # その行が箇条書き「・」で始まっているか？
+    if body[line_start:line_start + 1] != "・":
+        return start, None
+
+    # 行の末尾（次の改行 or 文末）
+    line_end = body.find("\n", line_start)
+    if line_end == -1:
+        line_end = len(body)
+
+    # 箇条書き行1本が max_len を超えるなら、丸ごと出せないので保護を諦める
+    if line_end - line_start > max_len:
+        return start, None
+
+    # 行頭から始めて、その行は必ず丸ごと含める
+    return line_start, line_end
+
+
+def _trim_to_max_len(body: str, start: int, end: int, max_len: int) -> Tuple[int, int]:
+    """
+    最終的に max_len 以内に収める。
+    - まずは [start:end] を基本とし、
+    - 長すぎる場合は「後ろ側を削る」
+    - 可能なら句読点・スペースの直前で切る
+    """
+    if end - start <= max_len:
+        return start, end
+
+    hard_end = start + max_len
+    if hard_end >= end:
+        return start, end
+
+    # 安全な区切りを探す（start〜hard_end の範囲で、できるだけ後ろ）
+    cut = None
+    i = hard_end
+    while i > start:
+        ch = body[i]
+        if ch in _SAFE_BACK:
+            cut = i
+            break
+        i -= 1
+
+    if cut is None:
+        cut = hard_end
+
+    return start, cut
+
+
+def make_snippet(body: str, terms: List[str], is_first_in_page: bool) -> str:
+    """
+    スニペット生成の本体
+    - 1件目: 先頭から300文字
+    - 2件目以降: ヒット語の前後から最大160文字
+      * 結合文字の途中で切らないよう、前後を“安全境界”に寄せる
+      * 箇条書き行「・…」の途中で始まらないようにする
+      * 「…」はここでは追加しない（元の本文にあるものだけ表示）
+    """
+    if not body:
+        return ""
+
+    if is_first_in_page:
+        # 1件目は単純に冒頭300文字（既定仕様）
+        return body[:300]
+
+    max_len = 160
+
+    # ヒット位置を探す
+    hit_pos = _find_hit_pos(body, terms)
+    if hit_pos is None:
+        # ヒット位置が見つからない場合は先頭から160文字
+        return body[:max_len]
+
+    # まずは「前後80文字」を目安に仮ウィンドウ
+    raw_start = max(0, hit_pos - 80)
+    raw_end = min(len(body), hit_pos + 80)
+
+    # 前後を“安全境界”へ寄せる
+    safe_start = _adjust_front(body, raw_start)
+    safe_end = _adjust_back(body, raw_end)
+    if safe_start >= safe_end:
+        safe_start = raw_start
+        safe_end = raw_end
+
+    # 箇条書き「・…」の途中から始まらないように保護
+    orig_start = safe_start
+    safe_start, bullet_end = _protect_bullet_line(body, safe_start, max_len)
+
+    # 箇条書き行を保護した結果、その行だけで160文字を超える場合は保護をやめる
+    if bullet_end is not None and (bullet_end - safe_start) > max_len:
+        safe_start = orig_start
+        bullet_end = None
+
+    # もし bullet_end があるなら、その行を必ず含めるように end を少なくともそこまで伸ばす
+    if bullet_end is not None and bullet_end > safe_end:
+        safe_end = bullet_end
+
+    # 最後に「最大160文字」に収める
+    safe_start, safe_end = _trim_to_max_len(body, safe_start, safe_end, max_len)
+
+    return body[safe_start:safe_end]
+
+
+def build_item(
+    rec: Dict[str, Any],
+    terms: List[str],
+    is_first_in_page: bool,
+    matches: Optional[Dict[str, List[str]]] = None,
+    hit_field: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    1件分の検索結果カードを組み立てる。
+    - title: そのまま + ハイライト
+    - content: make_snippet() で作った本文スニペット + ハイライト
+    """
     title = record_as_text(rec, "title") or "(無題)"
     body  = record_as_text(rec, "text") or ""
-    if is_first_in_page:
-        snippet_src = body[:300]
-    else:
-        pos = -1
-        for t in terms:
-            t = normalize_text(t)
-            if not t: continue
-            p = body.find(t)
-            if p >= 0: pos = p; break
-        if pos < 0:
-            snippet_src = body[:160]
-        else:
-            start = max(0, pos - 80); end = min(len(body), pos + 80)
-            snippet_src = ("…" if start>0 else "") + body[start:end] + ("…" if end<len(body) else "")
+
+    # ★ ここで 1件目=300文字 / 2件目以降=160文字 の仕様を反映
+    snippet_src = make_snippet(body, terms, is_first_in_page=is_first_in_page)
+
     item = {
         "title":   highlight_simple(title, terms),
         "content": highlight_simple(snippet_src, terms),
