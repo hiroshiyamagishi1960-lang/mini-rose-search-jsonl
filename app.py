@@ -561,25 +561,35 @@ def highlight_simple(text: str, terms: List[str]) -> str:
     return esc
 
 def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool, matches: Optional[Dict[str,List[str]]] = None, hit_field: Optional[str] = None) -> Dict[str, Any]:
+    """
+    バックエンドでは <mark> を付けず、プレーンテキストだけ返す版。
+    タイトルとスニペットはそのまま JSON に入れる。
+    """
     title = record_as_text(rec, "title") or "(無題)"
     body  = record_as_text(rec, "text") or ""
+
     if is_first_in_page:
         snippet_src = body[:300]
     else:
         pos = -1
         for t in terms:
-            t = normalize_text(t)
-            if not t: continue
-            p = body.find(t)
-            if p >= 0: pos = p; break
+            t_norm = normalize_text(t)
+            if not t_norm:
+                continue
+            p = body.find(t_norm)
+            if p >= 0:
+                pos = p
+                break
         if pos < 0:
             snippet_src = body[:160]
         else:
-            start = max(0, pos - 80); end = min(len(body), pos + 80)
-            snippet_src = ("…" if start>0 else "") + body[start:end] + ("…" if end<len(body) else "")
+            start = max(0, pos - 80)
+            end   = min(len(body), pos + 80)
+            snippet_src = ("…" if start > 0 else "") + body[start:end] + ("…" if end < len(body) else "")
+
     item = {
-        "title":   highlight_simple(title, terms),
-        "content": highlight_simple(snippet_src, terms),
+        "title":   title,
+        "content": snippet_src,
         "url":     record_as_text(rec, "url"),
         "rank":    None,
         "date":    record_as_text(rec, "date"),
