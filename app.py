@@ -4,6 +4,7 @@
 #  - 起動時：KBが読めない場合は例外を投げて起動失敗 → Renderは旧安定版を維持
 #  - /health・/version：ブラウザ=HTML（←検索画面に戻る付き）／機械=JSON
 #  - /api/search：v5.3.2のロジックを維持（AND前提・除外語・段階スコア等）
+#  - 追加仕様：order=latest のとき「開催日/発行日（record_date）を最優先」でソート
 
 import os, io, re, csv, json, hashlib, unicodedata, threading, tempfile
 from datetime import datetime
@@ -219,7 +220,7 @@ def doc_id_for(rec: Dict[str, Any]) -> str:
 
 # ====== 日付抽出（和暦対応はv5.3.2相当） ======
 _DATE_RE = re.compile(r"(?P<y>(?:19|20|21)\d{2})[./\-年]?(?:(?P<m>0?[1-9]|1[0-2])[./\-月]?(?:(?P<d>0?[1-9]|[12]\d|3[01])日?)?)?", re.UNICODE)
-_ERA_RE  = re.compile(r"(令和|平成|昭和)\s*(\d{1,2})\s*年(?:\s*(\d{1,2})\s*月(?:\s*(\d{1,2})\s*日)?)?")
+_ERA_RE  = re.compile(r"(令和|平成|昭和)\s*(\d{1,2})\s*年(?:\s*(\d{1,2})\s*月(?:\s*(\d{1,2})\s*日)?)?)?")
 
 def _era_to_seireki(era: str, nen: int) -> int:
     base = {"令和":2018, "平成":1988, "昭和":1925}.get(era, None)
@@ -249,26 +250,20 @@ def _first_valid_date_from_string(s: str) -> Optional[datetime]:
     return None
 
 def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
+    """
+    レコードの日付（開催日/発行日など）を決める。
+    - DATE_KEYS（開催日/発行日 ほか日付プロパティ）だけを見る
+    - どのプロパティにも日付がなければ None を返す（=「日付不明」扱い）
+    - 本文やタイトルから年を拾うフォールバックは行わない（入力し忘れ検出のため）
+    """
     for k in DATE_KEYS:
         v = rec.get(k)
-        if not v: continue
+        if not v:
+            continue
         dt = _first_valid_date_from_string(textify(v))
-        if dt: return dt
-    cand_year = None
-    for field in ("text","title"):
-        v = record_as_text(rec, field)
-        for y in re.findall(r"(19\d{2}|20\d{2}|21\d{2})", _nfkc(v)):
-            cand_year = max(int(y), cand_year or 0)
-    if cand_year:
-        return datetime(cand_year, 1, 1)
-    u = record_as_text(rec, "url")
-    if u:
-        y_url = None
-        for y in re.findall(r"(19\d{2}|20\d{2}|21\d{2})", _nfkc(u)):
-            y_val = int(y)
-            y_url = max(y_val, y_url or 0)
-        if y_url:
-            return datetime(y_url, 1, 1)
+        if dt:
+            return dt
+    # 日付プロパティが無い場合は「未日付」（最新ソートでは最下位扱い）
     return None
 
 # ====== KB 読込/取得・診断 ======
@@ -634,6 +629,7 @@ def build_item(
     if matches is not None:
         item["matches"] = matches
     return item
+
 TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')
 
 def parse_query(q: str) -> Tuple[List[str], List[str], List[str]]:
@@ -877,13 +873,29 @@ def api_search(
             hf = _decide_hit_field(rec, k_terms) or "body"
             decorated.append((sc, d, did, rec, hf))
 
-        # 並び順：関連度バケット＋日付
+        # 並び順：
+        #   latest : 開催日/発行日（__date_obj）を最優先 → ヒット位置（title/tag/body）→ スコア
+        #   relevance : これまで通り（ヒット位置 → スコア → 日付）
         bucket_order = {"title":0, "tag":1, "body":2}
         if order == "latest":
-            decorated.sort(key=lambda x: (bucket_order.get(x[4], 9), -(x[1] or datetime.min).timestamp(), -x[0], x[2]))
+            decorated.sort(
+                key=lambda x: (
+                    -(x[1] or datetime.min).timestamp(),   # ① 日付（開催日/発行日）降順
+                    bucket_order.get(x[4], 9),             # ② ヒット位置（title → tag → body）
+                    -x[0],                                  # ③ スコア（同日・同バケット内の優先度）
+                    x[2],                                   # ④ doc_id 安定ソート
+                )
+            )
             order_used = "latest"
         else:
-            decorated.sort(key=lambda x: (bucket_order.get(x[4], 9), -x[0], -(x[1] or datetime.min).timestamp(), x[2]))
+            decorated.sort(
+                key=lambda x: (
+                    bucket_order.get(x[4], 9),
+                    -x[0],
+                    -(x[1] or datetime.min).timestamp(),
+                    x[2],
+                )
+            )
             order_used = "relevance"
 
         total = len(decorated)
