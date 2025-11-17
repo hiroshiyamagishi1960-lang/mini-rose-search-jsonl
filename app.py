@@ -456,7 +456,8 @@ def highlight_simple(text: str,terms: List[str]) -> str:
         esc=re.sub(re.escape(et),lambda m:f"<mark>{m.group(0)}</mark>",esc)
     return esc
 
-fix snippet: keep title line full    return item
+#fix snippet: keep title line full    
+return item
 
 TOKEN_RE=re.compile(r'"([^"]+)"|(\S+)')
 
