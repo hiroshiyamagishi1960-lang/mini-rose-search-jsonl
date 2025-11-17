@@ -560,24 +560,69 @@ def highlight_simple(text: str, terms: List[str]) -> str:
         esc = re.sub(re.escape(et), lambda m: f"<mark>{m.group(0)}</mark>", esc)
     return esc
 
-def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool, matches: Optional[Dict[str,List[str]]] = None, hit_field: Optional[str] = None) -> Dict[str, Any]:
+def build_item(
+    rec: Dict[str, Any],
+    terms: List[str],
+    is_first_in_page: bool,
+    matches: Optional[Dict[str, List[str]]] = None,
+    hit_field: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    1件目: 300文字 + 途中で切れている場合は末尾に「…」
+    2件目以降:
+      - ヒット位置が分かる場合: 185文字ぶん前後を抜き出し、前/後が切れていれば「…」
+      - ヒット位置が分からない場合: 先頭185文字、途中で切れていれば末尾に「…」
+    """
+    FIRST_SNIPPET_LEN = 300
+    OTHER_SNIPPET_LEN = 185
+
     title = record_as_text(rec, "title") or "(無題)"
     body  = record_as_text(rec, "text") or ""
+
+    # ---------- 1件目 ----------
     if is_first_in_page:
-        snippet_src = body[:300]
+        # 300文字を上限にし、切れている場合は末尾に「…」
+        if len(body) <= FIRST_SNIPPET_LEN:
+            snippet_src = body
+        else:
+            snippet_src = body[:FIRST_SNIPPET_LEN] + "…"
+
+    # ---------- 2件目以降 ----------
     else:
+        # まず、検索語の出現位置を探す
         pos = -1
         for t in terms:
-            t = normalize_text(t)
-            if not t: continue
-            p = body.find(t)
-            if p >= 0: pos = p; break
+            t_norm = normalize_text(t)
+            if not t_norm:
+                continue
+            p = body.find(t_norm)
+            if p >= 0:
+                pos = p
+                break
+
+        # ★ ヒット位置が分からない場合：先頭から185文字 + 必要なら末尾に「…」
         if pos < 0:
-            snippet_src = body[:160]
+            if len(body) <= OTHER_SNIPPET_LEN:
+                snippet_src = body
+            else:
+                snippet_src = body[:OTHER_SNIPPET_LEN] + "…"
         else:
-            start = max(0, pos - 80); end = min(len(body), pos + 80)
-            snippet_src = ("…" if start>0 else "") + body[start:end] + ("…" if end<len(body) else "")
-    item = {
+            # ★ ヒット位置が分かる場合：185文字ぶんのウィンドウを作る
+            half = OTHER_SNIPPET_LEN // 2  # ここでは 92
+            start = max(0, pos - half)
+            end = start + OTHER_SNIPPET_LEN
+            if end > len(body):
+                end = len(body)
+                start = max(0, end - OTHER_SNIPPET_LEN)
+
+            core = body[start:end]
+
+            # 前後が切れているかどうかで「…」を付ける
+            prefix = "…" if start > 0 else ""
+            suffix = "…" if end < len(body) else ""
+            snippet_src = prefix + core + suffix
+
+    item: Dict[str, Any] = {
         "title":   highlight_simple(title, terms),
         "content": highlight_simple(snippet_src, terms),
         "url":     record_as_text(rec, "url"),
@@ -589,7 +634,6 @@ def build_item(rec: Dict[str, Any], terms: List[str], is_first_in_page: bool, ma
     if matches is not None:
         item["matches"] = matches
     return item
-
 TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')
 
 def parse_query(q: str) -> Tuple[List[str], List[str], List[str]]:
