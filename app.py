@@ -535,7 +535,7 @@ def make_snippet(body: str, terms: List[str], is_first_in_page: bool) -> str:
     if is_first_in_page:
         return body[:300]
 
-    max_len = 160
+    max_len = 180
 
     # ---------- まずヒット位置 ----------
     hit_pos = _find_hit_pos(body, terms)
