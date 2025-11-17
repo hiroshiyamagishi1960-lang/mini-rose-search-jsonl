@@ -717,23 +717,59 @@ def _decide_hit_field(rec: Dict[str, Any], terms: List[str]) -> str:
 
 RANGE_SEP = r"(?:-|–|—|~|〜|～|\.{2})"
 
-def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tuple[int,int]]]:
-    q = _nfkc(q_raw).strip()
-    if not q: return "", None, None
-    parts = q.replace("　"," ").split()
-    last = parts[-1] if parts else ""
-    if re.fullmatch(r"(19|20|21)\d{2}", last):
-        return (" ".join(parts[:-1]).strip(), int(last), None)
-    m_rng = re.fullmatch(rf"((?:19|20|21)\d{{2}})\s*{RANGE_SEP}\s*((?:19|20|21)\d{{2}})", last)
-    if m_rng:
-        y1, y2 = int(m_rng.group(1)), int(m_rng.group(2))
-        if y1 > y2: y1, y2 = y2, y1
-        return (" ".join(parts[:-1]).strip(), None, (y1, y2))
-    m_suf = re.fullmatch(rf"^(.*?)(?:((?:19|20|21)\d{{2}}))$", last)
-    if m_suf and m_suf.group(1):
-        return (" ".join(parts[:-1] + [m_suf.group(1)]).strip(), int(m_suf.group(2)), None)
-    return (q, None, None)
+# 「年の範囲」と「語尾に年が付いている」専用の正規表現を先にコンパイルしておく
+YEAR_RANGE_RE = re.compile(
+    r"((?:19|20|21)\d{2})\s*(?:-|–|—|~|〜|～|\.{2})\s*((?:19|20|21)\d{2})"
+)
+YEAR_SUFFIX_RE = re.compile(
+    r"^(.*?)(?:((?:19|20|21)\d{2}))$"
+)
 
+def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tuple[int,int]]]:
+    """
+    クエリ末尾の「年」指定を解釈する。
+
+    例）
+      - 「コンテスト 2024」        → base_q="コンテスト", year=2024
+      - 「春 コンテスト 2023-2025」→ base_q="春 コンテスト", year_range=(2023,2025)
+      - 「春季コンテスト2024」     → base_q="春季コンテスト", year=2024
+    """
+    q = _nfkc(q_raw).strip()
+    if not q:
+        return "", None, None
+
+    # 全角スペースも半角に寄せて分割
+    parts = q.replace("　", " ").split()
+    if not parts:
+        return "", None, None
+
+    last = parts[-1]
+    base = " ".join(parts[:-1]).strip()
+
+    # 1) シンプルに「4桁の年」だけが末尾についている場合
+    if re.fullmatch(r"(19|20|21)\d{2}", last):
+        return base, int(last), None
+
+    # 2) 「YYYY-YYYY」「2020〜2024」などの範囲指定
+    m_rng = YEAR_RANGE_RE.fullmatch(last)
+    if m_rng:
+        y1 = int(m_rng.group(1))
+        y2 = int(m_rng.group(2))
+        if y1 > y2:
+            y1, y2 = y2, y1
+        return base, None, (y1, y2)
+
+    # 3) 単語の末尾に年がくっついているパターン（例: 春季コンテスト2024）
+    m_suf = YEAR_SUFFIX_RE.fullmatch(last)
+    if m_suf:
+        word = m_suf.group(1)
+        y = int(m_suf.group(2))
+        new_parts = parts[:-1] + [word]  # 年だけを取り除いた単語を戻す
+        new_base = " ".join(p for p in new_parts if p).strip()
+        return new_base, y, None
+
+    # 4) どれにも当てはまらない場合は年指定なしとしてそのまま返す
+    return q, None, None
 def _record_years(rec: Dict[str, Any]) -> List[int]:
     ys = set()
     d = rec.get("__date_obj") or record_date(rec)
