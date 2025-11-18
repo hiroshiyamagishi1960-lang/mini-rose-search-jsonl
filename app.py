@@ -4,7 +4,6 @@
 #  - 起動時：KBが読めない場合は例外を投げて起動失敗 → Renderは旧安定版を維持
 #  - /health・/version：ブラウザ=HTML（←検索画面に戻る付き）／機械=JSON
 #  - /api/search：v5.3.2のロジックを維持（AND前提・除外語・段階スコア等）
-#  - 追加仕様：order=latest のとき「開催日/発行日（record_date）を最優先」でソート
 
 import os, io, re, csv, json, hashlib, unicodedata, threading, tempfile
 from datetime import datetime
@@ -220,7 +219,7 @@ def doc_id_for(rec: Dict[str, Any]) -> str:
 
 # ====== 日付抽出（和暦対応はv5.3.2相当） ======
 _DATE_RE = re.compile(r"(?P<y>(?:19|20|21)\d{2})[./\-年]?(?:(?P<m>0?[1-9]|1[0-2])[./\-月]?(?:(?P<d>0?[1-9]|[12]\d|3[01])日?)?)?", re.UNICODE)
-_ERA_RE  = re.compile(r"(令和|平成|昭和)\s*(\d{1,2})\s*年(?:\s*(\d{1,2})\s*月(?:\s*(\d{1,2})\s*日)?)?)?")
+_ERA_RE  = re.compile(r"(令和|平成|昭和)\s*(\d{1,2})\s*年(?:\s*(\d{1,2})\s*月(?:\s*(\d{1,2})\s*日)?)?")
 
 def _era_to_seireki(era: str, nen: int) -> int:
     base = {"令和":2018, "平成":1988, "昭和":1925}.get(era, None)
@@ -250,20 +249,26 @@ def _first_valid_date_from_string(s: str) -> Optional[datetime]:
     return None
 
 def record_date(rec: Dict[str, Any]) -> Optional[datetime]:
-    """
-    レコードの日付（開催日/発行日など）を決める。
-    - DATE_KEYS（開催日/発行日 ほか日付プロパティ）だけを見る
-    - どのプロパティにも日付がなければ None を返す（=「日付不明」扱い）
-    - 本文やタイトルから年を拾うフォールバックは行わない（入力し忘れ検出のため）
-    """
     for k in DATE_KEYS:
         v = rec.get(k)
-        if not v:
-            continue
+        if not v: continue
         dt = _first_valid_date_from_string(textify(v))
-        if dt:
-            return dt
-    # 日付プロパティが無い場合は「未日付」（最新ソートでは最下位扱い）
+        if dt: return dt
+    cand_year = None
+    for field in ("text","title"):
+        v = record_as_text(rec, field)
+        for y in re.findall(r"(19\d{2}|20\d{2}|21\d{2})", _nfkc(v)):
+            cand_year = max(int(y), cand_year or 0)
+    if cand_year:
+        return datetime(cand_year, 1, 1)
+    u = record_as_text(rec, "url")
+    if u:
+        y_url = None
+        for y in re.findall(r"(19\d{2}|20\d{2}|21\d{2})", _nfkc(u)):
+            y_val = int(y)
+            y_url = max(y_val, y_url or 0)
+        if y_url:
+            return datetime(y_url, 1, 1)
     return None
 
 # ====== KB 読込/取得・診断 ======
@@ -576,7 +581,6 @@ def build_item(
 
     # ---------- 1件目 ----------
     if is_first_in_page:
-        # 300文字を上限にし、切れている場合は末尾に「…」
         if len(body) <= FIRST_SNIPPET_LEN:
             snippet_src = body
         else:
@@ -584,7 +588,6 @@ def build_item(
 
     # ---------- 2件目以降 ----------
     else:
-        # まず、検索語の出現位置を探す
         pos = -1
         for t in terms:
             t_norm = normalize_text(t)
@@ -595,15 +598,13 @@ def build_item(
                 pos = p
                 break
 
-        # ★ ヒット位置が分からない場合：先頭から185文字 + 必要なら末尾に「…」
         if pos < 0:
             if len(body) <= OTHER_SNIPPET_LEN:
                 snippet_src = body
             else:
                 snippet_src = body[:OTHER_SNIPPET_LEN] + "…"
         else:
-            # ★ ヒット位置が分かる場合：185文字ぶんのウィンドウを作る
-            half = OTHER_SNIPPET_LEN // 2  # ここでは 92
+            half = OTHER_SNIPPET_LEN // 2
             start = max(0, pos - half)
             end = start + OTHER_SNIPPET_LEN
             if end > len(body):
@@ -611,8 +612,6 @@ def build_item(
                 start = max(0, end - OTHER_SNIPPET_LEN)
 
             core = body[start:end]
-
-            # 前後が切れているかどうかで「…」を付ける
             prefix = "…" if start > 0 else ""
             suffix = "…" if end < len(body) else ""
             snippet_src = prefix + core + suffix
@@ -715,19 +714,11 @@ def _decide_hit_field(rec: Dict[str, Any], terms: List[str]) -> str:
     if present_in(txt, ftx): return "body"
     return ""
 
-RANGE_SEP = r"(?:-|–|—|~|〜|～|\.{2})"
-
-# 「年の範囲」と「語尾に年が付いている」専用の正規表現を先にコンパイルしておく
-YEAR_RANGE_RE = re.compile(
-    r"((?:19|20|21)\d{2})\s*(?:-|–|—|~|〜|～|\.{2})\s*((?:19|20|21)\d{2})"
-)
-YEAR_SUFFIX_RE = re.compile(
-    r"^(.*?)(?:((?:19|20|21)\d{2}))$"
-)
+RANGE_SEP = r"(?:-|–|—|~|〜|～|\.{2})"  # 互換性のために残しているが、正規表現では使わない
 
 def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tuple[int,int]]]:
     """
-    クエリ末尾の「年」指定を解釈する。
+    クエリ末尾の「年」指定を解釈する（安全な実装：複雑な正規表現は使わない）
 
     例）
       - 「コンテスト 2024」        → base_q="コンテスト", year=2024
@@ -738,7 +729,6 @@ def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tup
     if not q:
         return "", None, None
 
-    # 全角スペースも半角に寄せて分割
     parts = q.replace("　", " ").split()
     if not parts:
         return "", None, None
@@ -746,30 +736,40 @@ def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tup
     last = parts[-1]
     base = " ".join(parts[:-1]).strip()
 
-    # 1) シンプルに「4桁の年」だけが末尾についている場合
-    if re.fullmatch(r"(19|20|21)\d{2}", last):
+    def _is_year(s: str) -> bool:
+        return bool(re.fullmatch(r"(19|20|21)\d{2}", s))
+
+    # 1) 「YYYY-YYYY」「2020〜2024」などの範囲指定を手作業で判定
+    for sep in ("-", "–", "—", "~", "〜", "～", ".."):
+        if sep in last:
+            left, right = last.split(sep, 1)
+            left = left.strip()
+            right = right.strip()
+            if _is_year(left) and _is_year(right):
+                y1, y2 = int(left), int(right)
+                if y1 > y2:
+                    y1, y2 = y2, y1
+                return base, None, (y1, y2)
+            break
+
+    # 2) トークン全体が年だけだった場合
+    if _is_year(last):
         return base, int(last), None
 
-    # 2) 「YYYY-YYYY」「2020〜2024」などの範囲指定
-    m_rng = YEAR_RANGE_RE.fullmatch(last)
-    if m_rng:
-        y1 = int(m_rng.group(1))
-        y2 = int(m_rng.group(2))
-        if y1 > y2:
-            y1, y2 = y2, y1
-        return base, None, (y1, y2)
-
-    # 3) 単語の末尾に年がくっついているパターン（例: 春季コンテスト2024）
-    m_suf = YEAR_SUFFIX_RE.fullmatch(last)
-    if m_suf:
-        word = m_suf.group(1)
-        y = int(m_suf.group(2))
-        new_parts = parts[:-1] + [word]  # 年だけを取り除いた単語を戻す
-        new_base = " ".join(p for p in new_parts if p).strip()
+    # 3) 単語の末尾に年がくっついているパターン（春季コンテスト2024 等）
+    m = re.search(r"(19|20|21)\d{2}$", last)
+    if m:
+        y = int(m.group(0))
+        word = last[:m.start()].strip()
+        new_parts = parts[:-1]
+        if word:
+            new_parts.append(word)
+        new_base = " ".join(new_parts).strip()
         return new_base, y, None
 
-    # 4) どれにも当てはまらない場合は年指定なしとしてそのまま返す
+    # 4) どれにも当てはまらない場合は年指定なし
     return q, None, None
+
 def _record_years(rec: Dict[str, Any]) -> List[int]:
     ys = set()
     d = rec.get("__date_obj") or record_date(rec)
@@ -804,7 +804,6 @@ def api_search(
             _refresh_kb_globals(fetch_now=True)
             _cache.clear()
 
-        # ★ 安定化：実読込件数で判定（0なら503）
         if not _KB_ROWS:
             return json_utf8(
                 {"items": [], "total_hits": 0, "error": "kb_not_loaded", "order_used": order},
@@ -903,35 +902,17 @@ def api_search(
                     best_by_id[did] = entry
         deduped = list(best_by_id.values())
 
-        # hit_field 決定
         decorated: List[Tuple[int, Optional[datetime], str, Dict[str, Any], str]] = []
         for sc, d, did, rec in deduped:
             hf = _decide_hit_field(rec, k_terms) or "body"
             decorated.append((sc, d, did, rec, hf))
 
-        # 並び順：
-        #   latest : 開催日/発行日（__date_obj）を最優先 → ヒット位置（title/tag/body）→ スコア
-        #   relevance : これまで通り（ヒット位置 → スコア → 日付）
         bucket_order = {"title":0, "tag":1, "body":2}
         if order == "latest":
-            decorated.sort(
-                key=lambda x: (
-                    -(x[1] or datetime.min).timestamp(),   # ① 日付（開催日/発行日）降順
-                    bucket_order.get(x[4], 9),             # ② ヒット位置（title → tag → body）
-                    -x[0],                                  # ③ スコア（同日・同バケット内の優先度）
-                    x[2],                                   # ④ doc_id 安定ソート
-                )
-            )
+            decorated.sort(key=lambda x: (bucket_order.get(x[4], 9), -(x[1] or datetime.min).timestamp(), -x[0], x[2]))
             order_used = "latest"
         else:
-            decorated.sort(
-                key=lambda x: (
-                    bucket_order.get(x[4], 9),
-                    -x[0],
-                    -(x[1] or datetime.min).timestamp(),
-                    x[2],
-                )
-            )
+            decorated.sort(key=lambda x: (bucket_order.get(x[4], 9), -x[0], -(x[1] or datetime.min).timestamp(), x[2]))
             order_used = "relevance"
 
         total = len(decorated)
