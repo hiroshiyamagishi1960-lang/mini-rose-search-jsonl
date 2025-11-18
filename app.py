@@ -972,20 +972,22 @@ def api_search(
 
         bucket_order = {"title": 0, "tag": 1, "body": 2}
 
-        # ---- 並び順：latest=日付優先 / relevance=スコア優先 ----
+        # ---- 並び順：latest=「日付」→「同じ日付の中でスコア」 / relevance=スコア優先 ----
         if order == "latest":
-            # 1) hit_field バケット 2) 日付（新しいほど前）3) スコア 4) doc_id
+            # 1) 日付（YYYYMMDD。新しい日付が前） 2) スコア（高いほど前）
+            # 3) hit_field バケット 4) doc_id
             decorated.sort(
                 key=lambda x: (
+                    int(x[1].strftime("%Y%m%d")),        # 日付だけを見る（時刻は無視）
+                    -x[0],                               # 同じ日付の中ではスコア大きい順
                     bucket_order.get(x[4], 9),
-                    -int(x[1].strftime("%Y%m%d%H%M%S")),
-                    -x[0],
                     x[2],
-                )
+                ),
+                reverse=True,
             )
             order_used = "latest"
         else:
-            # 1) hit_field バケット 2) スコア 3) 日付（新しいほど前）4) doc_id
+            # relevance: 1) hit_field バケット 2) スコア 3) 日付（新しいほど前）4) doc_id
             decorated.sort(
                 key=lambda x: (
                     bucket_order.get(x[4], 9),
