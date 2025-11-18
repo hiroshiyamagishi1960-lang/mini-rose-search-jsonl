@@ -789,6 +789,7 @@ def _matches_year(rec: Dict[str, Any], year: Optional[int], yr: Optional[Tuple[i
     return any(lo <= y <= hi for y in ys)
 
 # ====== /api/search ======
+# ====== /api/search ======
 @app.get("/api/search")
 def api_search(
     q: str = Query("", description="検索クエリ（-語=除外、末尾年/範囲はフィルタ可）"),
@@ -800,28 +801,255 @@ def api_search(
     debug: int = Query(0, description="1で各件のヒット内訳を返す（診断用）"),
 ):
     try:
+        # ---- KB リフレッシュ ----
         if refresh == 1:
             _refresh_kb_globals(fetch_now=True)
             _cache.clear()
 
+        # ★ 安定化：実読込件数で判定（0なら503）
         if not _KB_ROWS:
             return json_utf8(
                 {"items": [], "total_hits": 0, "error": "kb_not_loaded", "order_used": order},
                 status=503
             )
 
+        # ---- キャッシュキー ----
         cache_key = (q, order, page, page_size, logic, debug)
         cached = _cache.get(cache_key)
         if cached is not None:
             return json_utf8(cached)
 
+        # ---- クエリ解析（末尾の年・年範囲を分離）----
         base_q, y_tail, yr_tail = _parse_year_from_query(q)
         must_terms, minus_terms, raw_terms = parse_query(base_q)
+
+        # 検索語なしなら空で返す
         if not must_terms and not minus_terms:
-            payload = {"items": [], "total_hits": 0, "page": page, "page_size": page_size,
-                       "has_more": False, "next_page": None, "error": None, "order_used": order}
+            payload = {
+                "items": [],
+                "total_hits": 0,
+                "page": page,
+                "page_size": page_size,
+                "has_more": False,
+                "next_page": None,
+                "error": None,
+                "order_used": order,
+            }
             _cache.set(cache_key, payload)
             return json_utf8(payload)
+
+        rows = _KB_ROWS or []
+
+        # ---- 候補レコードの絞り込み ----
+        candidates: List[Dict[str, Any]] = []
+
+        for rec in rows:
+            # 年フィルタ（クエリ末尾の年 or 範囲）
+            if y_tail is not None or yr_tail is not None:
+                if not _matches_year(rec, y_tail, yr_tail):
+                    continue
+
+            ttl = rec.get("__ttl_norm", "")
+            txt = rec.get("__txt_norm", "")
+            tag = rec.get("__tag_norm", "")
+            ftt = rec.get("__ttl_fold", "")
+            ftx = rec.get("__txt_fold", "")
+            ftg = rec.get("__tag_fold", "")
+
+            def contains_any(term: str) -> bool:
+                exts = expand_with_synonyms(term) or {term}
+                for t in exts:
+                    if not t:
+                        continue
+                    # 通常マッチ
+                    if t in ttl or t in txt or t in tag:
+                        return True
+                    # かなフォールド後マッチ
+                    ft = fold_kana(t)
+                    if ft and (ft in ftt or ft in ftx or ft in ftg):
+                        return True
+                return False
+
+            # 除外語
+            if minus_terms and any(contains_any(t) for t in minus_terms):
+                continue
+
+            # AND / OR ロジック
+            if logic == "or":
+                if not must_terms or any(contains_any(t) for t in must_terms):
+                    candidates.append(rec)
+            else:
+                ok = True
+                for t in must_terms:
+                    if not contains_any(t):
+                        ok = False
+                        break
+                if ok:
+                    candidates.append(rec)
+
+        if not candidates:
+            payload = {
+                "items": [],
+                "total_hits": 0,
+                "page": page,
+                "page_size": page_size,
+                "has_more": False,
+                "next_page": None,
+                "error": None,
+                "order_used": order,
+            }
+            _cache.set(cache_key, payload)
+            return json_utf8(payload)
+
+        # ---- スコアリング Stage A/B/C ----
+        stage_a: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
+        k_terms = must_terms or raw_terms
+
+        for rec in candidates:
+            sc = _score_stage_a(rec, k_terms)
+            if sc <= 0:
+                continue
+            stage_a.append((sc, rec.get("__date_obj"), rec.get("__doc_id"), rec))
+
+        if not stage_a:
+            payload = {
+                "items": [],
+                "total_hits": 0,
+                "page": page,
+                "page_size": page_size,
+                "has_more": False,
+                "next_page": None,
+                "error": None,
+                "order_used": order,
+            }
+            _cache.set(cache_key, payload)
+            return json_utf8(payload)
+
+        stage_a.sort(key=sort_key_relevance)
+        stage_b_candidates = stage_a[:TOP_K_A]
+
+        stage_b: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
+        for sc_a, d, did, rec in stage_b_candidates:
+            sc = sc_a + _score_stage_b(rec, k_terms)
+            stage_b.append((sc, d, did, rec))
+        stage_b.sort(key=sort_key_relevance)
+        stage_c_candidates = stage_b[:TOP_K_B]
+
+        final_list: List[Tuple[int, Optional[datetime], str, Dict[str, Any]]] = []
+        for sc_b, d, did, rec in stage_c_candidates:
+            sc = sc_b + _score_stage_c(rec, k_terms)
+            final_list.append((sc, d, did, rec))
+
+        # ---- doc_id で重複をまとめる ----
+        best_by_id: Dict[str, Tuple[int, Optional[datetime], str, Dict[str, Any]]] = {}
+        for sc, d, did, rec in final_list:
+            prev = best_by_id.get(did)
+            if prev is None:
+                best_by_id[did] = (sc, d, did, rec)
+            else:
+                psc, pd, _, _ = prev
+                # スコア優先、同点なら新しい日付を採用
+                if (sc > psc) or (sc == psc and (d or datetime.min) > (pd or datetime.min)):
+                    best_by_id[did] = (sc, d, did, rec)
+
+        deduped = list(best_by_id.values())
+
+        # ---- hit_field & 日付オブジェクトを決定（ここで必ず record_date を通す）----
+        decorated: List[Tuple[int, datetime, str, Dict[str, Any], str]] = []
+
+        for sc, d, did, rec in deduped:
+            hf = _decide_hit_field(rec, k_terms) or "body"
+            # __date_obj が None / 不正でも必ず record_date で再取得
+            if isinstance(d, datetime):
+                dt = d
+            else:
+                d2 = rec.get("__date_obj")
+                if isinstance(d2, datetime):
+                    dt = d2
+                else:
+                    dt = record_date(rec) or datetime.min
+            decorated.append((sc, dt, did, rec, hf))
+
+        bucket_order = {"title": 0, "tag": 1, "body": 2}
+
+        # ---- 並び順：latest=日付優先 / relevance=スコア優先 ----
+        if order == "latest":
+            # 1) hit_field バケット 2) 日付（新しいほど前）3) スコア 4) doc_id
+            decorated.sort(
+                key=lambda x: (
+                    bucket_order.get(x[4], 9),
+                    -int(x[1].strftime("%Y%m%d%H%M%S")),
+                    -x[0],
+                    x[2],
+                )
+            )
+            order_used = "latest"
+        else:
+            # 1) hit_field バケット 2) スコア 3) 日付（新しいほど前）4) doc_id
+            decorated.sort(
+                key=lambda x: (
+                    bucket_order.get(x[4], 9),
+                    -x[0],
+                    -int(x[1].strftime("%Y%m%d%H%M%S")),
+                    x[2],
+                )
+            )
+            order_used = "relevance"
+
+        # ---- ページング ----
+        total = len(decorated)
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_slice = decorated[start:end]
+        has_more = end < total
+        next_page = page + 1 if has_more else None
+
+        # ---- 表示用アイテム生成 ----
+        items: List[Dict[str, Any]] = []
+        for i, (sc, dt, did, rec, hf) in enumerate(page_slice):
+            m = None if debug != 1 else _calc_matches_for_debug(rec, k_terms)
+            items.append(
+                build_item(
+                    rec,
+                    k_terms,
+                    is_first_in_page=(i == 0),
+                    matches=m,
+                    hit_field=hf,
+                )
+            )
+
+        # rank 付与（全体順位）
+        for idx, _ in enumerate(decorated, start=1):
+            if start < idx <= end:
+                items[idx - start - 1]["rank"] = idx
+
+        payload = {
+            "items": items,
+            "total_hits": total,
+            "page": page,
+            "page_size": page_size,
+            "has_more": has_more,
+            "next_page": next_page,
+            "error": None,
+            "order_used": order_used,
+        }
+        _cache.set(cache_key, payload)
+        return json_utf8(payload)
+
+    except Exception as e:
+        return json_utf8(
+            {
+                "items": [],
+                "total_hits": 0,
+                "page": 1,
+                "page_size": page_size,
+                "has_more": False,
+                "next_page": None,
+                "error": "exception",
+                "message": textify(e),
+            },
+            status=500,
+        )
 
         rows = _KB_ROWS or []
 
