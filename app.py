@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 # ========= 設定 =========
 
 KB_PATH = os.getenv("KB_PATH", "kb.jsonl")
-VERSION = os.getenv("APP_VERSION", "jsonl-2025-11-18-simple-fallback")
+VERSION = os.getenv("APP_VERSION", "jsonl-2025-11-18-simple-fallback-fix-date")
 
 PAGE_SIZE_DEFAULT = 5
 FIRST_SNIPPET_LEN = 300
@@ -179,8 +179,11 @@ def record_as_tags(rec: Dict[str, Any]) -> str:
 
 # ========= 日付抽出（発行日/開催日 優先） =========
 
+# ★ 修正ポイント：
+#  - 月の部分を「1[0-2] | 0?[1-9]」の順にし、
+#    10〜12月が「1月」と誤認識されないようにした。
 _DATE_RE = re.compile(
-    r"(?P<y>(?:19|20|21)\d{2})[./\-年]?(?:(?P<m>0?[1-9]|1[0-2])[./\-月]?(?:(?P<d>0?[1-9]|[12]\d|3[01])日?)?)?",
+    r"(?P<y>(?:19|20|21)\d{2})[./\-年]?(?:(?P<m>1[0-2]|0?[1-9])[./\-月]?(?:(?P<d>0?[1-9]|[12]\d|3[01])日?)?)?",
     re.UNICODE,
 )
 
@@ -843,6 +846,8 @@ def api_search(
         "order_used": "latest",
     }
     return json_utf8(payload)
+
+
 # ========= エントリポイント（ローカル実行用） =========
 
 if __name__ == "__main__":
