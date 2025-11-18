@@ -615,9 +615,6 @@ def _calc_matches_for_debug(rec: Dict[str, Any], terms: List[str]) -> Dict[str, 
 
 
 # ========= /api/search 本体 =========
-
-# ========= /api/search 本体 =========
-
 @app.get("/api/search")
 def api_search(
     q: str = Query("", description="検索クエリ（-語=除外、末尾年/範囲はフィルタ）"),
@@ -626,15 +623,7 @@ def api_search(
     order: str = Query("latest", description="latest 固定（互換用）"),
     debug: int = Query(0, description="1でヒット内訳を返す（診断用）"),
 ):
-    """
-    方針：
-      - 年フィルタは __date_obj（発行日/開催日）だけを見る。
-      - キーワードは AND＋除外語（-語）。
-      - ソートは「発行日/開催日の新しい順」が最優先。
-      - 同じ日付の中では「タイトル > タグ > 本文」のヒット数で軽く優先順位を付ける。
-      - relevance スコアは廃止（date が絶対優先）。
-    """
-    # KB が読めていない場合は 503
+    # KB が読めていないとき
     if not KB_ROWS:
         return json_utf8(
             {
@@ -650,11 +639,11 @@ def api_search(
             status=503,
         )
 
-    # --- クエリ解析（年フィルタ＋AND/除外） ---
+    # クエリ解析（年フィルタ付き）
     base_q, year, year_range = _parse_year_from_query(q)
     must_terms, minus_terms, raw_terms = parse_query(base_q)
 
-    # 年もキーワードも無い場合は空返し
+    # 何も指定がないときは空
     if not must_terms and not minus_terms:
         return json_utf8(
             {
@@ -669,12 +658,37 @@ def api_search(
             }
         )
 
-    # --- 年フィルタ（発行日/開催日だけを見る） ---
+    # -------------------------
+    # 1. 年フィルタ（発行日のみを見る）
+    # -------------------------
+    def _pub_date_for_rec(rec: Dict[str, Any]) -> datetime:
+        """
+        記事の日付は「発行日」だけを見る。
+        取れなかった場合は 1900-01-01 を返す（＝最も古い記事として扱う）。
+        """
+        date_text = record_as_text(rec, "date")
+        if date_text:
+            dt = _first_valid_date_from_string(date_text)
+            if dt:
+                return dt
+        return datetime(1900, 1, 1)
+
     candidates: List[Dict[str, Any]] = []
     for rec in KB_ROWS:
+        dt = _pub_date_for_rec(rec)
+        rec["_pub_date_for_sort"] = dt  # 後でソートに使う
+
+        # 年フィルタがある場合は発行年だけで判定
         if year is not None or year_range is not None:
-            if not _matches_year(rec, year, year_range):
-                continue
+            y = dt.year
+            if year is not None:
+                if y != year:
+                    continue
+            if year_range is not None:
+                lo, hi = year_range
+                if not (lo <= y <= hi):
+                    continue
+
         candidates.append(rec)
 
     if not candidates:
@@ -691,20 +705,23 @@ def api_search(
             }
         )
 
-    # --- キーワードフィルタ（AND／除外語） ---
+    # -------------------------
+    # 2. AND／除外語フィルタ
+    # -------------------------
     filtered: List[Dict[str, Any]] = []
 
-    def contains_any(rec: Dict[str, Any], term: str) -> bool:
-        """
-        1語について：
-          - 正規化（スペース・全角半角）した素のテキストに含まれるか？
-          - かなフォールディング済みテキストに含まれるか？
-        を見て、どれかに含まれていれば True。
-        """
+    def _contains_in_field(term: str, norm: str, folded: str) -> bool:
         nt = normalize_text(term)
         if not nt:
             return False
+        if nt in norm:
+            return True
+        fn = fold_kana(nt)
+        if fn and fn in folded:
+            return True
+        return False
 
+    for rec in candidates:
         ttl = rec.get("__ttl_norm", "")
         txt = rec.get("__txt_norm", "")
         tag = rec.get("__tag_norm", "")
@@ -712,26 +729,43 @@ def api_search(
         ftxt = rec.get("__txt_fold", "")
         ftag = rec.get("__tag_fold", "")
 
-        if nt in ttl or nt in txt or nt in tag:
-            return True
-        fn = fold_kana(nt)
-        if fn and (fn in fttl or fn in ftxt or fn in ftag):
-            return True
-        return False
-
-    for rec in candidates:
-        # 除外語（minus_terms）のどれかがヒットしたら除外
-        if minus_terms and any(contains_any(rec, t) for t in minus_terms):
+        # 除外語：タイトル／タグ／本文のどこかに入っていたら除外
+        exclude = False
+        for t in minus_terms:
+            if (
+                _contains_in_field(t, ttl, fttl)
+                or _contains_in_field(t, tag, ftag)
+                or _contains_in_field(t, txt, ftxt)
+            ):
+                exclude = True
+                break
+        if exclude:
             continue
 
-        # AND 条件（must_terms の全語がどこかに含まれる）
+        # AND 条件：must_terms のすべてが、タイトル／タグ／本文のどこかに入っている
         ok = True
         for t in must_terms:
-            if not contains_any(rec, t):
+            if not (
+                _contains_in_field(t, ttl, fttl)
+                or _contains_in_field(t, tag, ftag)
+                or _contains_in_field(t, txt, ftxt)
+            ):
                 ok = False
                 break
-        if ok:
-            filtered.append(rec)
+        if not ok:
+            continue
+
+        # 同じ発行日の中での優先順位用フラグ
+        terms_for_flags = must_terms or raw_terms
+        has_title_hit = any(_contains_in_field(t, ttl, fttl) for t in terms_for_flags)
+        has_tag_hit = any(_contains_in_field(t, tag, ftag) for t in terms_for_flags)
+        has_body_hit = any(_contains_in_field(t, txt, ftxt) for t in terms_for_flags)
+
+        rec["_has_title_hit"] = has_title_hit
+        rec["_has_tag_hit"] = has_tag_hit
+        rec["_has_body_hit"] = has_body_hit
+
+        filtered.append(rec)
 
     if not filtered:
         return json_utf8(
@@ -747,58 +781,36 @@ def api_search(
             }
         )
 
-    # --- ヒット数の軽い集計（同日内の並び用） ---
-    #   最優先：日付（新しい順）
-    #   次点：タイトルに多くヒットしたもの
-    #   次点：タグに多くヒットしたもの
-    #   次点：本文に多くヒットしたもの
-    #   最後：安定ソート用のID
-    scored: List[Tuple[datetime, int, int, int, str, Dict[str, Any]]] = []
-    terms = must_terms or raw_terms  # debug用も兼ねて raw_terms fallback
+    # -------------------------
+    # 3. ソート
+    #   1) 発行日（新しい順）
+    #   2) 同じ日付の中では「タイトル→タグ→本文」の順
+    # -------------------------
+    scored: List[Tuple[datetime, bool, bool, bool, str, Dict[str, Any]]] = []
+    terms_for_debug = must_terms or raw_terms
 
     for rec in filtered:
-        ttl = rec.get("__ttl_norm", "")
-        txt = rec.get("__txt_norm", "")
-        tag = rec.get("__tag_norm", "")
+        dt = rec.get("_pub_date_for_sort") or datetime(1900, 1, 1)
+        has_title_hit = bool(rec.get("_has_title_hit"))
+        has_tag_hit = bool(rec.get("_has_tag_hit"))
+        has_body_hit = bool(rec.get("_has_body_hit"))
 
-        title_hits = 0
-        tag_hits = 0
-        body_hits = 0
+        # 安定ソート用ID（タイトルから作る）
+        stable_id = hashlib.sha256(
+            (record_as_text(rec, "title") or "").encode("utf-8")
+        ).hexdigest()[:16]
 
-        for t in terms:
-            nt = normalize_text(t)
-            if not nt:
-                continue
-            if nt in ttl:
-                title_hits += ttl.count(nt)
-            if nt in tag:
-                tag_hits += tag.count(nt)
-            if nt in txt:
-                body_hits += txt.count(nt)
+        scored.append((dt, has_title_hit, has_tag_hit, has_body_hit, stable_id, rec))
 
-        # 日付が取れない場合は 1900-01-01 扱いで一番古くする
-        d = rec.get("__date_obj") or record_date(rec) or datetime(1900, 1, 1)
-        rec["__date_obj"] = d
-
-        # 同点時の安定ソート用にタイトルからIDを作る
-        stable_id_src = (record_as_text(rec, "title") or "") + (record_as_text(rec, "url") or "")
-        stable_id = hashlib.sha256(stable_id_src.encode("utf-8")).hexdigest()[:16]
-
-        scored.append((d, title_hits, tag_hits, body_hits, stable_id, rec))
-
-    # --- 並び順：日付（新しい）→タイトルヒット→タグヒット→本文ヒット ---
+    # 発行日↓ → タイトルヒット→タグヒット→本文ヒット→安定ID
     scored.sort(
-        key=lambda x: (
-            x[0],      # 日付（昇順）
-            x[1],      # タイトルヒット数
-            x[2],      # タグヒット数
-            x[3],      # 本文ヒット数
-            x[4],      # 安定ID
-        ),
-        reverse=True,  # すべて逆順：日付は新しい→古い、ヒット数は多い→少ない
+        key=lambda x: (x[0], x[1], x[2], x[3], x[4]),
+        reverse=True,
     )
 
-    # --- ページング ---
+    # -------------------------
+    # 4. ページング＆レスポンス
+    # -------------------------
     total = len(scored)
     start = (page - 1) * page_size
     end = start + page_size
@@ -806,15 +818,18 @@ def api_search(
     has_more = end < total
     next_page = page + 1 if has_more else None
 
-    # --- 表示用 item を組み立て ---
     items: List[Dict[str, Any]] = []
-    for idx, (d, t_hits, tag_hits, b_hits, stable_id, rec) in enumerate(page_slice, start=start + 1):
-        matches = _calc_matches_for_debug(rec, terms) if debug == 1 else None
-        item = build_item(rec, terms, is_first_in_page=(idx == start + 1), matches=matches)
+    for idx, (dt, has_title_hit, has_tag_hit, has_body_hit, stable_id, rec) in enumerate(
+        page_slice, start=start + 1
+    ):
+        matches = _calc_matches_for_debug(rec, terms_for_debug) if debug == 1 else None
+        item = build_item(
+            rec,
+            terms_for_debug,
+            is_first_in_page=(idx == start + 1),
+            matches=matches,
+        )
         item["rank"] = idx
-        item["title_hits"] = t_hits
-        item["tag_hits"] = tag_hits
-        item["body_hits"] = b_hits
         items.append(item)
 
     payload = {
