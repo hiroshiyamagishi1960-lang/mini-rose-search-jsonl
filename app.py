@@ -1,8 +1,9 @@
-# app.py — simple-search-2025-11-18
+# app.py — simple-search-2025-11-18-fallback
 # 目的：
 #   - ミニバラ盆栽デジタル資料館（JSONL版）の検索を
 #     「日付順＋年フィルタ」で素直に動かすシンプル版。
 #   - タイトル中の年はフィルタに使わず、発行日/開催日だけで年を判定。
+#   - タイトル・本文・タグが空のレコードは「レコード丸ごと」を検索対象にして取りこぼしを防ぐ。
 #   - UI や static ファイル構成は変更しない（/ui, /static/... は既存どおり）。
 
 import os
@@ -29,13 +30,13 @@ from fastapi.staticfiles import StaticFiles
 # ========= 設定 =========
 
 KB_PATH = os.getenv("KB_PATH", "kb.jsonl")
-VERSION = os.getenv("APP_VERSION", "jsonl-2025-11-18-simple")
+VERSION = os.getenv("APP_VERSION", "jsonl-2025-11-18-simple-fallback")
 
 PAGE_SIZE_DEFAULT = 5
 FIRST_SNIPPET_LEN = 300
 OTHER_SNIPPET_LEN = 185
 
-app = FastAPI(title="mini-rose-search-jsonl (simple)")
+app = FastAPI(title="mini-rose-search-jsonl (simple-fallback)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -280,6 +281,13 @@ def _attach_precomputed_fields(rows: List[Dict[str, Any]]) -> None:
         txt_norm = normalize_text(text)
         tag_norm = normalize_text(tags)
 
+        # ★ 保険：
+        # タイトル・本文・タグがすべて空の場合は、
+        # レコード全体の JSON を「本文」として検索対象にする。
+        if not ttl_norm and not txt_norm and not tag_norm:
+            raw = textify(rec)
+            txt_norm = normalize_text(raw)
+
         rec["__ttl_norm"] = ttl_norm
         rec["__txt_norm"] = txt_norm
         rec["__tag_norm"] = tag_norm
@@ -447,7 +455,6 @@ def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tup
     # 「語＋年」がくっついている場合をばらす（コンテスト2024 → コンテスト + 2024）
     m_suffix = re.fullmatch(rf"(.+?)((?:19|20|21)\d{{2}}(?:\s*{RANGE_SEP}\s*(?:19|20|21)\d{{2}})?)", last)
     if m_suffix:
-        # 例：["コンテスト2024"] → ["コンテスト", "2024"]
         head = m_suffix.group(1)
         tail = m_suffix.group(2)
         if head:
@@ -539,7 +546,6 @@ def highlight_simple(text: str, terms: List[str]) -> str:
     if not terms:
         return esc
 
-    # 長い語から順にマーキング
     norm_terms = [normalize_text(t) for t in terms if normalize_text(t)]
     norm_terms = sorted(set(norm_terms), key=len, reverse=True)
 
@@ -618,7 +624,6 @@ def api_search(
     order: str = Query("latest", description="latest 固定（互換用）"),
     debug: int = Query(0, description="1でヒット内訳を返す（診断用）"),
 ):
-    # KB 未ロード
     if not KB_ROWS:
         return json_utf8(
             {
@@ -634,7 +639,6 @@ def api_search(
             status=503,
         )
 
-    # 年フィルタを分離
     base_q, year, year_range = _parse_year_from_query(q)
     must_terms, minus_terms, raw_terms = parse_query(base_q)
 
