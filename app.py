@@ -616,137 +616,218 @@ def _calc_matches_for_debug(rec: Dict[str, Any], terms: List[str]) -> Dict[str, 
 
 # ========= /api/search 本体 =========
 
+# ========= /api/search 本体 =========
+
 @app.get("/api/search")
 def api_search(
-    q: str = "",
-    order: str = "latest",
-    page: int = 1,
-    page_size: int = 10,
+    q: str = Query("", description="検索クエリ（-語=除外、末尾年/範囲はフィルタ）"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(PAGE_SIZE_DEFAULT, ge=1, le=50),
+    order: str = Query("latest", description="latest 固定（互換用）"),
+    debug: int = Query(0, description="1でヒット内訳を返す（診断用）"),
 ):
-    # -------------------------
-    # 1. クエリ解析（AND検索）
-    # -------------------------
-    if not q.strip():
-        return {
-            "items": [],
-            "total_hits": 0,
-            "page": page,
-            "page_size": page_size,
-            "has_more": False,
-            "next_page": None,
-            "order_used": order,
-        }
+    """
+    方針：
+      - 年フィルタは __date_obj（発行日/開催日）だけを見る。
+      - キーワードは AND＋除外語（-語）。
+      - ソートは「発行日/開催日の新しい順」が最優先。
+      - 同じ日付の中では「タイトル > タグ > 本文」のヒット数で軽く優先順位を付ける。
+      - relevance スコアは廃止（date が絶対優先）。
+    """
+    # KB が読めていない場合は 503
+    if not KB_ROWS:
+        return json_utf8(
+            {
+                "items": [],
+                "total_hits": 0,
+                "page": page,
+                "page_size": page_size,
+                "has_more": False,
+                "next_page": None,
+                "error": "kb_not_loaded",
+                "order_used": "latest",
+            },
+            status=503,
+        )
 
-    terms = [t for t in re.split(r"[ \u3000]+", q.strip()) if t]
+    # --- クエリ解析（年フィルタ＋AND/除外） ---
+    base_q, year, year_range = _parse_year_from_query(q)
+    must_terms, minus_terms, raw_terms = parse_query(base_q)
 
-    # 年フィルタ（発行日だけ見る）
-    year_terms = []
-    normal_terms = []
-    for t in terms:
-        if re.fullmatch(r"\d{4}", t):
-            year_terms.append(int(t))
-        elif re.fullmatch(r"\d{4}-\d{4}", t):
-            a, b = t.split("-")
-            year_terms.append((int(a), int(b)))
-        else:
-            normal_terms.append(t)
+    # 年もキーワードも無い場合は空返し
+    if not must_terms and not minus_terms:
+        return json_utf8(
+            {
+                "items": [],
+                "total_hits": 0,
+                "page": page,
+                "page_size": page_size,
+                "has_more": False,
+                "next_page": None,
+                "error": None,
+                "order_used": "latest",
+            }
+        )
 
-    # -------------------------
-    # 2. 全レコードをスキャンして AND マッチ
-    # -------------------------
-    matched = []
-    for rec in kb_records:
-        title = rec.get("title", "")
-        body = rec.get("content", "")
-        date_str = rec.get("date", "")
-        url = rec.get("url", "")
+    # --- 年フィルタ（発行日/開催日だけを見る） ---
+    candidates: List[Dict[str, Any]] = []
+    for rec in KB_ROWS:
+        if year is not None or year_range is not None:
+            if not _matches_year(rec, year, year_range):
+                continue
+        candidates.append(rec)
 
-        # AND検索：全語が title または body に出現
-        ok = True
-        for t in normal_terms:
-            if (t not in title) and (t not in body):
-                ok = False
-                break
-        if not ok:
+    if not candidates:
+        return json_utf8(
+            {
+                "items": [],
+                "total_hits": 0,
+                "page": page,
+                "page_size": page_size,
+                "has_more": False,
+                "next_page": None,
+                "error": None,
+                "order_used": "latest",
+            }
+        )
+
+    # --- キーワードフィルタ（AND／除外語） ---
+    filtered: List[Dict[str, Any]] = []
+
+    def contains_any(rec: Dict[str, Any], term: str) -> bool:
+        """
+        1語について：
+          - 正規化（スペース・全角半角）した素のテキストに含まれるか？
+          - かなフォールディング済みテキストに含まれるか？
+        を見て、どれかに含まれていれば True。
+        """
+        nt = normalize_text(term)
+        if not nt:
+            return False
+
+        ttl = rec.get("__ttl_norm", "")
+        txt = rec.get("__txt_norm", "")
+        tag = rec.get("__tag_norm", "")
+        fttl = rec.get("__ttl_fold", "")
+        ftxt = rec.get("__txt_fold", "")
+        ftag = rec.get("__tag_fold", "")
+
+        if nt in ttl or nt in txt or nt in tag:
+            return True
+        fn = fold_kana(nt)
+        if fn and (fn in fttl or fn in ftxt or fn in ftag):
+            return True
+        return False
+
+    for rec in candidates:
+        # 除外語（minus_terms）のどれかがヒットしたら除外
+        if minus_terms and any(contains_any(rec, t) for t in minus_terms):
             continue
 
-        # 年フィルタ：title の年ではなく「発行日だけ」で判定
-        if year_terms:
-            try:
-                y = int(date_str[:4])
-            except:
+        # AND 条件（must_terms の全語がどこかに含まれる）
+        ok = True
+        for t in must_terms:
+            if not contains_any(rec, t):
+                ok = False
+                break
+        if ok:
+            filtered.append(rec)
+
+    if not filtered:
+        return json_utf8(
+            {
+                "items": [],
+                "total_hits": 0,
+                "page": page,
+                "page_size": page_size,
+                "has_more": False,
+                "next_page": None,
+                "error": None,
+                "order_used": "latest",
+            }
+        )
+
+    # --- ヒット数の軽い集計（同日内の並び用） ---
+    #   最優先：日付（新しい順）
+    #   次点：タイトルに多くヒットしたもの
+    #   次点：タグに多くヒットしたもの
+    #   次点：本文に多くヒットしたもの
+    #   最後：安定ソート用のID
+    scored: List[Tuple[datetime, int, int, int, str, Dict[str, Any]]] = []
+    terms = must_terms or raw_terms  # debug用も兼ねて raw_terms fallback
+
+    for rec in filtered:
+        ttl = rec.get("__ttl_norm", "")
+        txt = rec.get("__txt_norm", "")
+        tag = rec.get("__tag_norm", "")
+
+        title_hits = 0
+        tag_hits = 0
+        body_hits = 0
+
+        for t in terms:
+            nt = normalize_text(t)
+            if not nt:
                 continue
+            if nt in ttl:
+                title_hits += ttl.count(nt)
+            if nt in tag:
+                tag_hits += tag.count(nt)
+            if nt in txt:
+                body_hits += txt.count(nt)
 
-            ok_year = False
-            for yt in year_terms:
-                if isinstance(yt, int):
-                    if y == yt:
-                        ok_year = True
-                else:
-                    a, b = yt
-                    if a <= y <= b:
-                        ok_year = True
+        # 日付が取れない場合は 1900-01-01 扱いで一番古くする
+        d = rec.get("__date_obj") or record_date(rec) or datetime(1900, 1, 1)
+        rec["__date_obj"] = d
 
-            if not ok_year:
-                continue
+        # 同点時の安定ソート用にタイトルからIDを作る
+        stable_id_src = (record_as_text(rec, "title") or "") + (record_as_text(rec, "url") or "")
+        stable_id = hashlib.sha256(stable_id_src.encode("utf-8")).hexdigest()[:16]
 
-        # ヒットした語数（タイトル・本文）
-        title_hits = sum(t in title for t in normal_terms)
-        body_hits = sum(t in body for t in normal_terms)
+        scored.append((d, title_hits, tag_hits, body_hits, stable_id, rec))
 
-        matched.append({
-            "title": title,
-            "content": body,
-            "date": date_str,
-            "url": url,
-            "title_hits": title_hits,
-            "body_hits": body_hits,
-        })
+    # --- 並び順：日付（新しい）→タイトルヒット→タグヒット→本文ヒット ---
+    scored.sort(
+        key=lambda x: (
+            x[0],      # 日付（昇順）
+            x[1],      # タイトルヒット数
+            x[2],      # タグヒット数
+            x[3],      # 本文ヒット数
+            x[4],      # 安定ID
+        ),
+        reverse=True,  # すべて逆順：日付は新しい→古い、ヒット数は多い→少ない
+    )
 
-    # -------------------------
-    # 3. ソート：最優先は「date 降順」
-    # -------------------------
-    def parse_date(ds):
-        try:
-            return datetime.strptime(ds, "%Y-%m-%d")
-        except:
-            return datetime.min
-
-    matched.sort(key=lambda r: (
-        parse_date(r["date"]),  # 発行日（最優先）
-        r["title_hits"],        # 同日ならタイトルの一致数
-        r["body_hits"],         # 次に本文一致数
-        r["url"],               # 最後にURLで安定ソート
-    ), reverse=True)
-
-    # -------------------------
-    # 4. ページング
-    # -------------------------
-    total_hits = len(matched)
+    # --- ページング ---
+    total = len(scored)
     start = (page - 1) * page_size
     end = start + page_size
-    items = matched[start:end]
-
-    has_more = end < total_hits
+    page_slice = scored[start:end]
+    has_more = end < total
     next_page = page + 1 if has_more else None
 
-    return {
-        "items": [
-            {
-                "title": r["title"],
-                "content": r["content"],
-                "date": r["date"],
-                "url": r["url"],
-            }
-            for r in items
-        ],
-        "total_hits": total_hits,
+    # --- 表示用 item を組み立て ---
+    items: List[Dict[str, Any]] = []
+    for idx, (d, t_hits, tag_hits, b_hits, stable_id, rec) in enumerate(page_slice, start=start + 1):
+        matches = _calc_matches_for_debug(rec, terms) if debug == 1 else None
+        item = build_item(rec, terms, is_first_in_page=(idx == start + 1), matches=matches)
+        item["rank"] = idx
+        item["title_hits"] = t_hits
+        item["tag_hits"] = tag_hits
+        item["body_hits"] = b_hits
+        items.append(item)
+
+    payload = {
+        "items": items,
+        "total_hits": total,
         "page": page,
         "page_size": page_size,
         "has_more": has_more,
         "next_page": next_page,
-        "order_used": order,
+        "error": None,
+        "order_used": "latest",
     }
+    return json_utf8(payload)
 # ========= エントリポイント（ローカル実行用） =========
 
 if __name__ == "__main__":
