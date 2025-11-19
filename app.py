@@ -437,59 +437,42 @@ RANGE_SEP = r"(?:-|–|—|~|〜|～|\.{2})"
 
 def _parse_year_from_query(q_raw: str) -> Tuple[str, Optional[int], Optional[Tuple[int, int]]]:
     """
-    末尾の「西暦4桁」または「西暦4桁-西暦4桁」を年フィルタとして解釈する。
+    クエリ末尾の「西暦4桁」または「西暦4桁-西暦4桁」を年フィルタとして解釈する。
 
-    対応パターン:
+    対応例:
       - コンテスト 2024
       - コンテスト2024
       - 剪定 1999-2001
       - 剪定1999-2001
     """
-    q = _nfkc(q_raw).strip()
+    q = _nfkc(q_raw or "").strip()
     if not q:
         return "", None, None
 
-    # 全角スペースも半角に統一
+    # 全角スペース → 半角スペース
     q = q.replace("　", " ")
 
-    parts = q.split()
-    last = parts[-1] if parts else ""
-
-    # 「語＋年」がくっついている場合をばらす（コンテスト2024 → コンテスト + 2024）
-    m_suffix = re.fullmatch(rf"(.+?)((?:19|20|21)\d{{2}}(?:\s*{RANGE_SEP}\s*(?:19|20|21)\d{{2}})?)", last)
-    if m_suffix:
-        head = m_suffix.group(1)
-        tail = m_suffix.group(2)
-        if head:
-            parts[-1] = head
-            parts.append(tail)
-        last = tail
-
-    # 4桁西暦だけ
-    if re.fullmatch(r"(?:19|20|21)\d{2}", last):
-        base = " ".join(parts[:-1]).strip()
-        return base, int(last), None
-
-    # 1999-2001 のような範囲
-    m_rng = re.fullmatch(
-        rf"((?:19|20|21)\d{{2}})\s*{RANGE_SEP}\s*((?:19|20|21)\d{{2}})",
-        last,
-    )
+    # 1) 「… 2023-2024」や「…2023-2024」を末尾から拾う（年範囲）
+    rng_pattern = rf"^(?P<head>.*?)(?P<y1>(?:19|20|21)\d{{2}})\s*{RANGE_SEP}\s*(?P<y2>(?:19|20|21)\d{{2}})\s*$"
+    m_rng = re.search(rng_pattern, q)
     if m_rng:
-        y1, y2 = int(m_rng.group(1)), int(m_rng.group(2))
-        if y1 > y2:
-            y1, y2 = y2, y1
-        base = " ".join(parts[:-1]).strip()
-        return base, None, (y1, y2)
+        head = (m_rng.group("head") or "").strip()
+        y1 = int(m_rng.group("y1"))
+        y2 = int(m_rng.group("y2"))
+        lo, hi = (y1, y2) if y1 <= y2 else (y2, y1)
+        base = head
+        return base, None, (lo, hi)
 
-    # 語尾に年がくっついているパターン（剪定1999 など）をもう一度チェック
-    m_tail = re.fullmatch(rf"^(.*?)(?:((?:19|20|21)\d{{2}}))$", last)
-    if m_tail and m_tail.group(1):
-        base_parts = parts[:-1] + [m_tail.group(1)]
-        base = " ".join(base_parts).strip()
-        return base, int(m_tail.group(2)), None
+    # 2) 「… 2024」や「…2024」を末尾から拾う（単年）
+    year_pattern = r"^(?P<head>.*?)(?P<y>(?:19|20|21)\d{2})\s*$"
+    m_year = re.search(year_pattern, q)
+    if m_year:
+        head = (m_year.group("head") or "").strip()
+        y = int(m_year.group("y"))
+        base = head
+        return base, y, None
 
-    # 年指定なし
+    # 3) 年指定なし（そのままクエリとして使う）
     return q, None, None
 
 
