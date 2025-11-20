@@ -2,400 +2,368 @@
 # -*- coding: utf-8 -*-
 """
 refresh_kb.py — Notion DB → kb.jsonl 生成（インラインDB/フルページDB 両対応）
+
 - インラインDBでもフルページDBでも動作（Notion APIはDB IDが同じ扱い）
-- 列名の日本語差異を自動検出（envで明示も可）
-- title / date / url / body を堅牢に抽出
+- 列名の日本語差異を緩く吸収（envで明示も可）
+- title / date / url / body を抽出し、検索用の JSONL を生成
 - 生成物: kb.jsonl（UTF-8 / 1行1レコード）
+
+★今回の追加ポイント
+- Notion の「講師/著者」「資料区分」「出典」を取得し、
+  本文末尾に
+    【講師/著者】…
+    【資料区分】…
+    【出典】…
+  の3行を追記する。
+- これにより、検索語に
+    「71号」「会報71号」「楽しいミニバラ盆栽」
+    「白根」「規定」 などを入れてもヒットするようになる。
+- app.py 側のロジックは一切変更しない。
 
 環境変数（必要/任意）:
   NOTION_TOKEN            : 必須（Notion統合のシークレット）
   NOTION_DATABASE_ID      : 必須（32桁のDB ID）
   FIELD_TITLE             : 任意（既定：自動検出 "type=title"）
-  FIELD_URL               : 任意（候補: 出典URL, URL 等）※type=url優先
-  FIELD_DATE_PRIMARY      : 任意（候補: 発行日, 開催日 等）※type=date優先
-  FIELD_DATE_SECONDARY    : 任意（候補: あれば補助日付）
-  FIELD_BODY              : 任意（候補: 本文, メモ, 内容 等）※rich_text優先
-  FIELD_TAGS              : 任意（候補: タグ 等）※multi_select/select優先
-  FIELD_ISSUE             : 任意（候補: 号, 会報号 等）※number/text両対応
-
-出力:
-  kb.jsonl / kb_integrity.txt（行数とsha256）
+  FIELD_BODY              : 任意（既定：候補から自動検出）
+  FIELD_DATE              : 任意（既定：type=date の最初の列）
+  FIELD_URL               : 任意（候補: 出典URL, URL 等）
+  FIELD_TAGS              : 任意（既定：候補: タグ, Tags 等）
+  FIELD_AUTHOR            : 任意（既定：候補: 講師/著者 等）
+  FIELD_CATEGORY          : 任意（既定：候補: 資料区分 等）
+  FIELD_SOURCE            : 任意（既定：候補: 出典 等）
+  FIELD_ISSUE             : 任意（既定：候補: 会報号, 号 等）
 """
 
-import os, sys, json, time, hashlib, datetime as dt, re
-import requests
+import os
+import json
+import sys
+import re
+from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
-NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
-DB_ID        = os.getenv("NOTION_DATABASE_ID", "").strip()
+import requests
 
-if not NOTION_TOKEN or not DB_ID:
-    print("[ERROR] NOTION_TOKEN or NOTION_DATABASE_ID is missing.", file=sys.stderr)
-    sys.exit(1)
+NOTION_API_BASE = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
 
-HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json",
-}
 
-# ---- 環境変数による明示マップ（任意） ----
-ENV_FIELD = {
-    "title": os.getenv("FIELD_TITLE", "").strip(),
-    "url": os.getenv("FIELD_URL", "").strip(),
-    "date_primary": os.getenv("FIELD_DATE_PRIMARY", "").strip(),
-    "date_secondary": os.getenv("FIELD_DATE_SECONDARY", "").strip(),
-    "body": os.getenv("FIELD_BODY", "").strip(),
-    "tags": os.getenv("FIELD_TAGS", "").strip(),
-    "issue": os.getenv("FIELD_ISSUE", "").strip(),
-}
+# ----------------------------------------------------------------------
+# 共通ユーティリティ
+# ----------------------------------------------------------------------
+def getenv(name: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
+    value = os.getenv(name, default)
+    if required and not value:
+        print(f"[ERROR] 環境変数 {name} が設定されていません。", file=sys.stderr)
+        sys.exit(1)
+    return value or None
 
-# ---- 推定時の名称候補（日本語UI想定） ----
-NAME_CANDIDATES = {
-    "url": ["出典URL", "URL", "リンク", "Link"],
-    "date": ["発行日", "開催日", "日付", "Date"],
-    "body": ["本文", "内容", "メモ", "説明", "Body", "Notes"],
-    "tags": ["タグ", "カテゴリ", "カテゴリー", "分類", "Tags", "Category"],
-    "issue": ["号", "会報号", "No", "Issue", "号数"],
-}
 
-def notion_get_database(db_id: str) -> Dict[str, Any]:
-    r = requests.get(f"https://api.notion.com/v1/databases/{db_id}", headers=HEADERS)
-    if r.status_code != 200:
-        print(f"[ERROR] get_database failed: {r.status_code} {r.text}", file=sys.stderr)
-        sys.exit(2)
-    return r.json()
+def join_rich_text(blocks: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for b in blocks:
+        if "plain_text" in b:
+            parts.append(b["plain_text"])
+        elif "text" in b and isinstance(b["text"], dict) and "content" in b["text"]:
+            parts.append(b["text"]["content"])
+    return "".join(parts).strip()
 
-def notion_query_all(db_id: str) -> List[Dict[str, Any]]:
-    """DB全件をページングで取得（インライン/フルページ共通）"""
-    results = []
-    payload = {"page_size": 100}
-    next_cursor = None
+
+def notion_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
+
+def query_database_all(token: str, database_id: str) -> List[Dict[str, Any]]:
+    """Notion データベースを最後まで query して全行を返す。"""
+    url = f"{NOTION_API_BASE}/databases/{database_id}/query"
+    headers = notion_headers(token)
+
+    results: List[Dict[str, Any]] = []
+    payload: Dict[str, Any] = {}
+    cursor: Optional[str] = None
+
     while True:
-        if next_cursor:
-            payload["start_cursor"] = next_cursor
-        r = requests.post(
-            f"https://api.notion.com/v1/databases/{db_id}/query",
-            headers=HEADERS,
-            data=json.dumps(payload),
-        )
-        if r.status_code != 200:
-            print(f"[ERROR] query failed: {r.status_code} {r.text}", file=sys.stderr)
-            break
-        data = r.json()
+        if cursor:
+            payload["start_cursor"] = cursor
+        resp = requests.post(url, headers=headers, data=json.dumps(payload))
+        if resp.status_code != 200:
+            print("[ERROR] Notion query failed:", resp.status_code, resp.text, file=sys.stderr)
+            sys.exit(1)
+        data = resp.json()
         results.extend(data.get("results", []))
-        next_cursor = data.get("next_cursor")
         if not data.get("has_more"):
             break
+        cursor = data.get("next_cursor")
+
     return results
 
-def pick_title_property_name(schema: Dict[str, Any]) -> Optional[str]:
-    for prop_name, meta in schema.get("properties", {}).items():
-        if meta.get("type") == "title":
-            return prop_name
+
+# ----------------------------------------------------------------------
+# プロパティ抽出ヘルパ
+# ----------------------------------------------------------------------
+def get_first_property_of_type(properties: Dict[str, Any], prop_type: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    for name, p in properties.items():
+        if p.get("type") == prop_type:
+            return name, p
     return None
 
-def pick_first_of_type(schema: Dict[str, Any], type_name: str,
-                       name_hint: Optional[str], name_pool: List[str]) -> Optional[str]:
-    # 1) 明示指定あれば優先
-    if name_hint and name_hint in schema.get("properties", {}):
-        return name_hint
-    # 2) 型一致のプロパティを優先
-    for prop_name, meta in schema.get("properties", {}).items():
-        if meta.get("type") == type_name:
-            return prop_name
-    # 3) 候補名で一致するもの
-    for cand in name_pool:
-        if cand in schema.get("properties", {}):
-            return cand
+
+def get_property_by_candidates(
+    properties: Dict[str, Any],
+    candidates: List[str],
+    allowed_types: Optional[List[str]] = None,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    for cand in candidates:
+        if cand in properties:
+            p = properties[cand]
+            if allowed_types is None or p.get("type") in allowed_types:
+                return cand, p
     return None
 
-def to_plain_text(rich: List[Dict[str, Any]]) -> str:
-    out = []
-    for r in rich or []:
-        t = r.get("plain_text")
-        if t:
-            out.append(t)
-    return "".join(out).strip()
 
-def extract_title(props: Dict[str, Any], title_name: str) -> str:
-    # title プロパティは type=title 固定
-    title_arr = props.get(title_name, {}).get("title", [])
-    return to_plain_text(title_arr)
-
-def extract_rich_text(props: Dict[str, Any], field_name: str) -> str:
-    meta = props.get(field_name, {})
-    t = ""
-    if "rich_text" in meta:
-        t = to_plain_text(meta.get("rich_text", []))
-    elif "title" in meta:
-        t = to_plain_text(meta.get("title", []))
-    elif "url" in meta and isinstance(meta.get("url"), str):
-        t = meta.get("url") or ""
-    elif "number" in meta and meta.get("number") is not None:
-        t = str(meta.get("number"))
-    elif "select" in meta and meta.get("select"):
-        t = meta["select"].get("name", "")
-    elif "multi_select" in meta and meta.get("multi_select"):
-        t = ", ".join([x.get("name", "") for x in meta["multi_select"] if x.get("name")])
-    elif "people" in meta and meta.get("people"):
-        t = ", ".join([p.get("name", "") for p in meta["people"] if p.get("name")])
-    elif "email" in meta and meta.get("email"):
-        t = meta["email"]
-    elif "phone_number" in meta and meta.get("phone_number"):
-        t = meta["phone_number"]
-    return (t or "").strip()
-
-def extract_url(props: Dict[str, Any], url_name: Optional[str]) -> str:
-    if url_name and "url" in props.get(url_name, {}):
-        return props[url_name].get("url") or ""
-    # fallback: rich_text/タイトルからURLらしき文字列を拾う
-    for name, meta in props.items():
-        if meta.get("type") == "url":
-            return meta.get("url") or ""
-    # rich_textにhttpが含まれていれば拾う（安全のため先頭一つ）
-    for name, meta in props.items():
-        if "rich_text" in meta:
-            txt = to_plain_text(meta.get("rich_text", []))
-            if "http://" in txt or "https://" in txt:
-                for token in txt.split():
-                    if token.startswith("http://") or token.startswith("https://"):
-                        return token.strip()
+def extract_text_prop(p: Dict[str, Any]) -> str:
+    t = p.get("type")
+    if t == "title":
+        return join_rich_text(p.get("title", []))
+    if t == "rich_text":
+        return join_rich_text(p.get("rich_text", []))
+    if t == "select":
+        opt = p.get("select")
+        if opt:
+            return opt.get("name", "").strip()
+        return ""
+    if t == "multi_select":
+        opts = p.get("multi_select", [])
+        return " / ".join(o.get("name", "").strip() for o in opts if o.get("name"))
+    if t == "url":
+        return p.get("url") or ""
     return ""
 
-def extract_date_iso(props: Dict[str, Any],
-                     primary: Optional[str],
-                     secondary: Optional[str]) -> Optional[str]:
-    def _get_date(field: str) -> Optional[str]:
-        meta = props.get(field, {})
-        if not meta or meta.get("type") != "date":
-            return None
-        val = meta.get("date") or {}
-        if not val:
-            return None
-        s = val.get("start")
-        if s:
-            return s
-        return None
 
-    # 1) 明示指定の優先
-    for f in [primary, secondary]:
-        if f:
-            got = _get_date(f)
-            if got:
-                return got
-    # 2) 型= date の最初
-    for name, meta in props.items():
-        if meta.get("type") == "date":
-            got = _get_date(name)
-            if got:
-                return got
+def extract_date_prop(p: Dict[str, Any]) -> Optional[str]:
+    if p.get("type") != "date":
+        return None
+    d = p.get("date")
+    if not d:
+        return None
+    start = d.get("start")
+    if not start:
+        return None
+    # YYYY-MM-DD または ISO 形式を YYYY-MM-DD に揃える
+    try:
+        if len(start) >= 10:
+            return start[:10]
+    except Exception:
+        return None
     return None
 
-def extract_tags(props: Dict[str, Any], tags_name: Optional[str]) -> List[str]:
-    def _tags_from(meta: Dict[str, Any]) -> List[str]:
-        if meta.get("type") == "multi_select":
-            return [x.get("name", "") for x in meta.get("multi_select", []) if x.get("name")]
-        if meta.get("type") == "select" and meta.get("select"):
-            return [meta["select"].get("name", "")]
+
+def extract_tags_prop(p: Dict[str, Any]) -> List[str]:
+    if p.get("type") != "multi_select":
         return []
+    return [o.get("name", "").strip() for o in p.get("multi_select", []) if o.get("name")]
 
-    if tags_name and tags_name in props:
-        return _tags_from(props[tags_name])
 
-    for name, meta in props.items():
-        if meta.get("type") in ("multi_select", "select"):
-            got = _tags_from(meta)
-            if got:
-                return got
-    return []
+def pick_property(
+    properties: Dict[str, Any],
+    env_name: str,
+    default_candidates: List[str],
+    allowed_types: Optional[List[str]] = None,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    # 1) env で明示されている場合は最優先
+    env_value = getenv(env_name)
+    if env_value and env_value in properties:
+        p = properties[env_value]
+        if allowed_types is None or p.get("type") in allowed_types:
+            return env_value, p
 
-def extract_issue(props: Dict[str, Any], issue_name: Optional[str]) -> Optional[str]:
-    name_order = []
-    if issue_name:
-        name_order.append(issue_name)
-    name_order.extend(NAME_CANDIDATES["issue"])
-    for name in name_order:
-        meta = props.get(name, {})
-        if not meta:
-            continue
-        t = meta.get("type")
-        if t == "number" and meta.get("number") is not None:
-            return str(meta["number"])
-        if t == "rich_text":
-            s = to_plain_text(meta.get("rich_text", []))
-            if s:
-                return s
-        if t == "title":
-            s = to_plain_text(meta.get("title", []))
-            if s:
-                return s
-        if t == "select" and meta.get("select"):
-            return meta["select"].get("name", "")
-        if t == "multi_select" and meta.get("multi_select"):
-            return ", ".join(
-                [x.get("name", "") for x in meta["multi_select"] if x.get("name")]
-            )
+    # 2) 候補名から探す
+    cand = get_property_by_candidates(properties, default_candidates, allowed_types)
+    if cand:
+        return cand
+
+    # 3) allowed_types が指定されていれば、その type の最初のプロパティ
+    if allowed_types:
+        for name, p in properties.items():
+            if p.get("type") in allowed_types:
+                return name, p
+
     return None
 
-def detect_field_names(schema: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    props = schema.get("properties", {})
-    title_name = ENV_FIELD["title"] or pick_title_property_name(schema)
-    url_name   = pick_first_of_type(schema, "url",
-                                    ENV_FIELD["url"],
-                                    NAME_CANDIDATES["url"])
-    date_primary   = ENV_FIELD["date_primary"] or pick_first_of_type(
-        schema, "date", None, NAME_CANDIDATES["date"]
-    )
-    date_secondary = ENV_FIELD["date_secondary"] or None
-    body_name  = ENV_FIELD["body"] or pick_first_of_type(
-        schema, "rich_text", None, NAME_CANDIDATES["body"]
-    )
-    tags_name  = ENV_FIELD["tags"] or pick_first_of_type(
-        schema, "multi_select", None, NAME_CANDIDATES["tags"]
-    ) or pick_first_of_type(schema, "select", None, NAME_CANDIDATES["tags"])
-    issue_name = ENV_FIELD["issue"] or None
 
-    return {
-        "title": title_name,
-        "url": url_name,
-        "date_primary": date_primary,
-        "date_secondary": date_secondary,
-        "body": body_name,
-        "tags": tags_name,
-        "issue": issue_name,
-    }
+# ----------------------------------------------------------------------
+# 1ページ分のレコード作成
+# ----------------------------------------------------------------------
+TITLE_CANDIDATES = ["タイトル", "Title", "名前", "Name"]
+BODY_CANDIDATES = ["講習会等内容", "本文", "内容", "Notes", "note", "メモ"]
+DATE_CANDIDATES = ["開催日／発行日", "開催日", "発行日", "日付", "Date"]
+URL_CANDIDATES = ["出典URL", "URL", "Url", "Link"]
+TAGS_CANDIDATES = ["タグ", "Tags", "Tag"]
 
-def normalize_record(page: Dict[str, Any],
-                     fields: Dict[str, Optional[str]]) -> Optional[Dict[str, Any]]:
-    props = page.get("properties", {})
-    if not props:
-        return None
+AUTHOR_CANDIDATES = ["講師／著者", "講師/著者", "講師", "著者", "Author", "作者"]
+CATEGORY_CANDIDATES = ["資料区分", "区分", "カテゴリ", "Category", "種別"]
+SOURCE_CANDIDATES = ["出典", "Source", "媒体"]
+ISSUE_CANDIDATES = ["会報号", "号", "Issue"]
 
-    title_name = fields["title"]
-    if not title_name:
-        return None
 
-    title = extract_title(props, title_name).strip()
-    if not title:
-        return None
+def make_record(page: Dict[str, Any]) -> Dict[str, Any]:
+    props: Dict[str, Any] = page.get("properties", {})
 
-    url  = extract_url(props, fields["url"]).strip()
-    body = ""
+    # タイトル
+    title_name, title_prop = pick_property(
+        props, "FIELD_TITLE", TITLE_CANDIDATES, allowed_types=["title"]
+    ) or (None, None)
+    title = extract_text_prop(title_prop) if title_prop else ""
 
-    if fields["body"]:
-        body = extract_rich_text(props, fields["body"])
+    # 本文
+    body_name, body_prop = pick_property(
+        props, "FIELD_BODY", BODY_CANDIDATES, allowed_types=["rich_text", "title"]
+    ) or (None, None)
+    body_text = extract_text_prop(body_prop) if body_prop else ""
 
-    if not body:
-        rich_all = []
-        for name, meta in props.items():
-            if meta.get("type") == "rich_text":
-                s = to_plain_text(meta.get("rich_text", []))
-                if s:
-                    rich_all.append(s)
-        body = "\n".join(rich_all).strip()
+    # 日付
+    date_name, date_prop = pick_property(
+        props, "FIELD_DATE", DATE_CANDIDATES, allowed_types=["date"]
+    ) or (None, None)
+    date_label = extract_date_prop(date_prop) if date_prop else None
+    date_sort = 0
+    if date_label:
+        try:
+            date_sort = int(date_label.replace("-", ""))
+        except Exception:
+            date_sort = 0
 
-    # ★ タイトル行の補正ロジック ★
-    # 本文のどこかに「タイトル：〜」という行があれば、
-    # 先頭の・などの記号を残したまま、ページタイトルで必ず上書きする。
-    if body:
-        lines = body.splitlines()
-        fixed = False
-        for i, line in enumerate(lines):
-            m = re.match(r'^(\s*[・･*●◆]?\s*)タイトル：.*', line)
-            if m:
-                prefix = m.group(1) or ""
-                lines[i] = f"{prefix}タイトル：{title}"
-                fixed = True
-                break
-        if fixed:
-            body = "\n".join(lines)
+    # URL（出典URL）
+    url_name, url_prop = pick_property(
+        props, "FIELD_URL", URL_CANDIDATES, allowed_types=["url"]
+    ) or (None, None)
+    url = extract_text_prop(url_prop) if url_prop else ""
+    if not url:
+        # Notion ページの URL を最後の手段として使う
+        url = page.get("url", "")
 
-    date_iso = extract_date_iso(props,
-                                fields["date_primary"],
-                                fields["date_secondary"])
-    tags     = extract_tags(props, fields["tags"])
-    issue    = extract_issue(props, fields["issue"])
+    # タグ
+    tags_name, tags_prop = pick_property(
+        props, "FIELD_TAGS", TAGS_CANDIDATES, allowed_types=["multi_select"]
+    ) or (None, None)
+    tags = extract_tags_prop(tags_prop) if tags_prop else []
 
-    created   = page.get("created_time")
-    edited    = page.get("last_edited_time")
-    page_id   = page.get("id")
+    # ★ ここからメタ情報（講師/著者・資料区分・出典・会報号） -----------------------
+    author_name, author_prop = pick_property(
+        props, "FIELD_AUTHOR", AUTHOR_CANDIDATES,
+        allowed_types=["rich_text", "select", "multi_select"]
+    ) or (None, None)
+    author = extract_text_prop(author_prop) if author_prop else ""
 
-    rec = {
-        "id": page_id,
-        "title": title,
-        "url": url,
-        "date": date_iso,
-        "body": body,
-        "tags": tags,
-        "issue": issue,
-        "created_time": created,
-        "last_edited_time": edited,
-        "source": "notion",
-    }
-    return rec
+    category_name, category_prop = pick_property(
+        props, "FIELD_CATEGORY", CATEGORY_CANDIDATES,
+        allowed_types=["rich_text", "select", "multi_select"]
+    ) or (None, None)
+    category = extract_text_prop(category_prop) if category_prop else ""
 
-def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    source_name, source_prop = pick_property(
+        props, "FIELD_SOURCE", SOURCE_CANDIDATES,
+        allowed_types=["rich_text", "select", "multi_select"]
+    ) or (None, None)
+    source = extract_text_prop(source_prop) if source_prop else ""
 
-def write_integrity(path_rows: str, path_integrity: str) -> None:
-    with open(path_rows, "rb") as f:
-        data = f.read()
-    lines = data.count(b"\n")
-    sha = hashlib.sha256(data).hexdigest()
-    with open(path_integrity, "w", encoding="utf-8") as g:
-        g.write(f"lines={lines}\nsha256={sha}\n")
+    issue_name, issue_prop = pick_property(
+        props, "FIELD_ISSUE", ISSUE_CANDIDATES,
+        allowed_types=["rich_text", "select", "multi_select"]
+    ) or (None, None)
+    issue_label = extract_text_prop(issue_prop) if issue_prop else ""
 
-def main():
-    print("[INFO] refresh_kb.py start (INLINE/FP compatible)")
-    print(f"[INFO] DB_ID={DB_ID[:8]}... (masked)")
+    issue_sort = 0
+    if issue_label:
+        m = re.search(r"(\d+)", issue_label)
+        if m:
+            try:
+                issue_sort = int(m.group(1))
+            except Exception:
+                issue_sort = 0
 
-    schema = notion_get_database(DB_ID)
-    fields = detect_field_names(schema)
-    print("[INFO] detected fields:", json.dumps(fields, ensure_ascii=False))
+    # ★ 本文末尾にメタ情報を追記する（今回の追加ポイント）
+    meta_lines: List[str] = []
+    if author:
+        meta_lines.append(f"【講師/著者】{author}")
+    if category:
+        meta_lines.append(f"【資料区分】{category}")
+    if source:
+        meta_lines.append(f"【出典】{source}")
 
-    if not fields["title"]:
-        print(
-            "[ERROR] title(type=title) property not found. Please ensure the leftmost 'Name' column exists.",
-            file=sys.stderr,
-        )
-        sys.exit(3)
-
-    pages = notion_query_all(DB_ID)
-    print(f"[INFO] fetched pages: {len(pages)}")
-
-    rows = []
-    skipped = 0
-    for p in pages:
-        rec = normalize_record(p, fields)
-        if rec:
-            rows.append(rec)
+    if meta_lines:
+        if body_text:
+            body_text = body_text.rstrip() + "\n\n" + "\n".join(meta_lines)
         else:
-            skipped += 1
-    print(f"[INFO] normalized rows: {len(rows)} (skipped={skipped})")
+            body_text = "\n".join(meta_lines)
 
-    def sort_key(r):
-        t = r.get("date") or r.get("created_time") or r.get("last_edited_time") or ""
-        return t
+    # Notion メタ
+    created_time = page.get("created_time")
+    last_edited_time = page.get("last_edited_time")
 
-    rows.sort(key=sort_key, reverse=True)
+    record: Dict[str, Any] = {
+        "id": page.get("id"),
+        "title": title,
+        # 本文は body / content 両方のキーに入れておく（後方互換のため）
+        "body": body_text,
+        "content": body_text,
+        "url": url,
+        "tags": tags,
 
-    out_jsonl = "kb.jsonl"
-    out_int   = "kb_integrity.txt"
-    write_jsonl(out_jsonl, rows)
-    write_integrity(out_jsonl, out_int)
+        "author": author,
+        "author_label": author,
+        "category": category,
+        "category_label": category,
+        "source": source,
+        "source_label": source,
+        "issue": issue_label,
+        "issue_label": issue_label,
 
-    print(f"[OK] wrote {out_jsonl} and {out_int}")
-    print("[OK] INLINE MODE ACTIVE — DB構造に依存せず取得完了（title必須）")
+        "date": date_label,
+        "date_label": date_label,
+
+        "date_sort": date_sort,
+        "issue_sort": issue_sort,
+
+        "created_time": created_time,
+        "last_edited_time": last_edited_time,
+    }
+
+    return record
+
+
+# ----------------------------------------------------------------------
+# メイン処理
+# ----------------------------------------------------------------------
+def main() -> None:
+    token = getenv("NOTION_TOKEN", required=True)
+    database_id = getenv("NOTION_DATABASE_ID", required=True)
+
+    print("[INFO] Notion DB から記事を取得中...", file=sys.stderr)
+    pages = query_database_all(token, database_id)
+    print(f"[INFO] 取得件数: {len(pages)} 件", file=sys.stderr)
+
+    records: List[Dict[str, Any]] = []
+    for page in pages:
+        try:
+            rec = make_record(page)
+            if rec.get("title") or rec.get("body"):
+                records.append(rec)
+        except Exception as e:
+            print("[WARN] レコード変換に失敗しました:", e, file=sys.stderr)
+
+    # kb.jsonl に書き出し
+    out_path = "kb.jsonl"
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False))
+            f.write("\n")
+
+    print(f"[INFO] 書き出し完了: {out_path} （{len(records)} 件）", file=sys.stderr)
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n[WARN] interrupted by user", file=sys.stderr)
-        sys.exit(130)
-    except Exception as e:
-        print(f"[ERROR] unexpected: {e}", file=sys.stderr)
-        sys.exit(10)
+    main()
