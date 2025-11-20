@@ -14,10 +14,14 @@ refresh_kb.py — Notion DB → kb.jsonl 生成（インラインDB/フルペー
     【講師/著者】…
     【資料区分】…
     【出典】…
-  の3行を追記する。
-- これにより、検索語に
-    「71号」「会報71号」「楽しいミニバラ盆栽」
-    「白根」「規定」 などを入れてもヒットするようになる。
+  を追記する。
+- 【出典】については、元の文字列に加えて
+    ・数字を半角にした版
+    ・数字を全角にした版
+  を重複なしで並べる。
+  例）「会報６８号」 → 「会報６８号 / 会報68号」
+      「会報68号」   → 「会報68号 / 会報６８号」
+- これにより、「会報６８号」「会報68号」のどちらで検索してもヒットしやすくする。
 - app.py 側のロジックは一切変更しない。
 
 環境変数（必要/任意）:
@@ -26,7 +30,7 @@ refresh_kb.py — Notion DB → kb.jsonl 生成（インラインDB/フルペー
   FIELD_TITLE             : 任意（既定：自動検出 "type=title"）
   FIELD_BODY              : 任意（既定：候補から自動検出）
   FIELD_DATE              : 任意（既定：type=date の最初の列）
-  FIELD_URL               : 任意（候補: 出典URL, URL 等）
+  FIELD_URL               : 任意（既定：候補: 出典URL, URL 等）
   FIELD_TAGS              : 任意（既定：候補: タグ, Tags 等）
   FIELD_AUTHOR            : 任意（既定：候補: 講師/著者 等）
   FIELD_CATEGORY          : 任意（既定：候補: 資料区分 等）
@@ -99,6 +103,36 @@ def query_database_all(token: str, database_id: str) -> List[Dict[str, Any]]:
         cursor = data.get("next_cursor")
 
     return results
+
+
+# ----------------------------------------------------------------------
+# 数字の全角/半角変換ヘルパ
+# ----------------------------------------------------------------------
+def to_halfwidth_digits(s: str) -> str:
+    """全角数字（０〜９）を半角（0-9）に変換する。その他の文字はそのまま。"""
+    if not s:
+        return s
+    res: List[str] = []
+    for ch in s:
+        code = ord(ch)
+        if 0xFF10 <= code <= 0xFF19:
+            res.append(chr(code - 0xFF10 + ord("0")))
+        else:
+            res.append(ch)
+    return "".join(res)
+
+
+def to_fullwidth_digits(s: str) -> str:
+    """半角数字（0-9）を全角（０〜９）に変換する。その他の文字はそのまま。"""
+    if not s:
+        return s
+    res: List[str] = []
+    for ch in s:
+        if "0" <= ch <= "9":
+            res.append(chr(ord(ch) - ord("0") + 0xFF10))
+        else:
+            res.append(ch)
+    return "".join(res)
 
 
 # ----------------------------------------------------------------------
@@ -251,7 +285,7 @@ def make_record(page: Dict[str, Any]) -> Dict[str, Any]:
     ) or (None, None)
     tags = extract_tags_prop(tags_prop) if tags_prop else []
 
-    # ★ ここからメタ情報（講師/著者・資料区分・出典・会報号） -----------------------
+    # ★ メタ情報（講師/著者・資料区分・出典・会報号）
     author_name, author_prop = pick_property(
         props, "FIELD_AUTHOR", AUTHOR_CANDIDATES,
         allowed_types=["rich_text", "select", "multi_select"]
@@ -285,14 +319,19 @@ def make_record(page: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 issue_sort = 0
 
-    # ★ 本文末尾にメタ情報を追記する（今回の追加ポイント）
+    # ★ 本文末尾にメタ情報を追記する
     meta_lines: List[str] = []
     if author:
         meta_lines.append(f"【講師/著者】{author}")
     if category:
         meta_lines.append(f"【資料区分】{category}")
     if source:
-        meta_lines.append(f"【出典】{source}")
+        # 出典は「元 / 半角数字版 / 全角数字版」の重複なしリストを作る
+        variants: List[str] = []
+        for v in [source, to_halfwidth_digits(source), to_fullwidth_digits(source)]:
+            if v and v not in variants:
+                variants.append(v)
+        meta_lines.append("【出典】" + " / ".join(variants))
 
     if meta_lines:
         if body_text:
