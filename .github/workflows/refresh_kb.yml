@@ -21,7 +21,7 @@ jobs:
       # 列マッピング（必要に応じて変更可。FIELD_TITLE は指定しません）
       FIELD_AUTHOR: "講師/著者"
       FIELD_URL:    "出典URL"
-      FIELD_TEXT:   "講習会等内容"
+      FIELD_TEXT:   "講演会等内容"
       FIELD_ISSUE:  "会報号"
       FIELD_DATE:   "開催日/発行日"
 
@@ -36,30 +36,24 @@ jobs:
         with:
           python-version: "3.x"
 
-            - name: Install dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
           pip install notion-client
 
-      # 互換のため、両方の名前を子プロセスに渡す
-      - name: Export env (compat)
-        run: |
-          echo "NOTION_DB_ID=${NOTION_DB_ID}" >> $GITHUB_ENV
-          echo "NOTION_DATABASE_ID=${NOTION_DATABASE_ID}" >> $GITHUB_ENV
-
       - name: Build kb.jsonl from Notion
-        run: python refresh_kb.py
-
-      - name: Show diff
         run: |
-          git status --porcelain
-          git add -A
-          echo "---- about to commit"; git diff --cached --name-status
+          python refresh_kb.py
 
-      - name: Commit & Push
+      - name: Commit and push kb.jsonl
         run: |
-          git config user.name  "actions-user"
-          git config user.email "actions@github"
-          git commit -m "Auto update KB $(date +%s)" || echo "no changes"
+          if git diff --quiet --exit-code; then
+            echo "No changes in kb.jsonl"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add kb.jsonl
+          git commit -m "Update kb.jsonl from Notion"
           git push
