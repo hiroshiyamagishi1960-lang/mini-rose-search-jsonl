@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-refresh_kb.py — Notion DB → kb.jsonl 生成（講師/著者・資料区分・出典を本文に追記）
+refresh_kb.py — Notion DB → kb.jsonl 生成（講師/著者・資料区分・出典を本文に追記＋添付ファイル情報）
 
 - Notion データベースから全レコードを取得
-- プロパティからタイトル / 本文 / 講師/著者 / 資料区分 / 会報号 / 日付 / URL を抽出
+- プロパティからタイトル / 本文 / 講師/著者 / 資料区分 / 会報号 / 日付 / URL / 添付ファイル を抽出
 - 本文の末尾にメタ情報を追記してから kb.jsonl に 1 行 1 レコードで書き出し
 - 出典（会報号）は「会報６８号 / 会報68号」のように全角・半角を両方記録
+- 添付ファイルは files 配列として、「どのページの」「どのプロパティの」「何番目のファイルか」を記録
 """
 
 import os
@@ -177,6 +178,58 @@ def extract_fields(page: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def extract_files(page: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    1ページ分から添付ファイル（Files & media）プロパティをすべて抜き出す。
+
+    - properties 内で type == "files" のものを対象にする
+    - 各ファイルについて：
+        name    : ファイル名（Notion側の表示名）
+        page_id : このページのID
+        property: プロパティ名（例：「ファイル」「写真・PDF」など）
+        index   : そのプロパティ内での順番（0始まり）
+    - URL は「すぐ期限切れ」なのでここでは保存しない。
+      表示時に /file API から Notion に取りに行く。
+    """
+    props = page.get("properties", {}) or {}
+    page_id = page.get("id")
+    out: List[Dict[str, Any]] = []
+
+    if not page_id:
+        return out
+
+    for prop_name, prop in props.items():
+        if not isinstance(prop, dict):
+            continue
+        if prop.get("type") != "files":
+            continue
+        files = prop.get("files") or []
+        if not isinstance(files, list):
+            continue
+        for idx, f in enumerate(files):
+            if not isinstance(f, dict):
+                continue
+            name = f.get("name") or ""
+            if not name:
+                # name が無いことはあまりないが、念のため URL から補う
+                url = ""
+                if f.get("type") == "file":
+                    url = (f.get("file") or {}).get("url") or ""
+                elif f.get("type") == "external":
+                    url = (f.get("external") or {}).get("url") or ""
+                name = url or f"ファイル{idx+1}"
+
+            out.append(
+                {
+                    "name": name,
+                    "page_id": page_id,
+                    "property": prop_name,
+                    "index": idx,
+                }
+            )
+    return out
+
+
 def fetch_all_pages(client: Client, db_id: str) -> List[Dict[str, Any]]:
     """対象データベースから全ページを取得"""
     results: List[Dict[str, Any]] = []
@@ -209,6 +262,8 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         for page in pages:
             fields = extract_fields(page)
+            files = extract_files(page)
+
             rec = {
                 "id": page.get("id"),
                 "title": fields["title"],
@@ -221,6 +276,8 @@ def main() -> None:
                 "source_label": fields["source_label"],
                 "date": fields["date"],
                 "url": fields["url"],
+                # 添付ファイル情報（UI で /file?fid=... に変換して使う）
+                "files": files,
             }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             written += 1
