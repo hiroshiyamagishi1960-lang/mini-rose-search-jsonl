@@ -1,15 +1,17 @@
-# app.py — simple-search-2025-11-18-fallback
+# app.py — simple-search-2025-11-26-file-proxy
 # 目的：
 #   - ミニバラ盆栽デジタル資料館（JSONL版）の検索を
 #     「日付順＋年フィルタ」で素直に動かすシンプル版。
 #   - タイトル中の年はフィルタに使わず、発行日/開催日だけで年を判定。
 #   - タイトル・本文・タグが空のレコードは「レコード丸ごと」を検索対象にして取りこぼしを防ぐ。
+#   - 添付ファイル（Files & media）は /file?fid=... 経由で Notion から最新URLを取り直して表示する。
 #   - UI や static ファイル構成は変更しない（/ui, /static/... は既存どおり）。
 
 import os
 import io
 import re
 import json
+import base64
 import unicodedata
 import hashlib
 from datetime import datetime
@@ -26,17 +28,20 @@ from fastapi.responses import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from notion_client import Client  # 添付ファイル用に Notion API を利用
 
 # ========= 設定 =========
 
 KB_PATH = os.getenv("KB_PATH", "kb.jsonl")
-VERSION = os.getenv("APP_VERSION", "jsonl-2025-11-18-simple-fallback-fix-date")
+VERSION = os.getenv("APP_VERSION", "jsonl-2025-11-26-file-proxy")
 
 PAGE_SIZE_DEFAULT = 5
 FIRST_SNIPPET_LEN = 300
 OTHER_SNIPPET_LEN = 185
 
-app = FastAPI(title="mini-rose-search-jsonl (simple-fallback)")
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+
+app = FastAPI(title="mini-rose-search-jsonl (simple-fallback + file-proxy)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,6 +59,19 @@ KB_ROWS: List[Dict[str, Any]] = []
 KB_LINES: int = 0
 KB_HASH: str = ""
 LAST_ERROR: str = ""
+
+# ========= Notion クライアント（添付ファイル用） =========
+
+_notion_client: Optional[Client] = None
+
+
+def get_notion_client() -> Optional[Client]:
+    global _notation_client, _notion_client  # 安全のため誤記ガード（_notation_client は使わない）
+    if NOTION_TOKEN is None or NOTION_TOKEN.strip() == "":
+        return None
+    if _notion_client is None:
+        _notion_client = Client(auth=NOTION_TOKEN)
+    return _notion_client
 
 
 # ========= 共通ユーティリティ =========
@@ -172,7 +190,7 @@ def record_as_text(rec: Dict[str, Any], field: str) -> str:
 
 def record_as_tags(rec: Dict[str, Any]) -> str:
     for k in TAG_KEYS:
-        if k in rec and rec[k]:
+        if k in rec && rec[k]:
             return textify(rec[k])
     return ""
 
@@ -341,6 +359,39 @@ def json_utf8(payload: Dict[str, Any], status: int = 200) -> JSONResponse:
     )
 
 
+# ========= /file 用トークン エンコード・デコード =========
+
+FILE_TOKEN_PREFIX = "f1:"  # 将来仕様変更したときのためのバージョン識別子
+
+
+def encode_file_token(page_id: str, prop: str, index: int) -> str:
+    """page_id / property / index から fid 文字列をつくる。"""
+    payload = {"p": page_id, "k": prop, "i": int(index)}
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return FILE_TOKEN_PREFIX + b64
+
+
+def decode_file_token(fid: str) -> Optional[Tuple[str, str, int]]:
+    """fid 文字列から (page_id, property, index) を取り出す。失敗したら None。"""
+    if not fid or not fid.startswith(FILE_TOKEN_PREFIX):
+        return None
+    b64 = fid[len(FILE_TOKEN_PREFIX) :]
+    # padding を補う
+    pad = "=" * ((4 - len(b64) % 4) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(b64 + pad)
+        obj = json.loads(raw.decode("utf-8"))
+        page_id = str(obj.get("p") or "")
+        prop = str(obj.get("k") or "")
+        idx = int(obj.get("i") or 0)
+        if not page_id:
+            return None
+        return page_id, prop, idx
+    except Exception:
+        return None
+
+
 # ========= ルート / health / version / UI =========
 
 @app.get("/")
@@ -428,6 +479,58 @@ def ui():
     if os.path.exists(path):
         return FileResponse(path, media_type="text/html; charset=utf-8")
     return PlainTextResponse("static/ui.html not found", status_code=404)
+
+
+# ========= /file — 添付ファイルを Notion から取り直してリダイレクト =========
+
+@app.get("/file")
+def file_proxy(fid: str = Query(..., description="添付ファイルID（/api/search から渡される fid）")):
+    """
+    /file?fid=... にアクセスされたとき：
+      1. fid を (page_id, property, index) に復元
+      2. Notion API で該当ページを取得
+      3. Files & media プロパティから最新URLを取り出す
+      4. 302 でそのURLへリダイレクト（ブラウザには画像だけ表示される）
+    """
+    if NOTION_TOKEN is None or NOTION_TOKEN.strip() == "":
+        return PlainTextResponse("Notion token が設定されていないため、添付ファイルを表示できません。", status_code=500)
+
+    decoded = decode_file_token(fid)
+    if not decoded:
+        return PlainTextResponse("無効な添付ファイルIDです。", status_code=400)
+
+    page_id, prop_name, index = decoded
+    client = get_notion_client()
+    if client is None:
+        return PlainTextResponse("Notion クライアントを初期化できませんでした。", status_code=500)
+
+    try:
+        page = client.pages.retrieve(page_id=page_id)
+    except Exception as e:
+        return PlainTextResponse(f"Notion ページの取得に失敗しました: {e}", status_code=502)
+
+    props = page.get("properties") or {}
+    prop = props.get(prop_name) or {}
+    if prop.get("type") != "files":
+        return PlainTextResponse("指定されたプロパティはファイル型ではありません。", status_code=404)
+
+    files = prop.get("files") or []
+    if not isinstance(files, list) or not (0 <= index < len(files)):
+        return PlainTextResponse("指定された添付ファイルが見つかりません。", status_code=404)
+
+    fobj = files[index]
+    url = ""
+    if isinstance(fobj, dict):
+        if fobj.get("type") == "file":
+            url = (fobj.get("file") or {}).get("url") or ""
+        elif fobj.get("type") == "external":
+            url = (fobj.get("external") or {}).get("url") or ""
+
+    if not url:
+        return PlainTextResponse("添付ファイルのURLを取得できませんでした。", status_code=502)
+
+    # 実際のファイルURLへ 302 リダイレクト
+    return RedirectResponse(url=url, status_code=302)
 
 
 # ========= 検索クエリ処理（年フィルタを含む） =========
@@ -600,6 +703,30 @@ def _calc_matches_for_debug(rec: Dict[str, Any], terms: List[str]) -> Dict[str, 
     return out
 
 
+def build_files_payload(rec: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    kb.jsonl 内の rec["files"] から UI 用の [{name, fid}, …] を作る。
+    fid は /file?fid=... で使うトークン。
+    """
+    files = rec.get("files") or []
+    if not isinstance(files, list):
+        return []
+    out: List[Dict[str, str]] = []
+    page_id = textify(rec.get("id") or "")
+    for idx, f in enumerate(files):
+        if not isinstance(f, dict):
+            continue
+        name = textify(f.get("name") or f"ファイル{idx+1}")
+        f_page = textify(f.get("page_id") or page_id)
+        prop = textify(f.get("property") or "")
+        index = f.get("index", idx)
+        if not f_page:
+            continue
+        fid = encode_file_token(f_page, prop, index)
+        out.append({"name": name, "fid": fid})
+    return out
+
+
 # ========= /api/search 本体 =========
 @app.get("/api/search")
 def api_search(
@@ -645,7 +772,7 @@ def api_search(
         )
 
     # -------------------------
-    # 1. 年フィルタ（発行日のみを見る）
+    # 1. 年フィルタ（発行日だけを見る）
     # -------------------------
     def _pub_date_for_rec(rec: Dict[str, Any]) -> datetime:
         """
@@ -816,6 +943,8 @@ def api_search(
             matches=matches,
         )
         item["rank"] = idx
+        # 添付ファイル情報（UI 用）
+        item["files"] = build_files_payload(rec)
         items.append(item)
 
     payload = {
